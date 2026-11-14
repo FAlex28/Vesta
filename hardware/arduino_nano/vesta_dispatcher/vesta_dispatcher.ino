@@ -7,35 +7,27 @@
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-const uint8_t LED_POWER = 2;
-const uint8_t LED_LINK = 3;
-const uint8_t LED_DELIVERY_ERROR = 4;
-const uint8_t LED_ALERT = 5;
-const uint8_t LED_RESOLVED = 6;
+// Standard vizual Vesta: 00 alb, 01 verde, 02 galben, 03 roșu, 04 albastru.
+const uint8_t LED_STANDBY_WHITE = 2;
+const uint8_t LED_ACTIVE_GREEN = 3;
+const uint8_t LED_CHECK_YELLOW = 4;
+const uint8_t LED_ALERT_RED = 5;
+const uint8_t LED_TECHNICAL_BLUE = 6;
 const uint8_t LEDS[] = {
-  LED_POWER,
-  LED_LINK,
-  LED_DELIVERY_ERROR,
-  LED_ALERT,
-  LED_RESOLVED,
+  LED_STANDBY_WHITE,
+  LED_ACTIVE_GREEN,
+  LED_CHECK_YELLOW,
+  LED_ALERT_RED,
+  LED_TECHNICAL_BLUE,
 };
 
+// Cablajul existent se păstrează: buzzerele sunt pe D7 și D8.
 const uint8_t BUZZER_ALERT = 7;
-const uint8_t BUZZER_FEEDBACK = 8;
-
-const uint8_t PIN_LIGHT = A0;
-const uint8_t PIN_HUMIDITY = A1;
-const uint8_t PIN_JOYSTICK_X = A2;
-const uint8_t PIN_JOYSTICK_Y = A3;
-const uint8_t PIN_JOYSTICK_SWITCH = 9;
+const uint8_t BUZZER_TECHNICAL = 8;
 
 const unsigned long PC_TIMEOUT_MS = 10000UL;
-const unsigned long SENSOR_INTERVAL_MS = 250UL;
 const unsigned long LCD_INTERVAL_MS = 150UL;
-const unsigned long BUTTON_DEBOUNCE_MS = 35UL;
 const unsigned long RESOLVED_DISPLAY_MS = 5000UL;
-const unsigned long BUTTON_DISPLAY_MS = 1000UL;
-const unsigned long DELIVERED_LED_MS = 1200UL;
 
 const uint8_t SERIAL_BUFFER_SIZE = 120;
 char serialBuffer[SERIAL_BUFFER_SIZE];
@@ -44,33 +36,26 @@ bool serialOverflow = false;
 
 bool pcLinked = false;
 bool alertActive = false;
-bool deliveryError = false;
+bool technicalError = false;
 unsigned long lastPcMessageAt = 0;
 unsigned long resolvedDisplayUntil = 0;
-unsigned long buttonDisplayUntil = 0;
-unsigned long deliveredLedUntil = 0;
+unsigned long technicalSoundStartedAt = 0;
 
 char activeAlertId[40] = "";
 char alertReason[24] = "";
+char technicalReason[24] = "";
 
-int lightValue = 0;
-int humidityValue = 0;
-int joystickXValue = 0;
-int joystickYValue = 0;
+const uint8_t STATE_STANDBY = 0;
+const uint8_t STATE_ACTIVE = 1;
+const uint8_t STATE_CHECK = 2;
+uint8_t safetyState = STATE_STANDBY;
 
-int lastButtonReading = HIGH;
-int stableButtonState = HIGH;
-unsigned long buttonChangedAt = 0;
-
-unsigned long lastSensorReadAt = 0;
 unsigned long lastLcdUpdateAt = 0;
 char lastLcdLine1[17] = "";
 char lastLcdLine2[17] = "";
 
 const uint8_t SOUND_NONE = 0;
 const uint8_t SOUND_RESOLVED = 1;
-const uint8_t SOUND_ERROR = 2;
-const uint8_t SOUND_BUTTON = 3;
 
 uint8_t oneShotSound = SOUND_NONE;
 unsigned long oneShotStartedAt = 0;
@@ -87,6 +72,40 @@ void copyText(char *destination, size_t destinationSize, const char *source) {
   }
   strncpy(destination, source, destinationSize - 1);
   destination[destinationSize - 1] = '\0';
+}
+
+void setAlertReasonText(const char *reason) {
+  if (reason == NULL) {
+    copyText(alertReason, sizeof(alertReason), "ALERTA");
+  } else if (strcmp(reason, "SOS_EXPLICIT") == 0) {
+    copyText(alertReason, sizeof(alertReason), "AJUTOR SOLICITAT");
+  } else if (strcmp(reason, "MISSED_CHECK_INS") == 0 ||
+             strcmp(reason, "CHECKIN_TIMEOUT") == 0) {
+    copyText(alertReason, sizeof(alertReason), "FARA CONFIRMARE");
+  } else {
+    copyText(alertReason, sizeof(alertReason), reason);
+  }
+}
+
+void setTechnicalReasonText(const char *reason) {
+  if (reason == NULL) {
+    copyText(technicalReason, sizeof(technicalReason), "EROARE TEHNICA");
+  } else if (strcmp(reason, "NETWORK_DISCONNECTED") == 0) {
+    copyText(technicalReason, sizeof(technicalReason), "CONEXIUNE");
+  } else if (strcmp(reason, "MICROPHONE_DENIED") == 0) {
+    copyText(technicalReason, sizeof(technicalReason), "MICROFON");
+  } else if (strcmp(reason, "AUDIO_INTERRUPTED") == 0 ||
+             strcmp(reason, "AUDIO_DISCONNECTED") == 0) {
+    copyText(technicalReason, sizeof(technicalReason), "AUDIO");
+  } else if (strcmp(reason, "VOICE_UNAVAILABLE") == 0 ||
+             strcmp(reason, "VOICE_TIMEOUT") == 0) {
+    copyText(technicalReason, sizeof(technicalReason), "SERVICIU VOCAL");
+  } else if (strcmp(reason, "LOW_VOLTAGE") == 0 ||
+             strcmp(reason, "POWER_UNSTABLE") == 0) {
+    copyText(technicalReason, sizeof(technicalReason), "ALIMENTARE");
+  } else {
+    copyText(technicalReason, sizeof(technicalReason), reason);
+  }
 }
 
 bool deadlineActive(unsigned long now, unsigned long deadline) {
@@ -123,11 +142,11 @@ void updateOneShotSound(unsigned long now) {
 
   if (oneShotSound == SOUND_RESOLVED) {
     if (elapsed < 120UL) {
-      setToneOutput(BUZZER_FEEDBACK, 1500);
+      setToneOutput(BUZZER_TECHNICAL, 1500);
     } else if (elapsed < 220UL) {
       stopToneOutput();
     } else if (elapsed < 360UL) {
-      setToneOutput(BUZZER_FEEDBACK, 1900);
+      setToneOutput(BUZZER_TECHNICAL, 1900);
     } else {
       oneShotSound = SOUND_NONE;
       stopToneOutput();
@@ -135,42 +154,44 @@ void updateOneShotSound(unsigned long now) {
     return;
   }
 
-  if (oneShotSound == SOUND_ERROR) {
-    if (elapsed < 220UL) {
-      setToneOutput(BUZZER_FEEDBACK, 500);
-    } else {
-      oneShotSound = SOUND_NONE;
-      stopToneOutput();
-    }
-    return;
-  }
-
-  if (oneShotSound == SOUND_BUTTON) {
-    if (elapsed < 90UL) {
-      setToneOutput(BUZZER_FEEDBACK, 1000);
-    } else {
-      oneShotSound = SOUND_NONE;
-      stopToneOutput();
-    }
-  }
 }
 
 void updateAlertSound(unsigned long now) {
-  const unsigned long phase = now % 1600UL;
+  // D7: Bip - Bip - Bip rapid, apoi o pauză scurtă.
+  const unsigned long phase = now % 1200UL;
 
-  if (phase < 250UL) {
+  if (phase < 150UL) {
     setToneOutput(BUZZER_ALERT, 1200);
+  } else if (phase < 250UL) {
+    stopToneOutput();
   } else if (phase < 400UL) {
+    setToneOutput(BUZZER_ALERT, 1200);
+  } else if (phase < 500UL) {
     stopToneOutput();
   } else if (phase < 650UL) {
-    setToneOutput(BUZZER_ALERT, 1200);
-  } else if (phase < 800UL) {
-    stopToneOutput();
-  } else if (phase < 1050UL) {
     setToneOutput(BUZZER_ALERT, 1600);
   } else {
     stopToneOutput();
   }
+}
+
+void updateTechnicalSound(unsigned long now) {
+  // D8: Biiiip - pauză - Biiiip, repetat cât timp eroarea persistă.
+  const unsigned long phase = (now - technicalSoundStartedAt) % 4200UL;
+
+  if (phase < 900UL) {
+    setToneOutput(BUZZER_TECHNICAL, 650);
+  } else if (phase < 1500UL) {
+    stopToneOutput();
+  } else if (phase < 2400UL) {
+    setToneOutput(BUZZER_TECHNICAL, 650);
+  } else {
+    stopToneOutput();
+  }
+}
+
+bool technicalStateActive() {
+  return technicalError || !pcLinked;
 }
 
 void updateSound(unsigned long now) {
@@ -178,6 +199,8 @@ void updateSound(unsigned long now) {
     updateOneShotSound(now);
   } else if (alertActive) {
     updateAlertSound(now);
+  } else if (technicalStateActive()) {
+    updateTechnicalSound(now);
   } else {
     stopToneOutput();
   }
@@ -188,23 +211,46 @@ void markPcActivity(unsigned long now) {
   lastPcMessageAt = now;
 }
 
+const char *safetyStateName() {
+  if (alertActive) {
+    return "ALERT";
+  }
+  if (safetyState == STATE_ACTIVE) {
+    return "ACTIVE";
+  }
+  if (safetyState == STATE_CHECK) {
+    return "CHECK";
+  }
+  return "STANDBY";
+}
+
+bool applySafetyState(const char *state) {
+  if (strcmp(state, "STANDBY") == 0 || strcmp(state, "IDLE") == 0 ||
+      strcmp(state, "CANCELLED") == 0) {
+    safetyState = STATE_STANDBY;
+    return true;
+  }
+  if (strcmp(state, "ACTIVE") == 0) {
+    safetyState = STATE_ACTIVE;
+    return true;
+  }
+  if (strcmp(state, "CHECK") == 0 || strcmp(state, "CHECK_IN") == 0 ||
+      strcmp(state, "UNCONFIRMED") == 0) {
+    safetyState = STATE_CHECK;
+    return true;
+  }
+  return false;
+}
+
 void printStatus() {
   Serial.print(F("STATUS|PC="));
   Serial.print(pcLinked ? 1 : 0);
+  Serial.print(F("|STATE="));
+  Serial.print(safetyStateName());
   Serial.print(F("|ALERT="));
   Serial.print(alertActive ? 1 : 0);
-  Serial.print(F("|ERROR="));
-  Serial.print(deliveryError ? 1 : 0);
-  Serial.print(F("|L="));
-  Serial.print(lightValue);
-  Serial.print(F("|U="));
-  Serial.print(humidityValue);
-  Serial.print(F("|JX="));
-  Serial.print(joystickXValue);
-  Serial.print(F("|JY="));
-  Serial.print(joystickYValue);
-  Serial.print(F("|JOY="));
-  Serial.print(stableButtonState == LOW ? 1 : 0);
+  Serial.print(F("|TECH="));
+  Serial.print(technicalStateActive() ? 1 : 0);
   Serial.print(F("|ID="));
   Serial.println(activeAlertId);
 }
@@ -240,8 +286,27 @@ void processCommand(char *line, unsigned long now) {
   }
 
   if (strcmp(command, "READY") == 0) {
-    deliveryError = false;
+    technicalError = false;
     acknowledge(F("READY"));
+    return;
+  }
+
+  if (strcmp(command, "STATE") == 0) {
+    char *state = strtok_r(NULL, "|", &savePointer);
+    if (state == NULL || state[0] == '\0') {
+      Serial.println(F("ERR|MISSING_STATE"));
+      return;
+    }
+    if (alertActive) {
+      Serial.println(F("ERR|ALERT_ACTIVE"));
+      return;
+    }
+    if (!applySafetyState(state)) {
+      Serial.println(F("ERR|UNKNOWN_STATE"));
+      return;
+    }
+    Serial.print(F("OK|STATE|"));
+    Serial.println(safetyStateName());
     return;
   }
 
@@ -254,9 +319,9 @@ void processCommand(char *line, unsigned long now) {
     }
 
     copyText(activeAlertId, sizeof(activeAlertId), alertId);
-    copyText(alertReason, sizeof(alertReason), reason == NULL ? "ALERTA" : reason);
+    setAlertReasonText(reason);
     alertActive = true;
-    deliveryError = false;
+    safetyState = STATE_STANDBY;
     resolvedDisplayUntil = 0;
     Serial.print(F("OK|ALERT_RAISED|"));
     Serial.println(activeAlertId);
@@ -276,7 +341,7 @@ void processCommand(char *line, unsigned long now) {
 
     copyText(activeAlertId, sizeof(activeAlertId), alertId);
     alertActive = false;
-    deliveryError = false;
+    safetyState = STATE_STANDBY;
     resolvedDisplayUntil = now + RESOLVED_DISPLAY_MS;
     startOneShot(SOUND_RESOLVED, now);
     Serial.print(F("OK|ALERT_RESOLVED|"));
@@ -284,17 +349,25 @@ void processCommand(char *line, unsigned long now) {
     return;
   }
 
-  if (strcmp(command, "DELIVERY_FAILED") == 0) {
-    deliveryError = true;
-    startOneShot(SOUND_ERROR, now);
-    acknowledge(F("DELIVERY_FAILED"));
+  if (strcmp(command, "TECHNICAL_ERROR") == 0 || strcmp(command, "DELIVERY_FAILED") == 0) {
+    char *reason = strtok_r(NULL, "|", &savePointer);
+    technicalError = true;
+    technicalSoundStartedAt = now;
+    if (strcmp(command, "DELIVERY_FAILED") == 0) {
+      copyText(technicalReason, sizeof(technicalReason), "LIVRARE ESUATA");
+    } else {
+      setTechnicalReasonText(reason);
+    }
+    Serial.print(F("OK|"));
+    Serial.println(command);
     return;
   }
 
-  if (strcmp(command, "DELIVERED") == 0) {
-    deliveryError = false;
-    deliveredLedUntil = now + DELIVERED_LED_MS;
-    acknowledge(F("DELIVERED"));
+  if (strcmp(command, "TECHNICAL_RESOLVED") == 0 || strcmp(command, "DELIVERED") == 0) {
+    technicalError = false;
+    technicalReason[0] = '\0';
+    Serial.print(F("OK|"));
+    Serial.println(command);
     return;
   }
 
@@ -303,9 +376,9 @@ void processCommand(char *line, unsigned long now) {
       Serial.println(F("ERR|ALERT_ACTIVE"));
       return;
     }
-    deliveryError = false;
+    technicalError = false;
+    technicalReason[0] = '\0';
     resolvedDisplayUntil = 0;
-    deliveredLedUntil = 0;
     acknowledge(F("CLEAR"));
     return;
   }
@@ -345,39 +418,10 @@ void readSerial(unsigned long now) {
   }
 }
 
-void readSensors(unsigned long now) {
-  if (now - lastSensorReadAt < SENSOR_INTERVAL_MS) {
-    return;
-  }
-  lastSensorReadAt = now;
-  lightValue = analogRead(PIN_LIGHT);
-  humidityValue = analogRead(PIN_HUMIDITY);
-  joystickXValue = analogRead(PIN_JOYSTICK_X);
-  joystickYValue = analogRead(PIN_JOYSTICK_Y);
-}
-
-void updateJoystick(unsigned long now) {
-  const int reading = digitalRead(PIN_JOYSTICK_SWITCH);
-  if (reading != lastButtonReading) {
-    lastButtonReading = reading;
-    buttonChangedAt = now;
-  }
-
-  if (reading != stableButtonState && now - buttonChangedAt >= BUTTON_DEBOUNCE_MS) {
-    stableButtonState = reading;
-    if (stableButtonState == LOW) {
-      buttonDisplayUntil = now + BUTTON_DISPLAY_MS;
-      startOneShot(SOUND_BUTTON, now);
-      Serial.println(F("INPUT|JOYSTICK|PRESSED"));
-    } else {
-      Serial.println(F("INPUT|JOYSTICK|RELEASED"));
-    }
-  }
-}
-
 void updateLink(unsigned long now) {
   if (pcLinked && now - lastPcMessageAt > PC_TIMEOUT_MS) {
     pcLinked = false;
+    technicalSoundStartedAt = now;
   }
 }
 
@@ -385,14 +429,22 @@ void updateLeds(unsigned long now) {
   const bool fastBlink = ((now / 250UL) % 2UL) == 0;
   const bool slowBlink = ((now / 600UL) % 2UL) == 0;
 
-  digitalWrite(LED_POWER, HIGH);
-  digitalWrite(LED_LINK, pcLinked ? HIGH : slowBlink);
-  digitalWrite(LED_DELIVERY_ERROR, deliveryError ? slowBlink : LOW);
-  digitalWrite(LED_ALERT, alertActive ? fastBlink : LOW);
-  digitalWrite(
-    LED_RESOLVED,
-    (deadlineActive(now, resolvedDisplayUntil) || deadlineActive(now, deliveredLedUntil)) ? HIGH : LOW
-  );
+  for (uint8_t i = 0; i < sizeof(LEDS) / sizeof(LEDS[0]); ++i) {
+    digitalWrite(LEDS[i], LOW);
+  }
+
+  // Prioritate: alertă > eroare tehnică > verificare > activ > standby.
+  if (alertActive) {
+    digitalWrite(LED_ALERT_RED, fastBlink);
+  } else if (technicalStateActive()) {
+    digitalWrite(LED_TECHNICAL_BLUE, slowBlink);
+  } else if (safetyState == STATE_CHECK) {
+    digitalWrite(LED_CHECK_YELLOW, slowBlink);
+  } else if (safetyState == STATE_ACTIVE) {
+    digitalWrite(LED_ACTIVE_GREEN, HIGH);
+  } else {
+    digitalWrite(LED_STANDBY_WHITE, HIGH);
+  }
 }
 
 void padLcdLine(char *destination, const char *source) {
@@ -428,23 +480,27 @@ void updateLcd(unsigned long now) {
   char line2[17];
 
   if (alertActive) {
-    copyText(line1, sizeof(line1), "ALERTA ACTIVA");
+    copyText(line1, sizeof(line1), "ROSU 03 ALERTA");
     snprintf(line2, sizeof(line2), "%-16.16s", alertReason);
-  } else if (deliveryError) {
-    copyText(line1, sizeof(line1), "EROARE LIVRARE");
-    copyText(line2, sizeof(line2), "Verifica PC");
+  } else if (technicalStateActive()) {
+    copyText(line1, sizeof(line1), "ALBASTRU 04 ERR");
+    copyText(
+      line2,
+      sizeof(line2),
+      pcLinked ? (technicalReason[0] == '\0' ? "EROARE TEHNICA" : technicalReason) : "CONEXIUNE PC"
+    );
   } else if (deadlineActive(now, resolvedDisplayUntil)) {
-    copyText(line1, sizeof(line1), "ALERTA REZOLVATA");
-    copyText(line2, sizeof(line2), "Dispatcher liber");
-  } else if (!pcLinked) {
-    copyText(line1, sizeof(line1), "ASTEPT PC");
-    copyText(line2, sizeof(line2), "USB Serial");
-  } else if (deadlineActive(now, buttonDisplayUntil)) {
-    copyText(line1, sizeof(line1), "JOY APASAT");
-    copyText(line2, sizeof(line2), "Trimis catre PC");
+    copyText(line1, sizeof(line1), "ALB 00 STANDBY");
+    copyText(line2, sizeof(line2), "Alerta rezolvata");
+  } else if (safetyState == STATE_CHECK) {
+    copyText(line1, sizeof(line1), "GALBEN 02 CHECK");
+    copyText(line2, sizeof(line2), "Astept raspuns");
+  } else if (safetyState == STATE_ACTIVE) {
+    copyText(line1, sizeof(line1), "VERDE 01 ACTIV");
+    copyText(line2, sizeof(line2), "Conversatie OK");
   } else {
-    copyText(line1, sizeof(line1), "VESTA READY");
-    snprintf(line2, sizeof(line2), "L:%4d U:%4d", lightValue, humidityValue);
+    copyText(line1, sizeof(line1), "ALB 00 STANDBY");
+    copyText(line2, sizeof(line2), "Fara sesiune");
   }
 
   writeLcdLine(0, line1, lastLcdLine1);
@@ -463,12 +519,10 @@ void setup() {
   }
 
   pinMode(BUZZER_ALERT, OUTPUT);
-  pinMode(BUZZER_FEEDBACK, OUTPUT);
-  pinMode(PIN_JOYSTICK_SWITCH, INPUT_PULLUP);
+  pinMode(BUZZER_TECHNICAL, OUTPUT);
 
-  digitalWrite(LED_POWER, HIGH);
   writeLcdLine(0, "VESTA DISP V1", lastLcdLine1);
-  writeLcdLine(1, "ASTEPT PC", lastLcdLine2);
+  writeLcdLine(1, "Conectare PC", lastLcdLine2);
   Serial.println(F("BOOT|VESTA_NANO|1"));
 }
 
@@ -476,8 +530,6 @@ void loop() {
   const unsigned long now = millis();
 
   readSerial(now);
-  readSensors(now);
-  updateJoystick(now);
   updateLink(now);
   updateLeds(now);
   updateSound(now);
