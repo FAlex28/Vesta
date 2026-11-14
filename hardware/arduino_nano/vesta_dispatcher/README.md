@@ -4,6 +4,8 @@ Sketch-ul presupune un Arduino Nano clasic conectat prin USB la PC. PC-ul gestio
 WebSocket-ul Vesta și autentificarea; placa primește numai comenzi seriale și controlează
 LED-urile, buzzerele și LCD-ul. Nano nu are joystick, senzori sau conexiune Wi-Fi directă.
 
+Programul de pe PC care face legătura cu backendul este în [`../bridge`](../bridge/README.md).
+
 ## Conectare
 
 | Componentă | Pin Nano |
