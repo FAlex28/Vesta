@@ -200,6 +200,8 @@ class SafetySession:
     current_checkin_status: CheckInStatus | None = None
     current_checkin_requested_at: datetime | None = None
     current_checkin_delivered_at: datetime | None = None
+    # "voice", "web" or "android": where the active check-in was shown/heard.
+    current_checkin_channel: str | None = None
     last_checkin_id: str | None = None
     last_checkin_status: CheckInStatus | None = None
     last_checkin_requested_at: datetime | None = None

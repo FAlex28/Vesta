@@ -57,6 +57,9 @@ class AlertRecord:
     version: int = 1
     resolved_at: datetime | None = None
     resolution_action: str | None = None
+    # First time an authorized trusted contact displayed this alert. Creating an
+    # alert, or requesting its notification, is never treated as "seen".
+    viewed_at: datetime | None = None
 
 
 AlertIdFactory = Callable[[], str]
@@ -156,6 +159,15 @@ class AlertRegistry:
 
     def get(self, alert_id: str) -> AlertRecord:
         return _clone(self._get_record(alert_id))
+
+    def mark_viewed(self, alert_id: str, *, now: datetime) -> tuple[AlertRecord, bool]:
+        """Record the first display to the trusted contact; later views keep that time."""
+
+        record = self._get_record(alert_id)
+        if record.viewed_at is not None:
+            return _clone(record), False
+        record.viewed_at = _utc(now)
+        return _clone(record), True
 
     def get_for_session(self, session_id: str) -> AlertRecord | None:
         checked_session_id = _validate_identifier(session_id, "session_id")

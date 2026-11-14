@@ -100,7 +100,7 @@ class SafetyEngine:
             }:
                 return self._expire_undelivered_checkin(session, now)
             if session.current_checkin_status is CheckInStatus.DELIVERED:
-                if session.has_blocking_technical_issue:
+                if self._blocks_missed_check_in(session):
                     return self._defer(session, now, deadline_field="response_deadline")
                 return self._miss_check_in(session, now)
             raise InvalidCheckIn(
@@ -124,6 +124,7 @@ class SafetyEngine:
         *,
         delivered: bool,
         now: datetime,
+        channel: str = "voice",
     ) -> SafetyTransition:
         """Record whether the active check-in reached its voice/audio channel.
 
@@ -149,6 +150,7 @@ class SafetyEngine:
         session.current_checkin_status = desired
         if delivered:
             session.current_checkin_delivered_at = now
+            session.current_checkin_channel = channel
             kind = TransitionKind.CHECK_IN_DELIVERED
         else:
             session.undelivered_attempts += 1
@@ -536,6 +538,24 @@ class SafetyEngine:
         session.current_checkin_status = None
         session.current_checkin_requested_at = None
         session.current_checkin_delivered_at = None
+        session.current_checkin_channel = None
+
+    @staticmethod
+    def _blocks_missed_check_in(session: SafetySession) -> bool:
+        """Whether an unanswered, delivered check-in must be deferred, not counted.
+
+        A prompt delivered by voice depends on the audio path, so any blocking
+        technical issue defers it. A prompt shown on the phone screen ("web" or
+        "android") was seen through the page itself: only losing the phone's
+        connection prevents an answer, so audio problems do not defer it.
+        """
+
+        if session.current_checkin_channel in {"web", "android"}:
+            return (
+                TechnicalIssue.NETWORK_DISCONNECTED in session.technical_issues
+                or session.connectivity_status is ConnectivityStatus.DISCONNECTED
+            )
+        return session.has_blocking_technical_issue
 
     @staticmethod
     def _clear_deadlines(session: SafetySession) -> None:

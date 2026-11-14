@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api/client";
-import type { ContractTechnicalIssue, VoiceAccessResponse } from "../api/contract";
+import { CONTRACT_TECHNICAL_ISSUES, type ContractTechnicalIssue, type VoiceAccessResponse, type VoiceStatus } from "../api/contract";
 import type { Credential } from "./useCompanionSession";
 
 /*
@@ -15,6 +15,9 @@ import type { Credential } from "./useCompanionSession";
  *   anything: agent text is shown as text, labelled as sent, not as heard.
  * - In the backend's scripted mode there is no ElevenLabs call and no audio; the scripted
  *   lines are shown as text and labelled as such.
+ * - Every outcome is reported through POST /voice/status. The backend allows one conversation
+ *   per session and keeps it reserved until it hears CONNECTED, DISCONNECTED or an error; without
+ *   these reports a second start would be refused with VOICE_ALREADY_ACTIVE.
  */
 
 export type VoicePhase =
@@ -43,6 +46,7 @@ type ToolHandlers = {
   confirmSafe: () => Promise<boolean>;
   requestHelp: () => Promise<boolean>;
   reportIssue: (issue: ContractTechnicalIssue, active: boolean) => Promise<void>;
+  reportVoiceStatus: (status: VoiceStatus, conversationId: string | null, options?: { keepalive?: boolean }) => Promise<void>;
 };
 
 /** The subset of the ElevenLabs conversation object this page uses. */
@@ -100,10 +104,20 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
   const conversation = useRef<ConversationHandle | null>(null);
   const starting = useRef(false);
   const userEnded = useRef(false);
+  /** conversation_id issued by the backend for the open conversation, and whether its end was reported. */
+  const conversationId = useRef<string | null>(null);
+  const endReported = useRef(true);
   const toolsRef = useRef(tools);
   toolsRef.current = tools;
 
   const patch = useCallback((next: Partial<VoiceState>) => setState((current) => ({ ...current, ...next })), []);
+
+  /** Report the end of the current conversation once, whichever path ends it. */
+  const reportEnd = useCallback((status: VoiceStatus, options?: { keepalive?: boolean }) => {
+    if (endReported.current) return;
+    endReported.current = true;
+    void toolsRef.current.reportVoiceStatus(status, conversationId.current, options);
+  }, []);
 
   const start = useCallback(async () => {
     if (!credential || starting.current || conversation.current) return;
@@ -124,10 +138,9 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           stream.getTracks().forEach((track) => track.stop()); // the SDK opens its own stream
-          void toolsRef.current.reportIssue("microphone_denied", false);
         } catch (error) {
           patch({ phase: "mic_error", detail: micErrorDetail(error) });
-          void toolsRef.current.reportIssue("microphone_denied", true);
+          void toolsRef.current.reportVoiceStatus("MICROPHONE_ERROR", null);
           return;
         }
       }
@@ -137,18 +150,27 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
       try {
         access = await api.voiceAccess(credential.sessionId, credential.token);
       } catch (error) {
+        // Provider failures are recorded by the backend itself; nothing to report here.
         const failure = error instanceof ApiError ? error : null;
         patch({
           phase: "unavailable",
           detail:
             failure?.kind === "network"
               ? "Serverul Vesta nu a răspuns la cererea pentru conversație."
-              : "Conversația vocală este momentan indisponibilă.",
+              : failure?.code === "VOICE_ALREADY_ACTIVE"
+                ? "Serverul are deja o conversație deschisă pentru această sesiune (poate în altă filă). Încearcă din nou peste câteva secunde."
+                : failure?.code === "VOICE_RETRY_LATER"
+                  ? "Serviciul vocal a eșuat recent. Încearcă din nou peste câteva secunde."
+                  : "Conversația vocală este momentan indisponibilă.",
         });
         return;
       }
+      conversationId.current = access.conversation_id;
+      endReported.current = false;
 
       if (access.mode === "demo" || access.transport === "scripted" || !access.conversation_token) {
+        // Scripted mode: the backend marks this conversation CONNECTED itself.
+        endReported.current = true;
         const lines = Array.isArray(access.client_config.demo_messages) ? access.client_config.demo_messages : [];
         patch({ phase: "scripted", scriptedLines: lines, detail: null });
         return;
@@ -165,18 +187,22 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
           vesta_request_help: async () =>
             (await toolsRef.current.requestHelp()) ? "Alertă confirmată de server." : "Alerta NU a fost confirmată de server.",
           vesta_report_technical_issue: async (parameters) => {
-            const issue = parameters.issue as ContractTechnicalIssue | undefined;
-            if (issue) await toolsRef.current.reportIssue(issue, true);
-            return "Problema tehnică a fost raportată.";
+            // The model's argument is untrusted: only contract issue codes are forwarded.
+            const issue = parameters.issue;
+            if (typeof issue !== "string" || !(CONTRACT_TECHNICAL_ISSUES as readonly string[]).includes(issue)) {
+              return "Problema nu a fost raportată: cod necunoscut.";
+            }
+            await toolsRef.current.reportIssue(issue as ContractTechnicalIssue, true);
+            return "Problema tehnică a fost trimisă serverului.";
           },
         },
         onConnect: () => {
           patch({ phase: "connected", detail: null });
-          void toolsRef.current.reportIssue("audio_interrupted", false);
-          void toolsRef.current.reportIssue("voice_unavailable", false);
+          void toolsRef.current.reportVoiceStatus("CONNECTED", conversationId.current);
         },
         onDisconnect: (details) => {
           conversation.current = null;
+          reportEnd("DISCONNECTED");
           if (userEnded.current || details.reason === "user") {
             patch({ phase: "ended", mode: null });
             return;
@@ -186,7 +212,6 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
             mode: null,
             detail: details.reason === "agent" ? "Asistentul a încheiat conversația." : "Conexiunea audio s-a întrerupt.",
           });
-          if (details.reason === "error") void toolsRef.current.reportIssue("audio_interrupted", true);
         },
         onError: (message) => {
           setState((current) =>
@@ -204,11 +229,11 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
     } catch {
       conversation.current = null;
       patch({ phase: "unavailable", detail: "Conexiunea cu serviciul vocal nu a putut fi pornită." });
-      void toolsRef.current.reportIssue("voice_unavailable", true);
+      reportEnd("SERVICE_UNAVAILABLE");
     } finally {
       starting.current = false;
     }
-  }, [credential, voiceMode, patch]);
+  }, [credential, voiceMode, patch, reportEnd]);
 
   const stop = useCallback(async () => {
     userEnded.current = true;
@@ -221,8 +246,9 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
         // Already closed.
       }
     }
+    reportEnd("DISCONNECTED");
     patch({ phase: "ended", mode: null, detail: null });
-  }, [patch]);
+  }, [patch, reportEnd]);
 
   /** Tell the agent that the backend asked for a safety check, so it asks out loud. */
   const notifyCheckIn = useCallback(() => {
@@ -246,6 +272,17 @@ export function useVoice(credential: Credential | null, voiceMode: "elevenlabs" 
   useEffect(() => {
     if (!credential && conversation.current) void stop();
   }, [credential, stop]);
+
+  // Closing or leaving the page: tell the server so the next visit can start a conversation.
+  useEffect(() => {
+    const onPageHide = () => {
+      if (!conversation.current) return;
+      userEnded.current = true;
+      reportEnd("DISCONNECTED", { keepalive: true });
+    };
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, [reportEnd]);
 
   useEffect(
     () => () => {

@@ -11,6 +11,7 @@ import { primarySession } from "../state/liveState";
 import { formatAge, formatClock, formatDuration, issueLabel, sessionDuration, stateCopy } from "../state/presentation";
 import { useLiveConnection, type LiveLink } from "../state/useLiveConnection";
 import { usePageVisibility } from "../state/usePageVisibility";
+import { useCompanionAccess, type ClaimProblem } from "./useCompanionAccess";
 import { useCompanionSession, type ActionState, type PairingProblem } from "./useCompanionSession";
 import { freshnessOf, useGeolocation } from "./useGeolocation";
 import { useVoice, type VoicePhase } from "./useVoice";
@@ -22,9 +23,17 @@ const pairingProblemCopy: Record<Exclude<PairingProblem, null>, string> = {
   rejected: "Serverul a respins codul pentru sesiunea curentă.",
   network: "Serverul nu a răspuns. Verifică conexiunea și încearcă din nou.",
   session_gone:
-    "Sesiunea a fost întreruptă: serverul nu o mai are (de exemplu după o repornire). Conversația vocală anterioară nu mai este activă. Pentru o sesiune nouă, ține joystickul apăsat 5 secunde și asociază din nou telefonul.",
+    "Sesiunea a fost întreruptă: serverul nu o mai are (de exemplu după o repornire). Conversația vocală anterioară nu mai este activă. Pentru o sesiune nouă, ține joystickul apăsat 5 secunde; un telefon asociat o preia singur.",
   token_invalid:
     "Codul de control nu mai este valid (a expirat sau serverul a repornit). Comenzile nu mai pot fi trimise pentru această sesiune.",
+};
+
+const claimProblemCopy: Record<Exclude<ClaimProblem, null>, string> = {
+  invalid_code: "Codul nu este valid sau a expirat. Cere un cod nou din panoul Vesta.",
+  too_many_attempts: "Prea multe coduri greșite. Așteaptă un minut și încearcă din nou.",
+  network: "Serverul nu a răspuns. Verifică conexiunea și încearcă din nou.",
+  wrong_kind: "Acesta este un cod pentru contactul de încredere, nu pentru telefon.",
+  expired: "Asocierea telefonului a expirat. Introdu un cod nou din panoul Vesta.",
 };
 
 const voicePhaseCopy: Record<VoicePhase, { label: string; tone: "neutral" | "safe" | "warning" | "danger" }> = {
@@ -71,12 +80,15 @@ function ActionStatus({ action, sending, confirmed, failed }: { action: ActionSt
 export default function CompanionPage() {
   const live = useLiveConnection({ scope: "session" });
   const companion = useCompanionSession(live);
+  const access = useCompanionAccess(companion);
+  const [codeInput, setCodeInput] = useState("");
   const geo = useGeolocation();
   const now = useNow();
   const voiceCtl = useVoice(companion.credential, live.state.voiceMode, {
     confirmSafe: companion.confirmSafe,
     requestHelp: companion.sos,
     reportIssue: companion.reportIssue,
+    reportVoiceStatus: companion.reportVoiceStatus,
   });
   const visibility = usePageVisibility(() => {
     live.reconnectNow();
@@ -136,6 +148,33 @@ export default function CompanionPage() {
     return () => { active = false; };
   }, [shareLocation, paired, unfinished, geo.gps.fix, companion.credential]);
 
+  // Technical signals for the dashboard: page visibility and whether the phone has a recent GPS
+  // fix (never the coordinates; those go only through the explicit sharing switch below).
+  const { reportClientStatus } = companion;
+  useEffect(() => {
+    if (!paired || !unfinished) return;
+    void reportClientStatus({ page_visibility: visibility.hidden ? "HIDDEN" : "VISIBLE" }, { keepalive: visibility.hidden });
+  }, [paired, unfinished, visibility.hidden, reportClientStatus]);
+  const gpsStatus = geo.gps.fix?.source !== "device" ? "GPS_UNAVAILABLE" : fresh === "CURRENT" ? "GPS_AVAILABLE" : "GPS_STALE";
+  const gpsInUse = geo.gps.permission === "granted" || geo.gps.fix?.source === "device";
+  const gpsReported = useRef(false);
+  useEffect(() => {
+    if (!paired || !unfinished) {
+      gpsReported.current = false;
+      return;
+    }
+    // Until the user turns GPS on, the server's default (GPS_UNAVAILABLE) is already right.
+    if (!gpsInUse && !gpsReported.current) return;
+    gpsReported.current = true;
+    void reportClientStatus({ gps_status: gpsStatus });
+  }, [paired, unfinished, gpsInUse, gpsStatus, reportClientStatus]);
+
+  // A finished session has no conversation on the server any more: close ours too.
+  const { open: voiceOpen, stop: stopVoice } = voiceCtl;
+  useEffect(() => {
+    if (paired && known && !unfinished && voiceOpen) void stopVoice();
+  }, [paired, known, unfinished, voiceOpen, stopVoice]);
+
   // The server owns the quick-cancel window; never infer it from check-in counters.
   const quickCancel = Boolean(
     state === "ACTIVE" && session?.quick_cancel_until && Date.parse(session.quick_cancel_until) > now,
@@ -176,6 +215,15 @@ export default function CompanionPage() {
   const awayMs = visibility.lastAway ? visibility.lastAway.to - visibility.lastAway.from : 0;
   const showAway = visibility.lastAway !== null && awayMs > 5_000 && now - visibility.lastAway.to < 60_000;
   const sosAction = companion.actions.sos;
+
+  // The check-in reached the user: the prompt is on the open screen, or the voice agent has it.
+  const { reportDelivery } = companion;
+  const pendingCheckin = state === "CHECK_IN" && session?.checkin_id && session.checkin_status === "REQUESTED" ? session.checkin_id : null;
+  useEffect(() => {
+    if (!paired || !pendingCheckin) return;
+    if (!visibility.hidden) void reportDelivery(pendingCheckin, "android");
+    else if (voiceCtl.open) void reportDelivery(pendingCheckin, "voice");
+  }, [paired, pendingCheckin, visibility.hidden, voiceCtl.open, reportDelivery]);
 
   return (
     <div className="companion">
@@ -243,7 +291,7 @@ export default function CompanionPage() {
             <p>
               {state === "UNCONFIRMED"
                 ? "Prima verificare nu a primit răspuns. Confirmă acum, dacă poți."
-                : "Răspunde vocal sau apasă butonul de mai jos."}
+                : "Răspunde vocal sau apasă butonul de mai jos. Dacă două verificări afișate rămân fără răspuns, Vesta trimite alerta."}
               {session?.response_deadline && <> Termen: <span className="num">{formatClock(session.response_deadline)}</span>.</>}
             </p>
             <button
@@ -273,11 +321,59 @@ export default function CompanionPage() {
                 {pairingProblemCopy[companion.pairingProblem]}
               </p>
             )}
+            {access.problem && (
+              <p className="notice notice--warning" role="alert" data-testid="claim-problem">
+                {claimProblemCopy[access.problem]}
+              </p>
+            )}
+            {access.grant ? (
+              <div className="pair-waiting" data-testid="pair-waiting">
+                <p className="c-text">
+                  <strong>Telefon asociat cu dispozitivul <span className="num">{access.grant.deviceId}</span>.</strong>{" "}
+                  Ține joystickul apăsat continuu 5 secunde. Când serverul confirmă activarea, sesiunea apare aici singură.
+                </p>
+                <p className="c-hint" role="status">
+                  {access.lastPollOk
+                    ? `Serverul a răspuns ${formatAge(now - access.lastPollOk)}: nicio sesiune în desfășurare.`
+                    : "Se verifică serverul…"}
+                </p>
+                <button type="button" className="btn btn--ghost" onClick={access.forget}>
+                  Uită asocierea
+                </button>
+              </div>
+            ) : (
+              <form
+                className="pair-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void access.claimCode(codeInput).then((ok) => ok && setCodeInput(""));
+                }}
+              >
+                <label htmlFor="pair-code">Codul de asociere din panoul Vesta</label>
+                <input
+                  id="pair-code"
+                  type="text"
+                  inputMode="text"
+                  autoCapitalize="characters"
+                  autoComplete="one-time-code"
+                  spellCheck={false}
+                  maxLength={16}
+                  value={codeInput}
+                  onChange={(event) => setCodeInput(event.target.value)}
+                />
+                <button type="submit" className="btn btn--primary" disabled={access.claiming || codeInput.trim().length < 4}>
+                  {access.claiming ? "Se verifică…" : "Asociază cu codul"}
+                </button>
+                <p className="c-hint">
+                  Codul se folosește o singură dată. Asocierea rămâne pe acest telefon 24 de ore și poate fi ștearsă oricând.
+                </p>
+              </form>
+            )}
             <p className="c-text">
               Comenzile (SOS, „Sunt bine”, anulare, conversație) cer ca telefonul să fie autorizat pentru sesiunea curentă.
               Identificatorul sesiunii singur nu este suficient.
             </p>
-            {manualPairingEnabled ? (
+            {manualPairingEnabled && (
               <form className="pair-form" onSubmit={onPair}>
                 <label htmlFor="session-id">Identificatorul sesiunii</label>
                 <input
@@ -302,10 +398,6 @@ export default function CompanionPage() {
                 </button>
                 <p className="c-hint">Codul rămâne doar în memoria acestei pagini. La reîncărcare trebuie introdus din nou.</p>
               </form>
-            ) : (
-              <p className="notice" data-testid="pairing-unavailable">
-                Asocierea automată a telefonului cu sesiunea nu este disponibilă încă.
-              </p>
             )}
           </section>
         )}
@@ -345,6 +437,15 @@ export default function CompanionPage() {
             </button>
           )}
           {paired && !checkInPending && <p className="c-hint">„Sunt bine” devine activ când serverul cere confirmarea.</p>}
+          {/* The prompt closes as soon as the server accepts; its answer stays visible here. */}
+          {paired && !checkInPending && companion.actions.confirm.status === "confirmed" && (
+            <ActionStatus
+              action={companion.actions.confirm}
+              sending=""
+              confirmed={(at) => `Serverul a primit confirmarea la ${formatClock(at)}.`}
+              failed=""
+            />
+          )}
 
           {paired && unfinished && (
             <div className="end-block">
@@ -354,7 +455,7 @@ export default function CompanionPage() {
                     type="button"
                     className="btn btn--outline"
                     data-testid="quick-cancel"
-                    onClick={() => void companion.cancel("Activare accidentală")}
+                    onClick={() => void companion.cancel("ACCIDENTAL_ACTIVATION")}
                     disabled={companion.actions.cancel.status === "sending"}
                   >
                     Anulează activarea
@@ -375,8 +476,8 @@ export default function CompanionPage() {
                     type="button"
                     className="btn btn--outline"
                     data-testid="end-confirm"
-                    onClick={() => void companion.cancel(state === "ALERT" ? "Alertă închisă de utilizatoare" : "Sesiune încheiată")}
-                    disabled={companion.actions.cancel.status === "sending"}
+                    onClick={() => void (state === "ALERT" ? companion.resolveAlert() : companion.cancel("USER_CANCELLED"))}
+                    disabled={companion.actions.cancel.status === "sending" || companion.actions.resolve.status === "sending"}
                   >
                     Da, încheie
                   </button>
@@ -398,6 +499,14 @@ export default function CompanionPage() {
               sending="Se trimite anularea…"
               confirmed={(at) => `Serverul a încheiat sesiunea la ${formatClock(at)}.`}
               failed="Sesiunea NU a fost încheiată."
+            />
+          )}
+          {paired && (
+            <ActionStatus
+              action={companion.actions.resolve}
+              sending="Se trimite închiderea alertei…"
+              confirmed={(at) => `Serverul a închis alerta la ${formatClock(at)}. Ea rămâne în istoric ca rezolvată.`}
+              failed="Alerta NU a fost închisă."
             />
           )}
         </section>
@@ -550,6 +659,19 @@ export default function CompanionPage() {
               </dd>
             </div>
             <div><dt>Pagina</dt><dd>{visibility.hidden ? "În fundal" : "Deschisă"}</dd></div>
+            <div>
+              <dt>Asociere</dt>
+              <dd>
+                {access.grant ? (
+                  <>
+                    <span className="num">{access.grant.deviceId}</span>{" "}
+                    <button type="button" className="text-button" onClick={access.forget}>Uită</button>
+                  </>
+                ) : (
+                  "neasociat"
+                )}
+              </dd>
+            </div>
             <div>
               <dt>Rețea (indicativ)</dt>
               <dd>{typeof navigator !== "undefined" && navigator.onLine ? "Browserul raportează online" : "Browserul raportează offline"}</dd>

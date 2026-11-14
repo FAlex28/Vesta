@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import (
@@ -37,11 +38,20 @@ from app.schemas import (
     CheckInRequest,
     ClientStatusRequest,
     CommandResponse,
+    CompanionSessionResponse,
+    ContactAlertView,
+    ContactLocationView,
+    ContactStatusResponse,
     DeviceEventRequest,
     HeartbeatRequest,
     LocationUpdateRequest,
     LocationUpdateResponse,
     LocationView,
+    PairingClaimRequest,
+    PairingClaimResponse,
+    PairingCodeRequest,
+    PairingCodeResponse,
+    PowerView,
     ResolveAlertRequest,
     SessionView,
     SosRequest,
@@ -51,7 +61,8 @@ from app.schemas import (
     VoiceAccessResponse,
     VoiceStatusRequest,
 )
-from app.services.alerts import AlertRecord
+from app.services.access import AccessScope
+from app.services.alerts import AlertRecord, AlertStatus
 from app.services.location import LocationEventReused, LocationFromFuture
 from app.services.session_manager import ActivationOutcome
 from app.voice import (
@@ -101,6 +112,7 @@ def _alert_view(alert: AlertRecord | None) -> AlertView | None:
         resolved_at=alert.resolved_at,
         resolution_action=alert.resolution_action,
         version=alert.version,
+        viewed_at=alert.viewed_at,
     )
 
 
@@ -180,6 +192,7 @@ async def _status(
         latest_sequence=snapshot.latest_sequence,
         sessions=[_session_view(session, services) for session in sessions],
         voice_mode=services.settings.voice_mode,
+        power=PowerView(**services.power) if services.power is not None else None,
     )
 
 
@@ -422,6 +435,12 @@ async def session_heartbeat(
             PageVisibility(payload.page_visibility) if payload.page_visibility else None
         ),
     )
+    if services.persistence is not None:
+        services.persistence.record_companion_heartbeat(
+            device_id=result.session.device_id,
+            session_id=session_id,
+            visibility=result.session.page_visibility.value,
+        )
     return CommandResponse(
         duplicate=False,
         session=_session_view(result.session, services),
@@ -697,6 +716,174 @@ async def report_voice_status(
     )
 
 
+# ---------------------------------------------------------------------------
+# Phone pairing and trusted-contact access (codes are created on the dashboard)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/api/v1/pairing-codes",
+    response_model=PairingCodeResponse,
+    tags=["access"],
+)
+async def create_pairing_code(
+    payload: PairingCodeRequest,
+    request: Request,
+    response: Response,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> PairingCodeResponse:
+    """Operator-only: a one-time code the phone or the trusted contact types once."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    device_id = payload.device_id or services.settings.gpio_device_id
+    code, expires_at = services.pairing_codes.issue(
+        AccessScope(payload.scope),
+        device_id,
+        ttl=timedelta(seconds=services.settings.pairing_code_ttl_seconds),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return PairingCodeResponse(
+        scope=payload.scope, device_id=device_id, code=code, expires_at=expires_at
+    )
+
+
+@router.post(
+    "/api/v1/pairing/claim",
+    response_model=PairingClaimResponse,
+    tags=["access"],
+)
+async def claim_pairing_code(
+    payload: PairingClaimRequest,
+    request: Request,
+    response: Response,
+) -> PairingClaimResponse:
+    services = _services(request)
+    scope, device_id = services.pairing_codes.claim(payload.code)
+    ttl = (
+        services.settings.companion_token_ttl_seconds
+        if scope is AccessScope.COMPANION
+        else services.settings.contact_token_ttl_seconds
+    )
+    token, expires_at = services.access_tokens.issue(
+        scope, device_id, ttl=timedelta(seconds=ttl)
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return PairingClaimResponse(
+        scope=scope.value, device_id=device_id, access_token=token, expires_at=expires_at
+    )
+
+
+@router.get(
+    "/api/v1/companion/session",
+    response_model=CompanionSessionResponse,
+    tags=["access"],
+)
+async def companion_session(
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+) -> CompanionSessionResponse:
+    """The paired phone asks for its device's running session and a control token."""
+
+    services = _services(request)
+    grant = services.access_tokens.verify(_bearer(authorization), AccessScope.COMPANION)
+    response.headers["Cache-Control"] = "no-store"
+    claimed = await services.sessions.claim_current_session(grant.device_id)
+    if claimed is None:
+        return CompanionSessionResponse(
+            device_id=grant.device_id,
+            session=None,
+            control_token=None,
+            control_token_expires_at=None,
+        )
+    session, token, expires_at = claimed
+    return CompanionSessionResponse(
+        device_id=grant.device_id,
+        session=_session_view(session, services),
+        control_token=token,
+        control_token_expires_at=expires_at,
+    )
+
+
+@router.get(
+    "/api/v1/contact/status",
+    response_model=ContactStatusResponse,
+    tags=["access"],
+)
+async def contact_status(
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ContactStatusResponse:
+    """Alerts of the contact's device. Coordinates only while an alert is ACTIVE."""
+
+    services = _services(request)
+    grant = services.access_tokens.verify(_bearer(authorization), AccessScope.CONTACT)
+    now = datetime.now(UTC)
+    alerts: list[ContactAlertView] = []
+    for session in await services.sessions.list_sessions():
+        if session.device_id != grant.device_id:
+            continue
+        alert = services.alerts.get_for_session(session.session_id)
+        if alert is None:
+            continue
+        location_view: ContactLocationView | None = None
+        location_status = "UNAVAILABLE"
+        if alert.status is AlertStatus.ACTIVE:
+            location = await services.locations.get_last_authorized(session.session_id)
+            if location is not None:
+                age = max(0.0, (now - location.captured_at).total_seconds())
+                stale = age > services.settings.gps_stale_seconds
+                location_status = "STALE" if stale else "CURRENT"
+                location_view = ContactLocationView(
+                    latitude=location.latitude,
+                    longitude=location.longitude,
+                    captured_at=location.captured_at,
+                    age_seconds=round(age, 1),
+                    is_stale=stale,
+                    accuracy_meters=location.accuracy_meters,
+                )
+        alert_view = _alert_view(alert)
+        if alert_view is None:
+            continue
+        alerts.append(
+            ContactAlertView(
+                session_id=session.session_id,
+                state=session.state.value,
+                alert_reason=session.alert_reason.value if session.alert_reason else None,
+                alert=alert_view,
+                location=location_view,
+                location_status=location_status,
+            )
+        )
+    alerts.sort(key=lambda item: (item.alert.status != "ACTIVE", -item.alert.created_at.timestamp()))
+    response.headers["Cache-Control"] = "no-store"
+    return ContactStatusResponse(device_id=grant.device_id, generated_at=now, alerts=alerts)
+
+
+@router.post(
+    "/api/v1/contact/alerts/{alert_id}/viewed",
+    response_model=AlertView,
+    tags=["access"],
+)
+async def contact_viewed_alert(
+    alert_id: str,
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> AlertView:
+    """The contact page displayed this alert. Distinct from "notification requested"."""
+
+    services = _services(request)
+    grant = services.access_tokens.verify(_bearer(authorization), AccessScope.CONTACT)
+    record = await services.sessions.mark_alert_viewed(alert_id, device_id=grant.device_id)
+    if services.persistence is not None:
+        services.persistence.record_alert_viewed(alert_id)
+    view = _alert_view(record)
+    assert view is not None
+    return view
+
+
 async def _authenticate_websocket(
     websocket: WebSocket,
     services: AppServices,
@@ -738,11 +925,24 @@ async def _authenticate_websocket(
     raise AuthenticationError("WebSocket authentication failed")
 
 
+def _same_origin(origin: str, host: str | None) -> bool:
+    """A page served by this backend (VESTA_FRONTEND_DIST) talks to its own host."""
+
+    if not host:
+        return False
+    parsed = urlsplit(origin)
+    return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == host.strip().lower()
+
+
 @router.websocket("/ws/events")
 async def websocket_events(websocket: WebSocket) -> None:
     services: AppServices = websocket.app.state.services
     origin = websocket.headers.get("origin")
-    if origin is not None and origin not in services.settings.cors_origins:
+    if (
+        origin is not None
+        and origin not in services.settings.cors_origins
+        and not _same_origin(origin, websocket.headers.get("host"))
+    ):
         await websocket.close(code=1008, reason="Origin is not allowed")
         return
     await websocket.accept()

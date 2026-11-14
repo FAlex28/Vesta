@@ -1,7 +1,15 @@
 import { apiBaseUrl } from "./config";
 import type {
+  AccessScope,
+  AlertView,
   ApiErrorBody,
+  CancelReason,
   CommandResponse,
+  CompanionSessionResponse,
+  ContactStatusResponse,
+  PairingClaimResponse,
+  PairingCodeResponse,
+  VoiceStatus,
   ContractTechnicalIssue,
   LocationUpdateResponse,
   ClientStatusUpdate,
@@ -106,8 +114,9 @@ async function request<T>(path: string, init: RequestInit & { token?: string; da
   }
 }
 
-const post = <T>(path: string, body: unknown, token: string) =>
-  request<T>(path, { method: "POST", body: JSON.stringify(body), token });
+/** `keepalive` lets a report leave while the page is being hidden or closed. */
+const post = <T>(path: string, body: unknown, token: string, keepalive = false) =>
+  request<T>(path, { method: "POST", body: JSON.stringify(body), token, keepalive });
 
 const sessionPath = (sessionId: string, action: string) =>
   `/api/v1/sessions/${encodeURIComponent(sessionId)}/${action}`;
@@ -124,13 +133,36 @@ export const api = {
   sos: (sessionId: string, token: string, eventId: string) =>
     post<CommandResponse>(sessionPath(sessionId, "sos"), { event_id: eventId, source: "android" }, token),
 
-  cancel: (sessionId: string, token: string, eventId: string, reason?: string) =>
-    post<CommandResponse>(sessionPath(sessionId, "cancel"), { event_id: eventId, ...(reason ? { reason } : {}) }, token),
+  /** Not valid while the session is in ALERT (409 ALERT_REQUIRES_RESOLUTION): use resolveAlert. */
+  cancel: (sessionId: string, token: string, eventId: string, reason: CancelReason) =>
+    post<CommandResponse>(sessionPath(sessionId, "cancel"), { event_id: eventId, reason }, token),
+
+  resolveAlert: (sessionId: string, alertId: string, token: string, eventId: string, action: string) =>
+    post<CommandResponse>(
+      sessionPath(sessionId, `alerts/${encodeURIComponent(alertId)}/resolve`),
+      { event_id: eventId, action },
+      token,
+    ),
 
   heartbeat: (sessionId: string, token: string) => post<CommandResponse>(sessionPath(sessionId, "heartbeat"), {}, token),
 
-  clientStatus: (sessionId: string, token: string, eventId: string, status: ClientStatusUpdate) =>
-    post<CommandResponse>(sessionPath(sessionId, "client-status"), { event_id: eventId, ...status }, token),
+  clientStatus: (sessionId: string, token: string, eventId: string, status: ClientStatusUpdate, keepalive = false) =>
+    post<CommandResponse>(sessionPath(sessionId, "client-status"), { event_id: eventId, ...status }, token, keepalive),
+
+  voiceStatus: (
+    sessionId: string,
+    token: string,
+    eventId: string,
+    status: VoiceStatus,
+    conversationId: string | null,
+    keepalive = false,
+  ) =>
+    post<CommandResponse>(
+      sessionPath(sessionId, "voice/status"),
+      { event_id: eventId, status, ...(conversationId ? { conversation_id: conversationId } : {}) },
+      token,
+      keepalive,
+    ),
 
   location: (sessionId: string, token: string, eventId: string, location: {
     latitude: number; longitude: number; captured_at: string; accuracy_meters: number | null; source: "android";
@@ -138,6 +170,29 @@ export const api = {
 
   technicalStatus: (sessionId: string, token: string, eventId: string, issue: ContractTechnicalIssue, active: boolean) =>
     post<CommandResponse>(sessionPath(sessionId, "technical-status"), { event_id: eventId, issue, active, source: "android" }, token),
+
+  /** The phone shows the check-in prompt (channel android) or the voice agent was told (voice). */
+  checkinDelivery: (sessionId: string, checkinId: string, token: string, eventId: string, channel: "android" | "voice") =>
+    post<CommandResponse>(
+      sessionPath(sessionId, `checkins/${encodeURIComponent(checkinId)}/delivery`),
+      { event_id: eventId, status: "DELIVERED", channel },
+      token,
+    ),
+
+  /** Operator only (dashboard key). The code is typed once on the phone or by the contact. */
+  createPairingCode: (scope: AccessScope, dashboardKey?: string) =>
+    request<PairingCodeResponse>("/api/v1/pairing-codes", { method: "POST", body: JSON.stringify({ scope }), dashboardKey }),
+
+  claimPairingCode: (code: string) =>
+    request<PairingClaimResponse>("/api/v1/pairing/claim", { method: "POST", body: JSON.stringify({ code }) }),
+
+  /** Paired phone: the device's running session and a fresh control token, or session null. */
+  companionSession: (accessToken: string) => request<CompanionSessionResponse>("/api/v1/companion/session", { token: accessToken }),
+
+  contactStatus: (accessToken: string) => request<ContactStatusResponse>("/api/v1/contact/status", { token: accessToken }),
+
+  contactViewed: (alertId: string, accessToken: string) =>
+    request<AlertView>(`/api/v1/contact/alerts/${encodeURIComponent(alertId)}/viewed`, { method: "POST", token: accessToken }),
 
   voiceAccess: (sessionId: string, token: string) =>
     post<VoiceAccessResponse>(sessionPath(sessionId, "voice/access"), { transport: "webrtc" }, token),

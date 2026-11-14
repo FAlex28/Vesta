@@ -50,8 +50,27 @@ export type AlertRecord = {
   resolutionAction: string | null;
 };
 
+/**
+ * What `alert.notification_requested` said about location when the alert was transmitted.
+ * Coordinates are deliberately not kept: this frontend has no authorized private view for them.
+ */
+export type AlertLocationNotice = {
+  alertId: string | null;
+  at: string;
+  gpsStatus: string | null;
+  locationAvailable: boolean;
+  capturedAt: string | null;
+  ageSeconds: number | null;
+  isStale: boolean | null;
+};
+
+/** Raspberry Pi power as reported by `technical.power` (no battery percentage exists). */
+export type SystemPower = { state: string; detail: string | null; at: string };
+
 export type LiveState = {
   sessions: Record<string, SessionView>;
+  alertNotices: Record<string, AlertLocationNotice>;
+  systemPower: SystemPower | null;
   voiceMode: SystemStatus["voice_mode"] | null;
   systemHealth: SystemStatus["system_health"] | null;
   /** generated_at of the last applied snapshot. Null until the server has answered once. */
@@ -85,6 +104,8 @@ const MAX_LOG = 200;
 
 export const initialLiveState: LiveState = {
   sessions: {},
+  alertNotices: {},
+  systemPower: null,
   voiceMode: null,
   systemHealth: null,
   snapshotAt: null,
@@ -109,6 +130,17 @@ const isState = (value: unknown): value is SessionState =>
   typeof value === "string" && (SESSION_STATES as readonly string[]).includes(value);
 
 const time = (iso: string | null | undefined) => (iso ? Date.parse(iso) : Number.NaN);
+
+const str = (value: unknown) => (typeof value === "string" ? value : null);
+
+/** Data minimisation: coordinates in an event are never kept in the client log. */
+function loggable(data: Record<string, unknown>): Record<string, unknown> {
+  if (!("location" in data)) return data;
+  const { location, ...rest } = data;
+  return { ...rest, location_available: location !== null && location !== undefined };
+}
+
+const CLIENT_STATUS_FIELDS = ["page_visibility", "connectivity_status", "audio_status", "gps_status", "power_status", "health_status"] as const;
 
 function alertFromSession(session: SessionView, previous: AlertRecord | undefined): AlertRecord | undefined {
   const serverAlert = session.alert;
@@ -183,6 +215,9 @@ function applySnapshot(state: LiveState, status: SystemStatus, source: "http" | 
     sessions: {},
     voiceMode: status.voice_mode,
     systemHealth: status.system_health,
+    systemPower: status.power
+      ? { state: status.power.state, detail: status.power.detail, at: status.power.checked_at }
+      : state.systemPower,
     snapshotAt: status.generated_at,
     stateSequence: status.latest_sequence,
     lastSequence: source === "stream" || restart ? status.latest_sequence : state.lastSequence,
@@ -223,21 +258,25 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
     : state.log;
   // `seen` is cleared after a restart; the log itself never holds the same event_id twice.
   const baseLog = gapLog.filter((entry) => entry.id !== event.event_id);
+  // The phone's routine heartbeat republishes its status every few seconds: apply, do not log.
+  const routine = event.type === "client.status_changed" && event.data?.source === "client_heartbeat";
   const next: LiveState = {
     ...state,
     lastSequence: event.sequence,
     seen: [...state.seen, event.event_id].slice(-MAX_SEEN),
-    log: [
-      {
-        id: event.event_id,
-        sequence: event.sequence,
-        type: event.type,
-        occurredAt: event.occurred_at,
-        sessionId: event.session_id,
-        data: event.data ?? {},
-      },
-      ...baseLog,
-    ].slice(0, MAX_LOG),
+    log: routine
+      ? baseLog
+      : [
+          {
+            id: event.event_id,
+            sequence: event.sequence,
+            type: event.type,
+            occurredAt: event.occurred_at,
+            sessionId: event.session_id,
+            data: loggable(event.data ?? {}),
+          },
+          ...baseLog,
+        ].slice(0, MAX_LOG),
     resyncNeeded: state.resyncNeeded || gap || state.snapshotAt === null,
   };
 
@@ -249,6 +288,26 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
     if (!known || time(known) < time(event.occurred_at)) {
       next.lastConfirmedAt = { ...next.lastConfirmedAt, [sessionId]: event.occurred_at };
     }
+  }
+
+  // Facts that GET /status cannot return later: keep them even if the state already moved on.
+  if (event.type === "alert.notification_requested" && sessionId) {
+    const location = data.location && typeof data.location === "object" ? (data.location as Record<string, unknown>) : null;
+    next.alertNotices = {
+      ...next.alertNotices,
+      [sessionId]: {
+        alertId: str(data.alert_id),
+        at: str(data.notification_requested_at) ?? event.occurred_at,
+        gpsStatus: str(data.gps_status),
+        locationAvailable: data.location_available === true && location !== null,
+        capturedAt: location ? str(location.captured_at) : null,
+        ageSeconds: location && typeof location.age_seconds === "number" ? location.age_seconds : null,
+        isStale: location && typeof location.is_stale === "boolean" ? location.is_stale : null,
+      },
+    };
+  }
+  if (event.type === "technical.power" && typeof data.state === "string") {
+    next.systemPower = { state: data.state, detail: str(data.detail), at: event.occurred_at };
   }
 
   // Already reflected by a newer status answer: keep the facts (times), not the transition.
@@ -323,6 +382,16 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
     }
   }
 
+  // Informational events: logged above, no session field changes.
+  if (
+    event.type === "alert.notification_requested" ||
+    event.type === "contact.notification" ||
+    event.type === "technical.power" ||
+    event.type === "session.already_active"
+  ) {
+    return next;
+  }
+
   if (!current) {
     // A session we do not hold (e.g. a new activation): fetch the full object.
     if (sessionId) next.resyncNeeded = true;
@@ -392,9 +461,10 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
         updated.active_technical_issues = updated.active_technical_issues.filter((issue) => issue !== data.issue);
       }
       break;
-    case "technical.power":
-      if (typeof data.state === "string" && ["POWER_OK", "POWER_UNSTABLE", "LOW_VOLTAGE", "POWER_STATUS_UNKNOWN"].includes(data.state)) {
-        updated.power_status = data.state as SessionView["power_status"];
+    case "client.status_changed":
+      // Published on every phone heartbeat; it carries every field it changes, so no refetch.
+      for (const field of CLIENT_STATUS_FIELDS) {
+        if (typeof data[field] === "string") (updated as Record<string, unknown>)[field] = data[field];
       }
       break;
     default:

@@ -18,6 +18,8 @@ export type AlertView = {
   resolved_at: string | null;
   resolution_action: string | null;
   version: number;
+  /** First time the authorized trusted contact displayed the alert (not "notification sent"). */
+  viewed_at?: string | null;
 };
 
 /** Technical issues accepted by POST /technical-status. */
@@ -71,7 +73,40 @@ export type SystemStatus = {
   latest_sequence: number;
   sessions: SessionView[];
   voice_mode: "elevenlabs" | "demo";
+  /** Raspberry Pi power from vcgencmd; null until the Pi has reported. */
+  power?: { state: string; detail: string; checked_at: string } | null;
 };
+
+export type AccessScope = "companion" | "contact";
+
+export type PairingCodeResponse = { scope: AccessScope; device_id: string; code: string; expires_at: string };
+
+export type PairingClaimResponse = { scope: AccessScope; device_id: string; access_token: string; expires_at: string };
+
+export type CompanionSessionResponse = {
+  device_id: string;
+  session: SessionView | null;
+  control_token: string | null;
+  control_token_expires_at: string | null;
+};
+
+export type ContactAlert = {
+  session_id: string;
+  state: SessionState;
+  alert_reason: string | null;
+  alert: AlertView;
+  location: {
+    latitude: number;
+    longitude: number;
+    captured_at: string;
+    age_seconds: number;
+    is_stale: boolean;
+    accuracy_meters: number | null;
+  } | null;
+  location_status: "CURRENT" | "STALE" | "UNAVAILABLE";
+};
+
+export type ContactStatusResponse = { device_id: string; generated_at: string; alerts: ContactAlert[] };
 
 export const EVENT_TYPES = [
   "session.activated",
@@ -93,10 +128,29 @@ export const EVENT_TYPES = [
   "technical.power",
   "contact.notification",
   "system.recovered",
+  "client.status_changed",
+  "voice.status_changed",
   "system.snapshot",
   "system.heartbeat",
   "stream.resync_required",
 ] as const;
+
+/** CancelRequest.reason in backend/app/schemas.py; any other value is rejected with 422. */
+export type CancelReason = "ACCIDENTAL_ACTIVATION" | "USER_CANCELLED" | "SESSION_ENDED";
+
+/** VoiceStatusRequest.status for POST /voice/status. */
+export type VoiceStatus =
+  | "CONNECTED"
+  | "DISCONNECTED"
+  | "API_ERROR"
+  | "MICROPHONE_ERROR"
+  | "TIMEOUT"
+  | "RECONNECTING"
+  | "RECONNECTED"
+  | "SERVICE_UNAVAILABLE";
+
+/** Resolution action sent by the phone when the user closes her own alert (contract example). */
+export const USER_RESOLUTION_ACTION = "USER_CONFIRMED_SAFE";
 export type EventType = (typeof EVENT_TYPES)[number];
 
 export type EventEnvelope = {
@@ -156,7 +210,6 @@ export const isUnfinished = (state: SessionState) => state !== "CANCELLED" && st
 
 /** Capabilities that still require a cross-component contract decision. */
 export const MISSING_CONTRACT = {
-  phonePairing: "Transferul sigur al control_token de la firmware la aplicația telefonului",
   pressProgress: "Evenimente de început/progres pentru apăsarea de 5 secunde",
-  contactAccess: "Autorizarea distinctă a paginii contactului de încredere",
+  externalNotification: "Livrarea notificării în afara paginii contactului (SMS/push)",
 } as const;

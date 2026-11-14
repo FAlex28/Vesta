@@ -15,6 +15,7 @@ from app.hardware import (
 from app.realtime.broker import EventBroker
 from app.safety import SafetyEngine, SafetyPolicy
 from app.security import ControlTokenService
+from app.services.access import AccessTokenService, PairingCodeRegistry
 from app.services.alerts import AlertRegistry
 from app.services.location import (
     AuthorizedLocationStore,
@@ -41,8 +42,12 @@ class AppServices:
     voice_sessions: VoiceConversationRegistry
     hardware_monitor: JoystickMonitor | None
     hardware_coordinator: HardwareActivationCoordinator | None
+    access_tokens: AccessTokenService
+    pairing_codes: PairingCodeRegistry
     # TigerPersistence când VESTA_PERSISTENCE=tiger; altfel None (doar în memorie)
     persistence: Any | None = None
+    # Latest Raspberry Pi power reading (vcgencmd), shared with GET /api/v1/status.
+    power: dict[str, Any] | None = None
 
 
 def build_services(
@@ -117,6 +122,8 @@ def build_services(
         voice_sessions=VoiceConversationRegistry(),
         hardware_monitor=selected_monitor,
         hardware_coordinator=hardware_coordinator,
+        access_tokens=AccessTokenService(settings.control_signing_secret),
+        pairing_codes=PairingCodeRegistry(),
         persistence=persistence,
     )
 

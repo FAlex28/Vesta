@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from app.api.routes import router
 from app.config import Settings
@@ -15,6 +18,60 @@ from app.container import AppServices, build_services
 from app.errors import AppError
 
 LOGGER = logging.getLogger("vesta")
+
+
+async def _watch_power(services: AppServices, stop_event: asyncio.Event) -> None:
+    """Raspberry Pi power from `vcgencmd get_throttled`, published on every change.
+
+    No battery percentage exists: a power bank does not report one to the Pi. A severe
+    under-voltage can switch the Pi off before any notification leaves it.
+    """
+
+    from app.integrations.power import read_power_status
+
+    last_state: str | None = None
+    while not stop_event.is_set():
+        try:
+            status = await asyncio.to_thread(read_power_status)
+            now = datetime.now(UTC)
+            services.power = {"state": status.state, "detail": status.detail, "checked_at": now}
+            if status.state != last_state:
+                last_state = status.state
+                await services.broker.publish(
+                    "technical.power",
+                    data={"state": status.state, "detail": status.detail},
+                )
+                if services.persistence is not None:
+                    services.persistence.record_power(status)
+        except Exception:
+            LOGGER.exception("power status read failed")
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=services.settings.power_poll_seconds
+            )
+
+
+def _mount_frontend(app: FastAPI, dist_path: str) -> None:
+    """Serve frontend/dist from this process: /, /companion and /contact share one origin."""
+
+    dist = Path(dist_path).resolve()
+    index = dist / "index.html"
+    if not index.is_file():
+        raise RuntimeError(f"VESTA_FRONTEND_DIST has no index.html: {dist}")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def frontend(path: str) -> FileResponse:
+        if path.startswith(("api/", "ws/")) or path in {"api", "ws", "health"}:
+            raise HTTPException(status_code=404)
+        candidate = (dist / path).resolve()
+        if path and candidate.is_file() and candidate.is_relative_to(dist):
+            headers = (
+                {"Cache-Control": "public, max-age=31536000, immutable"}
+                if path.startswith("assets/")
+                else {"Cache-Control": "no-cache"}
+            )
+            return FileResponse(candidate, headers=headers)
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
 
 def create_app(
@@ -35,6 +92,7 @@ def create_app(
         stop_event = asyncio.Event()
         scheduler: asyncio.Task[None] | None = None
         hardware_task: asyncio.Task[None] | None = None
+        power_task: asyncio.Task[None] | None = None
         try:
             await resolved_services.sessions.recover_unfinished()
             if resolved_services.hardware_monitor is not None:
@@ -46,6 +104,10 @@ def create_app(
                 hardware_task = asyncio.create_task(
                     resolved_services.hardware_coordinator.run(stop_event),
                     name="vesta-gpio-activation-coordinator",
+                )
+            if resolved_settings.gpio_mode == "gpio":
+                power_task = asyncio.create_task(
+                    _watch_power(resolved_services, stop_event), name="vesta-power"
                 )
             if resolved_settings.scheduler_enabled:
                 scheduler = asyncio.create_task(
@@ -61,7 +123,7 @@ def create_app(
             stop_event.set()
             if resolved_services.hardware_monitor is not None:
                 resolved_services.hardware_monitor.stop()
-            tasks = [task for task in (scheduler, hardware_task) if task is not None]
+            tasks = [task for task in (scheduler, hardware_task, power_task) if task is not None]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await resolved_services.voice.aclose()
@@ -105,6 +167,8 @@ def create_app(
         )
 
     app.include_router(router)
+    if resolved_settings.frontend_dist:
+        _mount_frontend(app, resolved_settings.frontend_dist)
     return app
 
 

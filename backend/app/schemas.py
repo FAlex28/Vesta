@@ -38,6 +38,7 @@ class AlertView(StrictModel):
     resolved_at: datetime | None
     resolution_action: str | None
     version: int
+    viewed_at: datetime | None = None
 
 
 class SessionView(StrictModel):
@@ -236,6 +237,12 @@ class CommandResponse(StrictModel):
     session: SessionView
 
 
+class PowerView(StrictModel):
+    state: Literal["POWER_OK", "LOW_VOLTAGE", "POWER_UNSTABLE", "POWER_STATUS_UNKNOWN"]
+    detail: str
+    checked_at: datetime
+
+
 class SystemStatusResponse(StrictModel):
     system_state: str
     system_health: Literal["HEALTHY", "DEGRADED", "DISCONNECTED"]
@@ -243,6 +250,66 @@ class SystemStatusResponse(StrictModel):
     latest_sequence: int
     sessions: list[SessionView]
     voice_mode: Literal["elevenlabs", "demo"]
+    # Raspberry Pi power as read from vcgencmd; null until the first reading.
+    power: PowerView | None = None
+
+
+AccessScopeName = Literal["companion", "contact"]
+
+
+class PairingCodeRequest(StrictModel):
+    scope: AccessScopeName
+    device_id: Identifier | None = None
+
+
+class PairingCodeResponse(StrictModel):
+    scope: AccessScopeName
+    device_id: str
+    code: str
+    expires_at: datetime
+
+
+class PairingClaimRequest(StrictModel):
+    code: Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=32)]
+
+
+class PairingClaimResponse(StrictModel):
+    scope: AccessScopeName
+    device_id: str
+    access_token: str
+    expires_at: datetime
+
+
+class CompanionSessionResponse(StrictModel):
+    device_id: str
+    session: SessionView | None
+    control_token: str | None
+    control_token_expires_at: datetime | None
+
+
+class ContactLocationView(StrictModel):
+    latitude: float
+    longitude: float
+    captured_at: datetime
+    age_seconds: float
+    is_stale: bool
+    accuracy_meters: float | None
+
+
+class ContactAlertView(StrictModel):
+    session_id: str
+    state: str
+    alert_reason: str | None
+    alert: AlertView
+    # Only while the alert is ACTIVE; never after it is resolved.
+    location: ContactLocationView | None
+    location_status: Literal["CURRENT", "STALE", "UNAVAILABLE"]
+
+
+class ContactStatusResponse(StrictModel):
+    device_id: str
+    generated_at: datetime
+    alerts: list[ContactAlertView]
 
 
 class ErrorBody(StrictModel):

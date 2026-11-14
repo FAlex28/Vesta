@@ -533,6 +533,11 @@ def test_openapi_does_not_contain_permanent_secrets(client: TestClient) -> None:
         "/api/v1/sessions/{session_id}/technical-status",
         "/api/v1/sessions/{session_id}/voice/access",
         "/api/v1/sessions/{session_id}/voice/status",
+        "/api/v1/pairing-codes",
+        "/api/v1/pairing/claim",
+        "/api/v1/companion/session",
+        "/api/v1/contact/status",
+        "/api/v1/contact/alerts/{alert_id}/viewed",
     }
 
 

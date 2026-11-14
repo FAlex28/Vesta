@@ -7,9 +7,10 @@ import asyncio
 import contextlib
 import logging
 
+from app.integrations.heartbeat import HeartbeatMonitor
 from app.integrations.outbox import OutboxDispatcher
 from app.integrations.persistence import TigerRecorder
-from app.integrations.power import PowerMonitor
+from app.integrations.power import PowerStatus
 from app.integrations.startup import recover_on_startup
 
 log = logging.getLogger("vesta.persistence")
@@ -24,7 +25,7 @@ class TigerPersistence:
         recipients: tuple[str, ...],
         response_timeout_s: float,
         outbox_interval_s: float = 1.0,
-        power_interval_s: float = 30.0,
+        heartbeat_sweep_s: float = 5.0,
     ):
         self.db = db
         self._broker = broker
@@ -32,7 +33,8 @@ class TigerPersistence:
             db, recipients=recipients, response_timeout_s=response_timeout_s
         )
         self._outbox_interval = outbox_interval_s
-        self._power_interval = power_interval_s
+        self._heartbeat_sweep = heartbeat_sweep_s
+        self._side_tasks: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self.recovery: dict | None = None
@@ -77,24 +79,64 @@ class TigerPersistence:
             fut.result(timeout=5)
 
         outbox = OutboxDispatcher(self.db, send)
-
-        def on_power(st) -> None:
-            asyncio.run_coroutine_threadsafe(
-                self._broker.publish(
-                    "technical.power", data={"state": st.state, "detail": st.detail}
-                ),
-                loop,
-            )
-
-        power = PowerMonitor(self.db, on_change=on_power)
+        # Server-side sweep of companion_clients: CONNECTED -> RECONNECTING -> DISCONNECTED
+        # history (PHONE_HEARTBEAT_MISSED / PHONE_DISCONNECTED). Safety decisions stay in
+        # SessionManager's lease; this only records the timeline. It never raises SOS.
+        heartbeat = HeartbeatMonitor(self.db)
+        # Power is read by app.main for every persistence mode; see record_power().
         self._tasks = [
             asyncio.create_task(
                 self._loop(outbox.run_once, self._outbox_interval), name="vesta-outbox"
             ),
             asyncio.create_task(
-                self._loop(power.run_once, self._power_interval), name="vesta-power"
+                self._loop(heartbeat.run_once, self._heartbeat_sweep), name="vesta-heartbeat-sweep"
             ),
         ]
+
+    # -- fire-and-forget history writes (a database outage never blocks the API) --------
+
+    def _background(self, fn, *args, **kwargs) -> None:
+        async def run() -> None:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=10)
+            except Exception:
+                log.exception("Tiger Data write failed: %s", getattr(fn, "__qualname__", fn))
+
+        try:
+            task = asyncio.get_running_loop().create_task(run())
+        except RuntimeError:
+            return
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
+    def record_companion_heartbeat(self, *, device_id: str, session_id: str, visibility: str) -> None:
+        self._background(
+            self.db.companions.heartbeat,
+            f"phone:{device_id}",
+            device_id,
+            session_id=session_id,
+            visibility=visibility if visibility in {"VISIBLE", "HIDDEN"} else "UNKNOWN",
+        )
+
+    def record_alert_viewed(self, alert_id: str) -> None:
+        def mark() -> None:
+            for row in self.db.notifications.for_alert(alert_id):
+                if row.get("kind") in (None, "ALERT_RAISED"):
+                    self.db.notifications.mark_viewed(row["notification_id"])
+
+        self._background(mark)
+
+    def record_power(self, status: PowerStatus) -> None:
+        self._background(
+            self.db.events.log_technical_event,
+            component="POWER",
+            event_type=status.state,
+            metadata={
+                "raw": hex(status.raw) if status.raw is not None else None,
+                "thermal_throttling": status.thermal_throttling,
+                "detail": status.detail,
+            },
+        )
 
     async def _loop(self, fn, interval: float) -> None:
         while not self._stop.is_set():

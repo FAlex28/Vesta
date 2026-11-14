@@ -7,11 +7,81 @@ import type { EventEnvelope, SessionView, SystemStatus } from "../src/api/contra
  */
 
 export const TOKEN = "v1.test-payload.test-signature";
+export const COMPANION_TOKEN = "g1.companion-grant.sig";
+export const CONTACT_TOKEN = "g1.contact-grant.sig";
 export const SESSION_ID = "5d9a9a55-1ca6-47bd-8768-43bcdb8492d4";
 
 export type Recorded = { method: string; path: string; body: Record<string, unknown> | null; auth: string | null; url: string };
 
 type Responder = (request: Recorded) => { status: number; body?: unknown } | "abort" | undefined;
+
+/*
+ * Request bodies as backend/app/schemas.py accepts them (StrictModel: extra="forbid"). A field
+ * that is unknown, missing or outside its enum gets 422, exactly like the real backend.
+ */
+type FieldRule = { required?: boolean; oneOf?: readonly unknown[]; type?: "string" | "number" | "boolean" };
+const SOURCES = ["android", "voice_agent", "dashboard", "web"] as const;
+const BODY_RULES: Record<string, Record<string, FieldRule>> = {
+  heartbeat: { page_visibility: { oneOf: ["VISIBLE", "HIDDEN", "UNKNOWN"] } },
+  checkins: { event_id: { required: true, type: "string" }, checkin_id: { required: true, type: "string" }, confirmation: { oneOf: ["safe"] }, source: { oneOf: SOURCES } },
+  sos: { event_id: { required: true, type: "string" }, source: { oneOf: SOURCES }, reason: { type: "string" } },
+  cancel: { event_id: { required: true, type: "string" }, reason: { oneOf: ["ACCIDENTAL_ACTIVATION", "USER_CANCELLED", "SESSION_ENDED"] } },
+  resolve: { event_id: { required: true, type: "string" }, action: { required: true, type: "string" } },
+  "client-status": {
+    event_id: { required: true, type: "string" },
+    page_visibility: { oneOf: ["VISIBLE", "HIDDEN", "UNKNOWN"] },
+    connectivity_status: { oneOf: ["CONNECTED", "RECONNECTING", "DISCONNECTED", "UNKNOWN"] },
+    audio_status: { oneOf: ["CONNECTED", "DISCONNECTED", "ERROR", "UNKNOWN"] },
+    gps_status: { oneOf: ["GPS_AVAILABLE", "GPS_STALE", "GPS_UNAVAILABLE"] },
+    power_status: { oneOf: ["POWER_OK", "POWER_UNSTABLE", "LOW_VOLTAGE", "POWER_STATUS_UNKNOWN"] },
+  },
+  location: {
+    event_id: { required: true, type: "string" },
+    latitude: { required: true, type: "number" },
+    longitude: { required: true, type: "number" },
+    captured_at: { required: true, type: "string" },
+    accuracy_meters: { type: "number" },
+    source: { oneOf: ["android", "integration"] },
+  },
+  "technical-status": {
+    event_id: { required: true, type: "string" },
+    issue: {
+      required: true,
+      oneOf: ["network_disconnected", "voice_unavailable", "voice_timeout", "microphone_denied", "audio_interrupted", "audio_disconnected", "gps_stale", "gps_unavailable", "page_hidden", "low_voltage", "power_unstable", "process_restarted"],
+    },
+    active: { required: true, type: "boolean" },
+    source: { oneOf: ["android", "voice_gateway", "backend", "integration"] },
+  },
+  "voice/access": { transport: { oneOf: ["webrtc"] }, participant_name: { type: "string" }, environment: { type: "string" } },
+  delivery: {
+    event_id: { required: true, type: "string" },
+    status: { required: true, oneOf: ["DELIVERED", "UNDELIVERED"] },
+    channel: { oneOf: ["voice", "web", "android"] },
+  },
+  "voice/status": {
+    event_id: { required: true, type: "string" },
+    status: { required: true, oneOf: ["CONNECTED", "DISCONNECTED", "API_ERROR", "MICROPHONE_ERROR", "TIMEOUT", "RECONNECTING", "RECONNECTED", "SERVICE_UNAVAILABLE"] },
+    conversation_id: { type: "string" },
+  },
+};
+
+export function bodyProblem(action: string, body: Record<string, unknown> | null): string | null {
+  const rules = BODY_RULES[action];
+  if (!rules) return null;
+  const data = body ?? {};
+  for (const key of Object.keys(data)) if (!(key in rules)) return `extra field ${key}`;
+  for (const [key, rule] of Object.entries(rules)) {
+    const value = data[key];
+    if (value === undefined || value === null) {
+      if (rule.required) return `missing ${key}`;
+      continue;
+    }
+    if (rule.type && typeof value !== rule.type) return `${key} must be ${rule.type}`;
+    if (rule.oneOf && !rule.oneOf.includes(value)) return `${key} not allowed: ${String(value)}`;
+  }
+  if (action === "client-status" && Object.keys(data).filter((key) => key !== "event_id").length === 0) return "no status";
+  return null;
+}
 
 export function makeSession(overrides: Partial<SessionView> = {}): SessionView {
   const now = new Date().toISOString();
@@ -61,6 +131,17 @@ export class MockBackend {
   /** Per-path overrides; return undefined to fall through to the default behaviour. */
   responders: Responder[] = [];
   acceptSockets = true;
+  /** The backend's one-conversation-per-session reservation. */
+  voiceReserved = false;
+  /** One-time pairing codes issued by "the dashboard". */
+  codes = new Map<string, "companion" | "contact">();
+  /** Last authorized location per session, as the real backend keeps it. */
+  locations = new Map<string, { latitude: number; longitude: number; captured_at: string; accuracy_meters: number | null }>();
+
+  issueCode(scope: "companion" | "contact", code = scope === "companion" ? "PHONE234" : "CONTACT7") {
+    this.codes.set(code, scope);
+    return code;
+  }
   private eventCounter = 0;
 
   constructor(private page: Page) {}
@@ -132,6 +213,57 @@ export class MockBackend {
 
     if (recorded.path === "/api/v1/status") return route.fulfill({ json: this.status() });
 
+    const unauthorized = () => route.fulfill({ status: 401, json: { error: { code: "UNAUTHORIZED", message: "Invalid or missing authorization" } } });
+    if (recorded.path === "/api/v1/pairing-codes" && recorded.method === "POST") {
+      const scope = body?.scope === "contact" ? "contact" : "companion";
+      const code = this.issueCode(scope, `${scope === "companion" ? "PH" : "CT"}${String(this.codes.size).padStart(6, "2")}`);
+      return route.fulfill({ json: { scope, device_id: "vesta-01", code, expires_at: new Date(Date.now() + 600_000).toISOString() } });
+    }
+    if (recorded.path === "/api/v1/pairing/claim" && recorded.method === "POST") {
+      const code = String(body?.code ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const scope = this.codes.get(code);
+      if (!scope) return unauthorized();
+      this.codes.delete(code);
+      return route.fulfill({
+        json: { scope, device_id: "vesta-01", access_token: scope === "companion" ? COMPANION_TOKEN : CONTACT_TOKEN, expires_at: new Date(Date.now() + 86_400_000).toISOString() },
+      });
+    }
+    if (recorded.path === "/api/v1/companion/session") {
+      if (recorded.auth !== `Bearer ${COMPANION_TOKEN}`) return unauthorized();
+      const live = this.sessions.find((item) => item.state !== "CANCELLED");
+      return route.fulfill({
+        json: live
+          ? { device_id: "vesta-01", session: structuredClone(live), control_token: TOKEN, control_token_expires_at: new Date(Date.now() + 3_600_000).toISOString() }
+          : { device_id: "vesta-01", session: null, control_token: null, control_token_expires_at: null },
+      });
+    }
+    if (recorded.path === "/api/v1/contact/status") {
+      if (recorded.auth !== `Bearer ${CONTACT_TOKEN}`) return unauthorized();
+      const alerts = this.sessions
+        .filter((item) => item.alert)
+        .map((item) => {
+          const location = item.alert!.status === "ACTIVE" ? this.locations.get(item.id) : undefined;
+          const age = location ? (Date.now() - Date.parse(location.captured_at)) / 1000 : 0;
+          return {
+            session_id: item.id,
+            state: item.state,
+            alert_reason: item.alert_reason,
+            alert: structuredClone(item.alert),
+            location: location ? { ...location, age_seconds: age, is_stale: age > 60 } : null,
+            location_status: location ? (age > 60 ? "STALE" : "CURRENT") : "UNAVAILABLE",
+          };
+        });
+      return route.fulfill({ json: { device_id: "vesta-01", generated_at: new Date().toISOString(), alerts } });
+    }
+    const viewed = recorded.path.match(/^\/api\/v1\/contact\/alerts\/([^/]+)\/viewed$/);
+    if (viewed && recorded.method === "POST") {
+      if (recorded.auth !== `Bearer ${CONTACT_TOKEN}`) return unauthorized();
+      const owner = this.sessions.find((item) => item.alert?.id === decodeURIComponent(viewed[1]));
+      if (!owner?.alert) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Alert not found" } } });
+      owner.alert.viewed_at = owner.alert.viewed_at ?? new Date().toISOString();
+      return route.fulfill({ json: structuredClone(owner.alert) });
+    }
+
     const sessionRead = recorded.path.match(/^\/api\/v1\/sessions\/([^/]+)$/);
     if (recorded.method === "GET" && sessionRead) {
       if (recorded.auth !== `Bearer ${TOKEN}`) {
@@ -145,15 +277,22 @@ export class MockBackend {
 
     const match = recorded.path.match(/^\/api\/v1\/sessions\/([^/]+)\/(.+)$/);
     if (!match) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "not found" } } });
-    const [, id, action] = match;
+    const [, id, rawAction] = match;
+    const resolveMatch = rawAction.match(/^alerts\/([^/]+)\/resolve$/);
+    const deliveryMatch = rawAction.match(/^checkins\/([^/]+)\/delivery$/);
+    const action = resolveMatch ? "resolve" : deliveryMatch ? "delivery" : rawAction;
     if (recorded.auth !== `Bearer ${TOKEN}`) {
       return route.fulfill({ status: 401, json: { error: { code: "UNAUTHORIZED", message: "Invalid control token" } } });
     }
     const session = this.session(decodeURIComponent(id));
     if (!session) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Unknown session" } } });
 
+    const problem = bodyProblem(action, body);
+    if (problem) return route.fulfill({ status: 422, json: { error: { code: "VALIDATION_ERROR", message: problem } } });
+
     const now = new Date().toISOString();
     const reply = () => route.fulfill({ json: { duplicate: false, session: structuredClone(session) } });
+    const conflict = (code: string) => route.fulfill({ status: 409, json: { error: { code, message: code } } });
 
     switch (action) {
       case "heartbeat":
@@ -174,13 +313,66 @@ export class MockBackend {
         return reply();
       case "sos":
         if (!["ACTIVE", "CHECK_IN", "UNCONFIRMED"].includes(session.state)) return this.conflict(route);
-        session.alert_reason = "explicit_sos";
-        this.transition(session, "ALERT", "safety.alerted", { reason: "explicit_sos", missed_attempts: 0, source: "android" });
+        session.alert_reason = "SOS_EXPLICIT";
+        session.alert = {
+          id: `alert-${session.id}`,
+          incident_type: "EXPLICIT_SOS",
+          status: "ACTIVE",
+          created_at: now,
+          updated_at: now,
+          notification_requested_at: now,
+          resolved_at: null,
+          resolution_action: null,
+          version: 1,
+        };
+        this.transition(session, "ALERT", "safety.alerted", { reason: "SOS_EXPLICIT", missed_attempts: 0, source: "android" });
+        this.publish("alert.notification_requested", { alert_id: session.alert.id, incident_type: "EXPLICIT_SOS", gps_status: session.gps_status, location: null, location_available: false });
         return reply();
-      case "cancel":
+      case "cancel": {
+        const reason = String(body?.reason ?? "USER_CANCELLED");
         if (session.state === "CANCELLED") return this.conflict(route);
-        this.transition(session, "CANCELLED", "session.cancelled", {});
+        if (reason === "ACCIDENTAL_ACTIVATION" && !(session.quick_cancel_until && Date.parse(session.quick_cancel_until) > Date.now())) {
+          return conflict("QUICK_CANCEL_EXPIRED");
+        }
+        if (session.state === "ALERT" && reason !== "ACCIDENTAL_ACTIVATION") return conflict("ALERT_REQUIRES_RESOLUTION");
+        session.cancellation_reason = reason;
+        this.transition(session, "CANCELLED", "session.cancelled", { reason });
         return reply();
+      }
+      case "resolve": {
+        const alertId = decodeURIComponent(resolveMatch![1]);
+        if (!session.alert || session.alert.id !== alertId) return route.fulfill({ status: 404, json: { error: { code: "ALERT_NOT_FOUND", message: "unknown alert" } } });
+        if (session.alert.status === "RESOLVED") return conflict("ALERT_ALREADY_RESOLVED");
+        session.alert = { ...session.alert, status: "RESOLVED", resolved_at: now, resolution_action: String(body?.action), updated_at: now, version: session.alert.version + 1 };
+        session.cancellation_reason = "ALERT_RESOLVED";
+        this.transition(session, "CANCELLED", "safety.alert_resolved", { alert_id: alertId, resolution_action: body?.action, resolved_at: now });
+        this.publish("alert.resolved", { alert_id: alertId, status: "RESOLVED", resolution_action: body?.action, resolved_at: now });
+        return reply();
+      }
+      case "delivery": {
+        const checkinId = decodeURIComponent(deliveryMatch![1]);
+        if (session.state !== "CHECK_IN" || session.checkin_id !== checkinId) return conflict("CHECKIN_MISMATCH");
+        if (session.checkin_status !== "REQUESTED") return conflict("CHECKIN_ALREADY_REPORTED");
+        session.checkin_status = "DELIVERED";
+        session.checkin_delivered_at = now;
+        this.publish("safety.check_in_delivered", { from_state: "CHECK_IN", state: "CHECK_IN", checkin_id: checkinId, channel: body?.channel });
+        return reply();
+      }
+      case "client-status": {
+        const fields = ["page_visibility", "connectivity_status", "audio_status", "gps_status", "power_status"] as const;
+        for (const field of fields) if (typeof body?.[field] === "string") (session as Record<string, unknown>)[field] = body[field];
+        session.updated_at = now;
+        this.publish("client.status_changed", { ...Object.fromEntries(fields.map((field) => [field, session[field]])), state: session.state, source: "android" });
+        return reply();
+      }
+      case "voice/status": {
+        const status = String(body?.status);
+        this.voiceReserved = ["CONNECTED", "RECONNECTING", "RECONNECTED"].includes(status);
+        session.audio_status = status === "CONNECTED" || status === "RECONNECTED" ? "CONNECTED" : status === "DISCONNECTED" ? "DISCONNECTED" : status === "RECONNECTING" ? "UNKNOWN" : "ERROR";
+        session.updated_at = now;
+        this.publish("voice.status_changed", { status, state: session.state });
+        return reply();
+      }
       case "technical-status": {
         const issue = String(body?.issue);
         if (body?.active) {
@@ -191,6 +383,12 @@ export class MockBackend {
         return reply();
       }
       case "location":
+        this.locations.set(session.id, {
+          latitude: Number(body?.latitude),
+          longitude: Number(body?.longitude),
+          captured_at: String(body?.captured_at),
+          accuracy_meters: typeof body?.accuracy_meters === "number" ? body.accuracy_meters : null,
+        });
         return route.fulfill({
           json: {
             duplicate: false,
@@ -206,6 +404,9 @@ export class MockBackend {
           },
         });
       case "voice/access":
+        if (session.state === "CANCELLED") return conflict("SESSION_CANCELLED");
+        if (this.voiceReserved) return conflict("VOICE_ALREADY_ACTIVE");
+        this.voiceReserved = true;
         return route.fulfill({
           json:
             this.voiceMode === "demo"

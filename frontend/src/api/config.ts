@@ -6,8 +6,8 @@
  * VITE_VESTA_API_URL         Backend origin, e.g. http://192.168.1.20:8000. Empty = same origin
  *                            (the Vite dev server proxies /api, /ws and /health to the backend).
  * VITE_VESTA_DEVICE_ID       Device whose session the companion binds to when several exist.
- * VITE_VESTA_MANUAL_PAIRING  "true" enables the test-only manual pairing form on /companion.
- *                            The contract has no phone pairing yet (MISSING_CONTRACT.phonePairing).
+ * VITE_VESTA_MANUAL_PAIRING  "true" also shows the test-only form (session id + control token)
+ *                            on /companion. Normal pairing uses a one-time code from the dashboard.
  */
 const env = import.meta.env;
 
@@ -26,8 +26,12 @@ export const configuredDeviceId = ((env.VITE_VESTA_DEVICE_ID as string | undefin
 
 export const manualPairingEnabled = env.VITE_VESTA_MANUAL_PAIRING === "true";
 
-/** The backend's default lease is 20 s; the contract recommends heartbeats at under half of it. */
-export const HEARTBEAT_INTERVAL_MS = 7_000;
+/** Every 15 s; the backend marks the phone disconnected after 45 s without one (VESTA_CLIENT_HEARTBEAT_TIMEOUT_SECONDS). */
+export const HEARTBEAT_INTERVAL_MS = 15_000;
+/** How often a paired phone asks whether the joystick started a session. */
+export const COMPANION_POLL_MS = 3_000;
+/** How often the trusted-contact page refreshes its alerts. */
+export const CONTACT_POLL_MS = 4_000;
 /** Backend sends system.heartbeat every 15 s by default; allow two missed beats. */
 export const STREAM_SILENCE_MS = 35_000;
 /** A GPS fix older than this is shown as STALE, never as current. */

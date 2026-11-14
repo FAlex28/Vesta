@@ -1,15 +1,17 @@
 import type { LiveState } from "../state/liveState";
-import { alertReasonCopy, eventCopy, formatClock, issueLabel } from "../state/presentation";
-import type { AlertReason } from "../api/contract";
+import { alertReasonLabel, eventCopy, formatClock, issueLabel } from "../state/presentation";
 
 // Readable names for the `source` field of server events.
 const sourceCopy: Record<string, string> = {
   android: "telefon",
   android_heartbeat: "telefon",
+  client_heartbeat: "telefon",
+  heartbeat_timeout: "lipsa semnalului de la telefon",
   voice_agent: "asistentul vocal",
   voice_gateway: "serviciul vocal",
   dashboard: "panou",
   backend: "server",
+  integration: "integrare",
 };
 
 function detailFor(type: string, data: Record<string, unknown>): string {
@@ -19,9 +21,11 @@ function detailFor(type: string, data: Record<string, unknown>): string {
   }
   if (typeof data.issue === "string") parts.push(issueLabel(data.issue));
   if (typeof data.attempt === "number") parts.push(`încercarea ${data.attempt}`);
-  if (typeof data.reason === "string" && type === "safety.alerted") {
-    parts.push(alertReasonCopy[data.reason as AlertReason] ?? data.reason);
+  if (typeof data.reason === "string" && type === "safety.alerted") parts.push(alertReasonLabel(data.reason));
+  if (type === "alert.notification_requested" && typeof data.location_available === "boolean") {
+    parts.push(data.location_available ? "cu ultima locație autorizată" : "fără locație");
   }
+  if (type === "technical.power" && typeof data.state === "string") parts.push(data.state);
   if (typeof data.source === "string") parts.push(`prin ${sourceCopy[data.source] ?? "sistem"}`);
   return parts.join(" · ");
 }

@@ -1,0 +1,15 @@
+[Unit]
+Description=Vesta HTTPS tunnel (Cloudflare quick tunnel to the local backend)
+After=vesta.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+# Prints a https://<random>.trycloudflare.com address: journalctl -u vesta-tunnel | grep trycloudflare
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

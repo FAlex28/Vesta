@@ -424,6 +424,7 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
   .area-map { order: 2; }
   .area-events { order: 3; }
   .area-howto { order: 4; }
+  .area-pairing { order: 5; }
   .map-frame { min-height: 300px; }
 }
 
@@ -569,3 +570,13 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
   .c-state-title { font-size: 24px; }
   .companion-bar .link-label { display: none; }
 }
+
+/* --------------------------------------------------------------------------
+   Pairing codes (dashboard) and waiting state (phone)
+   -------------------------------------------------------------------------- */
+.pairing-grid { display: grid; gap: 16px; margin-top: 14px; }
+.pairing-item { display: grid; gap: 10px; justify-items: start; }
+.pairing-code { display: grid; gap: 4px; padding: 10px 14px; border: 1px dashed var(--rule-dash); border-radius: 6px; background: var(--surface-2); }
+.pairing-code-value { color: var(--ink); font-size: 28px; font-weight: 650; letter-spacing: 0.12em; }
+.pairing-code-help { max-width: 52ch; color: var(--muted); font-size: var(--t-small); line-height: 1.45; overflow-wrap: anywhere; }
+.pair-waiting { display: grid; gap: 10px; justify-items: start; }

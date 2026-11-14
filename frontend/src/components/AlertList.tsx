@@ -1,9 +1,10 @@
 import type { AlertRecord } from "../state/liveState";
-import { alertReasonCopy, formatClock } from "../state/presentation";
+import { alertReasonLabel, formatClock, resolutionLabel } from "../state/presentation";
 
 /*
- * Active and resolved alerts, one row per alert (keyed by session id; the contract has no
- * alert_id). A cancelled alert is never removed: it becomes RESOLVED with its closing time.
+ * Active and resolved alerts, one row per alert (a session has at most one alert; its v2
+ * alert_id is kept on the record). A closed alert is never removed: it becomes RESOLVED with
+ * its closing time and, when the server sends it, how it was closed.
  */
 export function AlertList({ alerts, emptyText }: { alerts: AlertRecord[]; emptyText: string }) {
   if (alerts.length === 0) {
@@ -18,7 +19,10 @@ export function AlertList({ alerts, emptyText }: { alerts: AlertRecord[]; emptyT
             <strong>{alert.status === "ALERT" ? "ALERT" : "RESOLVED"}</strong>
             <span className="alert-status-text">{alert.status === "ALERT" ? "alertă activă" : "alertă închisă"}</span>
           </span>
-          <span className="alert-reason">{alert.reason ? alertReasonCopy[alert.reason] : "Motiv neraportat"}</span>
+          <span className="alert-reason">
+            {alertReasonLabel(alert.reason ?? alert.incidentType)}
+            {alert.status === "RESOLVED" && resolutionLabel(alert.resolutionAction) && ` · ${resolutionLabel(alert.resolutionAction)}`}
+          </span>
           <dl className="alert-times">
             <div>
               <dt>Emisă</dt>

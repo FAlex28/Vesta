@@ -1,0 +1,21 @@
+[Unit]
+Description=Vesta safety backend (FastAPI, GPIO17 joystick, web app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+SupplementaryGroups=gpio
+WorkingDirectory=__REPO__/backend
+EnvironmentFile=/etc/vesta/vesta.env
+RuntimeDirectory=vesta
+# One worker only: exactly one process may own GPIO17 and the safety scheduler.
+ExecStart=__REPO__/backend/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --no-access-log
+Restart=always
+RestartSec=3
+# Logs: journalctl -u vesta -f  (tokens and coordinates are not logged; access log is off)
+
+[Install]
+WantedBy=multi-user.target

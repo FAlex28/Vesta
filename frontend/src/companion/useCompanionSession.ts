@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, newEventId } from "../api/client";
 import { configuredDeviceId, HEARTBEAT_INTERVAL_MS } from "../api/config";
-import { isUnfinished, type CommandResponse, type ContractTechnicalIssue, type SessionView } from "../api/contract";
+import {
+  isUnfinished,
+  USER_RESOLUTION_ACTION,
+  type CancelReason,
+  type ClientStatusUpdate,
+  type CommandResponse,
+  type ContractTechnicalIssue,
+  type SessionView,
+  type VoiceStatus,
+} from "../api/contract";
 import type { LiveConnection } from "../state/useLiveConnection";
 
 /*
@@ -19,7 +28,7 @@ import type { LiveConnection } from "../state/useLiveConnection";
 
 export type Credential = { token: string; sessionId: string; deviceId: string };
 
-export type ActionName = "confirm" | "sos" | "cancel";
+export type ActionName = "confirm" | "sos" | "cancel" | "resolve";
 
 export type ActionState =
   | { status: "idle" }
@@ -53,9 +62,11 @@ export function useCompanionSession(live: LiveConnection) {
   const [credential, setCredential] = useState<Credential | null>(null);
   const [pairingProblem, setPairingProblem] = useState<PairingProblem>(null);
   const [pairing, setPairing] = useState(false);
-  const [actions, setActions] = useState<Record<ActionName, ActionState>>({ confirm: idle, sos: idle, cancel: idle });
+  const [actions, setActions] = useState<Record<ActionName, ActionState>>({ confirm: idle, sos: idle, cancel: idle, resolve: idle });
   const [heartbeat, setHeartbeat] = useState<HeartbeatHealth>({ lastOkAt: null, consecutiveFailures: 0, lastError: null });
   const reportedIssues = useRef(new Map<ContractTechnicalIssue, boolean>());
+  const reportedClientStatus = useRef<ClientStatusUpdate>({});
+  const deliveredCheckins = useRef(new Set<string>());
   const { applyCommand, refreshStatus } = live;
 
   const session: SessionView | null = credential ? live.state.sessions[credential.sessionId] ?? null : null;
@@ -67,7 +78,35 @@ export function useCompanionSession(live: LiveConnection) {
     setPairingProblem(problem);
     setHeartbeat({ lastOkAt: null, consecutiveFailures: 0, lastError: null });
     reportedIssues.current.clear();
+    reportedClientStatus.current = {};
+    deliveredCheckins.current.clear();
   }, [live.authorizeSessionStream]);
+
+  /**
+   * Take over a session handed out by the server to this paired phone (GET /companion/session).
+   * The control token is verified with one heartbeat before any control is shown.
+   */
+  const adopt = useCallback(
+    async (token: string, target: SessionView): Promise<boolean> => {
+      if (!isUnfinished(target.state)) return false;
+      try {
+        const response = await api.heartbeat(target.id, token);
+        applyCommand(response);
+        live.authorizeSessionStream({ sessionId: target.id, token });
+        setCredential({ token, sessionId: target.id, deviceId: target.device_id });
+        setHeartbeat({ lastOkAt: Date.now(), consecutiveFailures: 0, lastError: null });
+        setActions({ confirm: idle, sos: idle, cancel: idle, resolve: idle });
+        setPairingProblem(null);
+        reportedIssues.current.clear();
+        reportedClientStatus.current = {};
+        deliveredCheckins.current.clear();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [applyCommand, live.authorizeSessionStream],
+  );
 
   /** Bind a control token to the server's current session for this device. */
   const pair = useCallback(
@@ -104,7 +143,7 @@ export function useCompanionSession(live: LiveConnection) {
         live.authorizeSessionStream({ sessionId: target.id, token });
         setCredential({ token, sessionId: target.id, deviceId: target.device_id });
         setHeartbeat({ lastOkAt: Date.now(), consecutiveFailures: 0, lastError: null });
-        setActions({ confirm: idle, sos: idle, cancel: idle });
+        setActions({ confirm: idle, sos: idle, cancel: idle, resolve: idle });
         return true;
       } catch (error) {
         const failure = asApiError(error);
@@ -214,8 +253,19 @@ export function useCompanionSession(live: LiveConnection) {
     [run],
   );
   const sos = useCallback(() => run("sos", api.sos), [run]);
+  /** ACCIDENTAL_ACTIVATION only inside the server's quick-cancel window; never valid in ALERT. */
   const cancel = useCallback(
-    (reason?: string) => run("cancel", (id, token, eventId) => api.cancel(id, token, eventId, reason)),
+    (reason: CancelReason) => run("cancel", (id, token, eventId) => api.cancel(id, token, eventId, reason)),
+    [run],
+  );
+  /** A transmitted alert is closed explicitly through its alert_id and kept as RESOLVED. */
+  const resolveAlert = useCallback(
+    () => run("resolve", (id, token, eventId, current) => {
+      if (current.state !== "ALERT" || !current.alert?.id) {
+        throw new ApiError("conflict", 409, "ALERT_NOT_ACTIVE", "Serverul nu are o alertă activă pentru această sesiune.");
+      }
+      return api.resolveAlert(id, current.alert.id, token, eventId, USER_RESOLUTION_ACTION);
+    }),
     [run],
   );
   const resetAction = useCallback((name: ActionName) => setActions((current) => ({ ...current, [name]: idle })), []);
@@ -238,6 +288,74 @@ export function useCompanionSession(live: LiveConnection) {
     [credential, applyCommand, refreshStatus, handleAuthFailure],
   );
 
+  /**
+   * Report page visibility / GPS availability. Each field is sent only when it changes, and a
+   * failed report is retried on the next change. These are technical signals: none of them
+   * can raise or close an alert on the server.
+   */
+  const reportClientStatus = useCallback(
+    async (update: ClientStatusUpdate, options: { keepalive?: boolean } = {}) => {
+      if (!credential) return;
+      const changed = Object.fromEntries(
+        Object.entries(update).filter(([key, value]) => reportedClientStatus.current[key as keyof ClientStatusUpdate] !== value),
+      ) as ClientStatusUpdate;
+      if (Object.keys(changed).length === 0) return;
+      reportedClientStatus.current = { ...reportedClientStatus.current, ...changed };
+      try {
+        const response = await api.clientStatus(credential.sessionId, credential.token, newEventId("client"), changed, options.keepalive);
+        applyCommand(response);
+      } catch (error) {
+        // A timeout does not tell whether the server applied it: forget these fields so the
+        // next value is always sent.
+        const known = { ...reportedClientStatus.current };
+        for (const key of Object.keys(changed)) delete known[key as keyof ClientStatusUpdate];
+        reportedClientStatus.current = known;
+        const failure = asApiError(error);
+        if (failure.code === "SESSION_CANCELLED") return;
+        handleAuthFailure(failure);
+      }
+    },
+    [credential, applyCommand, handleAuthFailure],
+  );
+
+  /**
+   * The check-in prompt reached the user: shown on the open phone page ("android") or handed to
+   * the connected voice agent ("voice"). Reported once per check-in; the server counts an
+   * unanswered check-in toward ALERT only after such a report.
+   */
+  const reportDelivery = useCallback(
+    async (checkinId: string, channel: "android" | "voice") => {
+      if (!credential || deliveredCheckins.current.has(checkinId)) return;
+      deliveredCheckins.current.add(checkinId);
+      try {
+        const response = await api.checkinDelivery(credential.sessionId, checkinId, credential.token, newEventId("delivery"), channel);
+        applyCommand(response);
+      } catch (error) {
+        const failure = asApiError(error);
+        // A conflict means the server already has a result for it (or it expired): do not repeat.
+        if (failure.kind !== "conflict") deliveredCheckins.current.delete(checkinId);
+        handleAuthFailure(failure);
+      }
+    },
+    [credential, applyCommand, handleAuthFailure],
+  );
+
+  /** POST /voice/status: releases or confirms the server's single-conversation reservation. */
+  const reportVoiceStatus = useCallback(
+    async (status: VoiceStatus, conversationId: string | null, options: { keepalive?: boolean } = {}) => {
+      if (!credential) return;
+      try {
+        const response = await api.voiceStatus(credential.sessionId, credential.token, newEventId("voice"), status, conversationId, options.keepalive);
+        applyCommand(response);
+      } catch (error) {
+        const failure = asApiError(error);
+        if (failure.code === "SESSION_CANCELLED") return;
+        handleAuthFailure(failure);
+      }
+    },
+    [credential, applyCommand, handleAuthFailure],
+  );
+
   // A new session (new activation) means the old token no longer controls anything useful.
   useEffect(() => {
     if (credential && interrupted) unpair("session_gone");
@@ -249,6 +367,7 @@ export function useCompanionSession(live: LiveConnection) {
     pairing,
     pairingProblem,
     pair,
+    adopt,
     unpair,
     heartbeat,
     beatNow,
@@ -256,8 +375,12 @@ export function useCompanionSession(live: LiveConnection) {
     confirmSafe,
     sos,
     cancel,
+    resolveAlert,
     resetAction,
     reportIssue,
+    reportClientStatus,
+    reportVoiceStatus,
+    reportDelivery,
   } as const;
 }
 

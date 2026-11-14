@@ -1,6 +1,7 @@
 # Vesta API contract — backend, voice, GPIO and safety
 
-Version: `v2` (UniHack 2026 prototype)
+Version: `v3` (UniHack 2026 prototype). v3 adds phone pairing, trusted-contact access,
+check-in delivery semantics by channel, `viewed_at`, Pi power in status and the served web app.
 
 This file defines only the interfaces owned by Agent 2. Vesta is a controlled demonstration,
 not a validated emergency service. No endpoint calls 112 or infers that an assault occurred.
@@ -139,6 +140,13 @@ delivery.
 ```
 
 `channel` is `voice`, `web` or `android`; `status` is `DELIVERED` or `UNDELIVERED`.
+
+Only a check-in marked `DELIVERED` counts toward `ALERT` when it stays unanswered; an
+undelivered one is retried. The companion page reports `android` when the prompt is shown on
+the open (visible) page, or `voice` when the page is hidden but the voice conversation is
+connected; it reports each `checkin_id` once. A prompt delivered by `voice` is deferred while
+any audio/voice issue is active; a prompt delivered on screen (`web`/`android`) is deferred
+only while the phone is disconnected, because the user saw it without audio.
 The session view distinguishes the initial `REQUESTED` state from these outcomes. Audio
 disconnect is recorded explicitly, and the web interface may still confirm.
 
@@ -232,6 +240,31 @@ The compatibility route `POST /api/v1/sessions/{id}/technical-status` accepts an
 technical issue and `active` flag. Technical issues are history/status signals, not safety
 conclusions.
 
+## Phone pairing and trusted-contact access
+
+Operators create one-time codes on the authenticated dashboard; the phone or the trusted
+contact types the code once and receives a device-scoped bearer grant
+(`g1.<payload>.<signature>`, HMAC with a key derived from `VESTA_CONTROL_SIGNING_SECRET`).
+A grant never works as a control token, for another device or for the other role.
+
+- `POST /api/v1/pairing-codes` (`X-Dashboard-Key`) `{"scope": "companion" | "contact",
+  "device_id"?: "..."}` → `{scope, device_id, code, expires_at}`. 8 characters, one use,
+  `VESTA_PAIRING_CODE_TTL_SECONDS` (600 s).
+- `POST /api/v1/pairing/claim` `{"code": "ABCD2345"}` → `{scope, device_id, access_token,
+  expires_at}`. Spaces/dashes and case are ignored. Wrong codes: `401`; more than 10 wrong
+  codes per minute: `429 TOO_MANY_ATTEMPTS`.
+- `GET /api/v1/companion/session` (Bearer companion grant) → `{device_id, session, control_token,
+  control_token_expires_at}` for the device's unfinished session, or `session: null`. The phone
+  polls this every 3 s, so a joystick activation is taken over without typing any token.
+- `GET /api/v1/contact/status` (Bearer contact grant) → `{device_id, generated_at, alerts[]}`;
+  each item has `session_id`, `state`, `alert_reason`, `alert`, `location_status`
+  (`CURRENT`/`STALE`/`UNAVAILABLE`, stale after `VESTA_GPS_STALE_SECONDS`) and `location`
+  (last authorized position with `age_seconds`, `is_stale`, `accuracy_meters`) **only while the
+  alert is ACTIVE**.
+- `POST /api/v1/contact/alerts/{alert_id}/viewed` (Bearer contact grant) → `AlertView`. Records
+  the first display (`viewed_at`, event `alert.viewed`); later calls keep the first time. An
+  alert of another device answers `404`.
+
 ## Alert model
 
 Exactly one active alert exists per session. Concurrent SOS and automatic timeout converge on
@@ -247,9 +280,13 @@ the same `alert_id`; notification is requested once. An alert includes:
   "notification_requested_at": "2026-11-14T10:03:00Z",
   "resolved_at": null,
   "resolution_action": null,
-  "version": 1
+  "version": 1,
+  "viewed_at": null
 }
 ```
+
+`viewed_at` is set only when the authorized contact page displayed the alert; creating the
+alert or requesting its notification is never treated as seen.
 
 When the alert is first transmitted, `alert.notification_requested` includes the last location
 previously accepted through the authorized session endpoint, when one exists:
@@ -314,7 +351,11 @@ safety behavior.
 ## Dashboard and events
 
 `GET /api/v1/status` returns `system_state`, `system_health`, `generated_at`,
-`latest_sequence`, `sessions` and `voice_mode`. `WS /ws/events` starts with an authenticated
+`latest_sequence`, `sessions`, `voice_mode` and `power` (`{state, detail, checked_at}` from
+`vcgencmd get_throttled` on the Pi, or `null`; never a battery percentage). The first WebSocket
+message, when a dashboard key is configured, must be `{"type":"auth","dashboard_key":...}` or
+`{"type":"auth","session_id":...,"control_token":...}`. The WebSocket accepts origins in
+`VESTA_CORS_ORIGINS` and pages served by the backend itself (`VESTA_FRONTEND_DIST`). `WS /ws/events` starts with an authenticated
 snapshot and then ordered events. A slow client may receive `stream.resync_required` and must
 refresh through an authorized read.
 
@@ -324,7 +365,8 @@ Important event types include:
 - `safety.check_in_requested`, `safety.check_in_delivered`, `safety.check_in_undelivered`,
   `safety.check_in_unconfirmed`, `safety.check_in_confirmed`, `safety.check_in_deferred`
 - `safety.alerted`, `alert.notification_requested`, `safety.alert_resolved`, `alert.resolved`
-- `technical.issue_reported`, `technical.issue_resolved`, `voice.status_changed`
+- `technical.issue_reported`, `technical.issue_resolved`, `voice.status_changed`,
+  `client.status_changed`, `technical.power`, `alert.viewed`
 - `system.snapshot`, `system.heartbeat`, `stream.resync_required`
 
 Each effective update includes the server-side session `version`. A client must not infer the

@@ -6,7 +6,8 @@ import { initialLiveState, liveReducer, type LiveState } from "./liveState";
 
 /*
  * Live server link: the dashboard reads system status; the phone reads its token-scoped
- * session. In production both WebSocket scopes authenticate before receiving a snapshot.
+ * session. When the backend has a dashboard key (required outside development/test), the first
+ * WebSocket message must be {type:"auth"} with the dashboard key or the session's control token.
  *
  * CONNECTED     the socket is open, the snapshot arrived and the server spoke recently
  *               (events or system.heartbeat). navigator.onLine is never enough on its own.
@@ -77,11 +78,10 @@ export function useLiveConnection(options: LiveConnectionOptions = {}) {
 
   const connect = useCallback(() => {
     if (stopped.current) return;
+    // Before pairing, a production phone page has nothing it may read.
     if (!import.meta.env.DEV && scope === "session" && !sessionCredential) return;
-    if (!import.meta.env.DEV && scope === "dashboard" && !dashboardKey) {
-      setAuthRequired(true);
-      return;
-    }
+    // Whether the server needs a key is the server's decision (VESTA_DASHBOARD_API_KEY), not the
+    // build mode's: connect, send any credential we hold, and treat close code 1008 as "auth needed".
     window.clearTimeout(retryTimer.current);
     const existing = socketRef.current;
     if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) return;
@@ -105,12 +105,12 @@ export function useLiveConnection(options: LiveConnectionOptions = {}) {
     };
 
     socket.onopen = () => {
-      if (!import.meta.env.DEV) {
-        if (scope === "session" && sessionCredential) {
-          socket.send(JSON.stringify({ type: "auth", session_id: sessionCredential.sessionId, control_token: sessionCredential.token }));
-        } else if (scope === "dashboard" && dashboardKey) {
-          socket.send(JSON.stringify({ type: "auth", dashboard_key: dashboardKey }));
-        }
+      // The credential travels inside the socket, never in the URL. A server running without a
+      // dashboard key ignores this message and streams straight away.
+      if (scope === "session" && sessionCredential) {
+        socket.send(JSON.stringify({ type: "auth", session_id: sessionCredential.sessionId, control_token: sessionCredential.token }));
+      } else if (scope === "dashboard" && dashboardKey) {
+        socket.send(JSON.stringify({ type: "auth", dashboard_key: dashboardKey }));
       }
       armSilence();
       void refreshStatus();
@@ -136,7 +136,9 @@ export function useLiveConnection(options: LiveConnectionOptions = {}) {
     socket.onclose = (event) => {
       window.clearTimeout(silenceTimer.current);
       if (socketRef.current === socket) socketRef.current = null;
-      if (!import.meta.env.DEV && event.code === 1008) {
+      // 1008: missing/invalid credential or disallowed Origin. Retrying with the same credential
+      // cannot succeed; a new credential re-runs the connection effect.
+      if (event.code === 1008) {
         setAuthRequired(true);
         setLink((previous) => ({ ...previous, state: "DISCONNECTED" }));
         return;
@@ -208,6 +210,7 @@ export function useLiveConnection(options: LiveConnectionOptions = {}) {
     setDashboardKey(key.trim());
     setAuthRequired(false);
   }, []);
+  const requireDashboardAuth = useCallback(() => setAuthRequired(true), []);
   const authorizeSessionStream = useCallback((credential: SessionStreamCredential | null) => {
     setSessionCredential(credential);
     setAuthRequired(false);
@@ -223,6 +226,9 @@ export function useLiveConnection(options: LiveConnectionOptions = {}) {
     authRequired,
     authenticateDashboard,
     authorizeSessionStream,
+    requireDashboardAuth,
+    /** Kept in memory only; needed for operator calls such as creating a pairing code. */
+    dashboardKey,
   } as const;
 }
 

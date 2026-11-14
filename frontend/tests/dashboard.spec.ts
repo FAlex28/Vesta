@@ -117,25 +117,85 @@ test.describe("dashboard", () => {
     await backend.install();
     await page.goto("/");
     await expect(page.getByText("Punct de referință simulat, nu este locația unei persoane")).toBeVisible();
-    await expect(page.getByTestId("signal-gps")).toContainText("UNAVAILABLE");
+    await expect(page.getByTestId("signal-gps")).toContainText("Indisponibil");
     // Read-only: no session controls on the dashboard.
     await expect(page.getByRole("button", { name: /SOS|Sunt bine|Anulează|Pornește/ })).toHaveCount(0);
     expect(backend.requests.every((request) => request.method === "GET")).toBe(true);
   });
 
-  test("contact page reflects ALERT then RESOLVED from backend events, without coordinates", async ({ page }) => {
+  test("phone status from the v2 stream updates the signals without refetching /status each heartbeat", async ({ page }) => {
     const backend = new MockBackend(page);
-    const session = makeSession({ state: "ALERT", alert_reason: "missed_check_ins" });
+    const seen = new Date().toISOString();
+    const session = makeSession({ client_last_seen_at: seen, connection_lease_expires_at: new Date(Date.now() + 40_000).toISOString() });
     backend.sessions = [session];
     await backend.install();
-    await page.goto("/contact");
-    await expect(page.getByTestId("contact-state")).toHaveText(/Alertă activă/);
-    await expect(page.getByTestId("alert-row")).toContainText("Verificări fără răspuns");
+    await page.goto("/");
+    await expect(page.getByTestId("signal-phone")).toContainText("Conectat");
+    await expect(page.getByTestId("signal-gps")).toContainText("Indisponibil");
+    const statusCalls = backend.calls("/api/v1/status").length;
 
-    session.state = "CANCELLED";
-    backend.publish("session.cancelled", { from_state: "ALERT", state: "CANCELLED" }, SESSION_ID);
-    await expect(page.getByTestId("contact-state")).toHaveText(/Nicio alertă activă/);
-    await expect(page.getByTestId("alert-row")).toContainText("RESOLVED");
-    await expect(page.getByText(/\d+\.\d{4,}, \d+\.\d{4,}/)).toHaveCount(0);
+    for (let beat = 0; beat < 3; beat += 1) {
+      backend.publish("client.status_changed", {
+        page_visibility: "VISIBLE", connectivity_status: "CONNECTED", audio_status: "CONNECTED", gps_status: "GPS_AVAILABLE",
+        power_status: "POWER_STATUS_UNKNOWN", health_status: "HEALTHY", state: "ACTIVE", version: 2 + beat, source: "client_heartbeat",
+      });
+    }
+    await expect(page.getByTestId("signal-gps")).toContainText("Disponibil");
+    await expect(page.getByTestId("signal-voice")).toContainText("Audio conectat");
+    backend.publish("client.status_changed", {
+      page_visibility: "HIDDEN", connectivity_status: "CONNECTED", audio_status: "CONNECTED", gps_status: "GPS_STALE",
+      power_status: "POWER_STATUS_UNKNOWN", health_status: "DEGRADED", state: "ACTIVE", version: 9, source: "android",
+    });
+    await expect(page.getByTestId("signal-gps")).toContainText("Poziție veche");
+    await expect(page.getByTestId("signal-phone")).toContainText("pagină în fundal");
+    // Routine heartbeats are applied but not logged; the explicit change is.
+    await expect(page.getByTestId("log-row")).toHaveCount(1);
+    await page.waitForTimeout(600);
+    expect(backend.calls("/api/v1/status").length).toBe(statusCalls);
+  });
+
+  test("Raspberry Pi power comes from technical.power; no battery percentage", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.sessions = [makeSession()];
+    await backend.install();
+    await page.goto("/");
+    await expect(page.getByTestId("signal-power")).toContainText("Neraportată");
+    backend.publish("technical.power", { state: "POWER_UNSTABLE", detail: "undervoltage flag" }, null);
+    await expect(page.getByTestId("signal-power")).toContainText("POWER_UNSTABLE");
+    await expect(page.getByTestId("signal-power")).not.toContainText("%");
+  });
+
+  test("v2 alert: reason and notification are readable; coordinates are never displayed or kept", async ({ page }) => {
+    const backend = new MockBackend(page);
+    const session = makeSession();
+    backend.sessions = [session];
+    await backend.install();
+    await page.goto("/");
+    await expect(page.getByTestId("session-title")).toHaveAttribute("data-state", "ACTIVE");
+
+    const now = new Date().toISOString();
+    session.state = "ALERT";
+    session.alert_reason = "MISSED_CHECK_INS";
+    session.alert = { id: "alert-7", incident_type: "MISSED_CHECK_INS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 };
+    backend.publish("safety.alerted", { from_state: "UNCONFIRMED", state: "ALERT", reason: "MISSED_CHECK_INS", missed_attempts: 2 });
+    backend.publish("alert.notification_requested", {
+      alert_id: "alert-7", incident_type: "MISSED_CHECK_INS", gps_status: "GPS_STALE", location_available: true,
+      location: { latitude: 45.761234, longitude: 21.229876, captured_at: now, age_seconds: 60, is_stale: true, accuracy_meters: 18, source: "android" },
+    });
+    await expect(page.getByTestId("alert-row")).toContainText("Verificări fără răspuns");
+    await expect(page.getByTestId("alert-location")).toContainText("Atașată alertei");
+    await expect(page.getByTestId("alert-location")).toContainText("veche");
+    await expect(page.getByText(/45\.7612|21\.2298/)).toHaveCount(0);
+  });
+
+  test("the operator creates one-time pairing codes for the phone and the contact", async ({ page }) => {
+    const backend = new MockBackend(page);
+    await backend.install();
+    await page.goto("/");
+    await page.getByTestId("pair-code-companion").click();
+    await expect(page.getByTestId("pair-code-value-companion")).toContainText("/companion");
+    await page.getByTestId("pair-code-contact").click();
+    await expect(page.getByTestId("pair-code-value-contact")).toContainText("/contact");
+    expect(backend.calls("/api/v1/pairing-codes").map((call) => call.body?.scope)).toEqual(["companion", "contact"]);
   });
 });

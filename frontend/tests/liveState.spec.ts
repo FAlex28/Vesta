@@ -99,3 +99,29 @@ test("one device never shows two ACTIVE sessions: the unfinished one wins over o
   const state = liveReducer(initialLiveState, { type: "snapshot", status: status({ sessions: [old, current] }) });
   expect(primarySession(state, "vesta-01")?.id).toBe("current");
 });
+
+test("routine client.status_changed is applied without a resync and without a log entry", () => {
+  const base = liveReducer(initialLiveState, { type: "snapshot", status: status({ latest_sequence: 1 }), source: "stream" });
+  const state = run(base, event(2, "client.status_changed", { gps_status: "GPS_AVAILABLE", audio_status: "CONNECTED", page_visibility: "HIDDEN", source: "client_heartbeat", state: "ACTIVE", version: 3 }));
+  expect(state.resyncNeeded).toBe(false);
+  expect(state.log).toHaveLength(0);
+  expect(state.sessions[SESSION_ID]).toMatchObject({ gps_status: "GPS_AVAILABLE", audio_status: "CONNECTED", page_visibility: "HIDDEN" });
+});
+
+test("alert.notification_requested keeps location status and age, never coordinates", () => {
+  const base = liveReducer(initialLiveState, { type: "snapshot", status: status({ latest_sequence: 1 }), source: "stream" });
+  const state = run(base, event(2, "alert.notification_requested", {
+    alert_id: "alert-1", gps_status: "GPS_STALE", location_available: true,
+    location: { latitude: 45.7, longitude: 21.2, captured_at: at(0), age_seconds: 90, is_stale: true, accuracy_meters: 10, source: "android" },
+  }));
+  expect(state.alertNotices[SESSION_ID]).toMatchObject({ alertId: "alert-1", locationAvailable: true, ageSeconds: 90, isStale: true });
+  expect(JSON.stringify(state)).not.toContain("45.7");
+  expect(state.resyncNeeded).toBe(false);
+});
+
+test("technical.power without a session updates the system power", () => {
+  const base = liveReducer(initialLiveState, { type: "snapshot", status: status({ latest_sequence: 1 }), source: "stream" });
+  const state = run(base, { ...event(2, "technical.power", { state: "LOW_VOLTAGE", detail: "under-voltage" }), session_id: null, device_id: null });
+  expect(state.systemPower).toMatchObject({ state: "LOW_VOLTAGE", detail: "under-voltage" });
+  expect(state.resyncNeeded).toBe(false);
+});

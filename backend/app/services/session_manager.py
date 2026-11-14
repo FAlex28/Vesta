@@ -272,6 +272,7 @@ class SessionManager:
                     checkin_id,
                     delivered=delivered,
                     now=instant,
+                    channel=channel,
                 )
             except InvalidCheckIn as exc:
                 raise _checkin_conflict(exc, session, checkin_id) from exc
@@ -900,6 +901,70 @@ class SessionManager:
             existing.fingerprint != command.fingerprint or existing.session_id != command.session_id
         ):
             raise RuntimeError("Recovered idempotency records conflict")
+
+    async def claim_current_session(
+        self,
+        device_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[SafetySession, str, datetime] | None:
+        """For a paired phone: the device's unfinished session and a fresh control token.
+
+        The caller has already verified a companion access token for ``device_id``.
+        """
+
+        instant = _utc_now(now)
+        async with self._lock:
+            unfinished = [
+                session
+                for session in self._sessions.values()
+                if session.device_id == device_id
+                and session.state
+                in {
+                    SessionState.ACTIVE,
+                    SessionState.CHECK_IN,
+                    SessionState.UNCONFIRMED,
+                    SessionState.ALERT,
+                }
+            ]
+            if not unfinished:
+                return None
+            session = max(unfinished, key=lambda item: item.version)
+            token, expires_at = self._issue_control_token(session.session_id, instant)
+            return copy.deepcopy(session), token, expires_at
+
+    async def mark_alert_viewed(
+        self,
+        alert_id: str,
+        *,
+        device_id: str,
+        now: datetime | None = None,
+    ) -> AlertRecord:
+        """Record that the trusted contact of ``device_id`` displayed this alert."""
+
+        instant = _utc_now(now)
+        async with self._lock:
+            try:
+                alert = self._alerts.get(alert_id)
+            except AlertRegistryError as exc:
+                raise NotFoundError("Alert not found") from exc
+            session = self._sessions.get(alert.session_id)
+            if session is None or session.device_id != device_id:
+                # Same answer as an unknown alert: no probing of other devices' alerts.
+                raise NotFoundError("Alert not found")
+            record, first = self._alerts.mark_viewed(alert_id, now=instant)
+            if first:
+                await self._broker.publish(
+                    "alert.viewed",
+                    session_id=session.session_id,
+                    device_id=session.device_id,
+                    data={
+                        "alert_id": record.alert_id,
+                        "viewed_at": instant.isoformat(),
+                        "status": record.status.value,
+                    },
+                )
+            return record
 
     async def get(self, session_id: str) -> SafetySession:
         async with self._lock:

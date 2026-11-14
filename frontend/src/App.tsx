@@ -4,6 +4,7 @@ import { AlertList } from "./components/AlertList";
 import { BrandLockup } from "./components/BrandLockup";
 import { EventLog } from "./components/EventLog";
 import { LinkBadge } from "./components/LinkBadge";
+import { PairingPanel } from "./components/PairingPanel";
 import { SectionHead } from "./components/SectionHead";
 import { SourceTag } from "./components/SourceTag";
 import { StateLadder } from "./components/StateLadder";
@@ -15,6 +16,7 @@ import {
   formatAge,
   formatClock,
   formatDuration,
+  gpsSignal,
   issueLabel,
   issuesOfKind,
   phoneSignal,
@@ -92,7 +94,9 @@ function App() {
   const alerts = sortedAlerts(state);
   const activeAlerts = alerts.filter((alert) => alert.status === "ALERT").length;
   const duration = sessionDuration(session, now);
-  const lastConfirmed = session ? state.lastConfirmedAt[session.id] : undefined;
+  const lastConfirmed = session ? session.last_confirmation_at ?? state.lastConfirmedAt[session.id] : undefined;
+  // Location facts attached to the most recent alert (status and age only, never coordinates).
+  const notice = session ? state.alertNotices[session.id] : undefined;
   const otherIssues = issuesOfKind(session, "other");
   const phone = phoneSignal(session, now);
   const today = new Date(now).toLocaleDateString("ro-RO", { weekday: "long", day: "numeric", month: "long" });
@@ -236,17 +240,8 @@ function App() {
           <dl className="signals">
             <SignalCell name="Conexiune telefon" signal={phone} testId="signal-phone" />
             <SignalCell name="Voce · ElevenLabs" signal={voiceSignal(session, state.voiceMode)} testId="signal-voice" />
-            <SignalCell
-              name="GPS"
-              testId="signal-gps"
-              signal={{
-                state: "UNAVAILABLE",
-                detail: "Locația nu este transmisă către acest panou.",
-                tone: "neutral",
-                mark: "unknown",
-              }}
-            />
-            <SignalCell name="Alimentare Raspberry Pi" signal={powerSignal(session)} testId="signal-power" />
+            <SignalCell name="GPS pe telefon" signal={gpsSignal(session)} testId="signal-gps" />
+            <SignalCell name="Alimentare Raspberry Pi" signal={powerSignal(session, state.systemPower)} testId="signal-power" />
           </dl>
           {otherIssues.length > 0 && (
             <ul className="issue-list" aria-label="Alte avertizări tehnice">
@@ -305,10 +300,20 @@ function App() {
                 <dt>Coordonate</dt>
                 <dd><span className="num sample">{lat.toFixed(4)}, {lng.toFixed(4)}</span></dd>
               </div>
-              <div><dt>Ultima locație reală</dt><dd>UNAVAILABLE · netransmisă</dd></div>
+              <div>
+                <dt>Locația trimisă cu alerta</dt>
+                <dd data-testid="alert-location">
+                  {!notice
+                    ? "Nu este afișată în acest panou"
+                    : notice.locationAvailable
+                      ? `Atașată alertei · captată la ${formatClock(notice.capturedAt)}${notice.isStale ? " · veche" : ""}`
+                      : "Nicio locație autorizată la emiterea alertei"}
+                </dd>
+              </div>
             </dl>
           </section>
 
+          <PairingPanel dashboardKey={live.dashboardKey} onUnauthorized={live.requireDashboardAuth} />
           </div>
         </div>
       </main>
