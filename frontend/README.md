@@ -4,11 +4,11 @@ Aplicație web React + TypeScript + Vite cu trei ecrane:
 
 | Rută | Pentru cine | Ce face |
 | --- | --- | --- |
-| `/` | operatorul / prezentarea | Dashboard: starea sesiunii, conexiunea telefonului, vocea, GPS, alimentarea Raspberry Pi, alertele active și rezolvate, jurnalul live și codurile de asociere pentru telefon și contact. Nu afișează coordonate reale; harta arată doar punctul fix de test. |
-| `/companion` | utilizatoarea, pe telefonul Android | Asocierea cu un cod, preluarea automată a sesiunii pornite din joystick, „Sunt bine”, SOS, anulare/încheiere, închiderea alertei, conversația vocală ElevenLabs, GPS opțional și starea conexiunii. |
-| `/contact` | contactul de încredere | Acces cu un cod; alerta activă cu ultima locație autorizată (doar cât timp alerta e activă), alertele rezolvate cu ora închiderii. |
+| `/` | dispeceratul | Starea sesiunii, conexiunea telefonului, vocea, GPS, alimentarea Raspberry Pi, alertele active și rezolvate, jurnalul live; locația reală doar în timpul unei alerte active (ascunsă în modul prezentare). |
+| `/companion` | persoana protejată, pe telefonul Android | Asocierea cu QR-ul de pe dispozitiv, preluarea automată a sesiunii pornite din joystick, „Sunt bine”, SOS, anulare/încheiere, închiderea alertei, conversația vocală ElevenLabs, GPS opțional, contactele de urgență și starea conexiunii. |
+| `/contact` | contactul de urgență | Acces prin linkul din SMS; notificări push; alerta activă cu ultima locație autorizată (doar cât timp alerta e activă), alertele rezolvate cu ora închiderii. |
 
-Datele și comenzile urmează `shared/API_CONTRACT.md` v3.
+Datele și comenzile urmează `shared/API_CONTRACT.md` v4. Interfața folosește tema întunecată „Vesta Night”: culoarea poartă doar starea.
 
 ## Rulare
 
@@ -34,9 +34,11 @@ Serverul Vite redirecționează `/api`, `/ws` și `/health` către backend (`VES
 
 ## Asocierea și accesul
 
-1. Dashboardul (autentificat cu `VESTA_DASHBOARD_API_KEY`, ținută doar în memoria filei) creează un cod de 8 caractere, valabil 10 minute și o singură dată.
-2. Telefonul introduce codul în `/companion` și primește o asociere limitată la acel dispozitiv (24 h, păstrată pe telefon, „Uită asocierea” o șterge). Telefonul întreabă serverul la 3 s dacă rulează o sesiune; când joystickul pornește una, o preia singur. Tokenul de control al sesiunii nu este salvat niciodată: e cerut din nou de la server.
-3. Contactul introduce un cod de contact în `/contact` și vede doar alertele acelui dispozitiv. Deschiderea unei alerte active este raportată serverului ca „văzută” (`viewed_at`).
+1. **Telefonul persoanei** scanează QR-ul de pe dispozitivul Vesta (`/companion#pair=COD`) sau scrie codul de 10 caractere. Primește o asociere limitată la acel dispozitiv (30 de zile, păstrată pe telefon, revocabilă din lista „Telefoane asociate”). Telefonul întreabă serverul la 3 s dacă rulează o sesiune; când joystickul pornește una, o preia singur. Tokenul de control al sesiunii nu este salvat: e cerut din nou de la server.
+2. **Contactele de urgență** le alege persoana, pe telefonul ei: nume și număr → invitație de unică folosință → **Trimite prin SMS** (se deschide aplicația de mesaje cu textul gata). Contactul deschide `/contact#cod=COD`, vede doar alertele acelei persoane și apasă **Permite notificările**; alertele ajung apoi ca notificări push chiar cu pagina închisă (`public/sw.js`).
+3. **Dispeceratul** (`/`, cheia `VESTA_DASHBOARD_API_KEY` ținută doar în memoria filei) doar monitorizează. În timpul unei alerte active vede ultima locație autorizată; **Mod prezentare** ascunde coordonatele.
+
+Codurile din link sunt citite din fragmentul URL (nu ajung la server sau în loguri) și șterse imediat din bara de adrese.
 
 ## Ce garantează interfața
 
@@ -47,7 +49,7 @@ Serverul Vite redirecționează `/api`, `/ws` și `/health` către backend (`VES
 - Telefonul raportează vizibilitatea paginii, disponibilitatea GPS și starea vocii; coordonatele pleacă doar prin comutatorul explicit de partajare, oprit implicit.
 - Nu există procent de baterie: alimentarea Pi-ului vine din `vcgencmd`.
 
-Limite: comportamentul cu ecranul blocat depinde de browserul Android și trebuie verificat pe telefonul real. Nu există evenimente de progres pentru apăsarea de 5 s. Vesta nu apelează 112 și nu trimite SMS sau push; contactul vede alerta doar pe pagina `/contact` deschisă.
+Limite: comportamentul cu ecranul blocat și livrarea notificărilor push depind de Android/Chrome și trebuie verificate pe telefoanele reale. Nu există evenimente de progres pentru apăsarea de 5 s. Vesta nu apelează 112 și nu trimite SMS de pe server.
 
 ## Teste
 

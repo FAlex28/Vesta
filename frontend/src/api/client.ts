@@ -1,14 +1,14 @@
 import { apiBaseUrl } from "./config";
 import type {
-  AccessScope,
   AlertView,
   ApiErrorBody,
   CancelReason,
   CommandResponse,
+  AccessGrantResponse,
+  CompanionProfile,
   CompanionSessionResponse,
+  ContactInvite,
   ContactStatusResponse,
-  PairingClaimResponse,
-  PairingCodeResponse,
   VoiceStatus,
   ContractTechnicalIssue,
   LocationUpdateResponse,
@@ -107,6 +107,7 @@ async function request<T>(path: string, init: RequestInit & { token?: string; da
     throw new ApiError(kind, response.status, code, message);
   }
 
+  if (response.status === 204) return undefined as T;
   try {
     return (await response.json()) as T;
   } catch {
@@ -179,12 +180,42 @@ export const api = {
       token,
     ),
 
-  /** Operator only (dashboard key). The code is typed once on the phone or by the contact. */
-  createPairingCode: (scope: AccessScope, dashboardKey?: string) =>
-    request<PairingCodeResponse>("/api/v1/pairing-codes", { method: "POST", body: JSON.stringify({ scope }), dashboardKey }),
+  /** The code printed on the Vesta device (or inside its QR code), typed/scanned once by the phone. */
+  pairDevice: (code: string, label: string) =>
+    request<AccessGrantResponse>("/api/v1/pairing/device", { method: "POST", body: JSON.stringify({ code, label }) }),
 
-  claimPairingCode: (code: string) =>
-    request<PairingClaimResponse>("/api/v1/pairing/claim", { method: "POST", body: JSON.stringify({ code }) }),
+  companionProfile: (accessToken: string) => request<CompanionProfile>("/api/v1/companion/profile", { token: accessToken }),
+
+  updateProfile: (accessToken: string, displayName: string) =>
+    request<CompanionProfile>("/api/v1/companion/profile", {
+      method: "POST",
+      body: JSON.stringify({ display_name: displayName }),
+      token: accessToken,
+    }),
+
+  revokePhone: (accessToken: string, phoneId: string) =>
+    request<CompanionProfile>(`/api/v1/companion/phones/${encodeURIComponent(phoneId)}/revoke`, { method: "POST", token: accessToken }),
+
+  addContact: (accessToken: string, name: string, phone: string) =>
+    request<ContactInvite>("/api/v1/companion/contacts", { method: "POST", body: JSON.stringify({ name, phone }), token: accessToken }),
+
+  reinviteContact: (accessToken: string, contactId: string) =>
+    request<ContactInvite>(`/api/v1/companion/contacts/${encodeURIComponent(contactId)}/invite`, { method: "POST", token: accessToken }),
+
+  revokeContact: (accessToken: string, contactId: string) =>
+    request<CompanionProfile>(`/api/v1/companion/contacts/${encodeURIComponent(contactId)}/revoke`, { method: "POST", token: accessToken }),
+
+  /** The emergency contact opens the SMS link (or types the code) once. */
+  claimContact: (code: string) =>
+    request<AccessGrantResponse>("/api/v1/contact/claim", { method: "POST", body: JSON.stringify({ code }) }),
+
+  contactPushKey: (accessToken: string) => request<{ public_key: string }>("/api/v1/contact/push/key", { token: accessToken }),
+
+  contactPushSubscribe: (accessToken: string, subscription: PushSubscriptionJSON) =>
+    request<void>("/api/v1/contact/push/subscribe", { method: "POST", body: JSON.stringify(subscription), token: accessToken }),
+
+  contactPushUnsubscribe: (accessToken: string, endpoint: string) =>
+    request<void>("/api/v1/contact/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint }), token: accessToken }),
 
   /** Paired phone: the device's running session and a fresh control token, or session null. */
   companionSession: (accessToken: string) => request<CompanionSessionResponse>("/api/v1/companion/session", { token: accessToken }),

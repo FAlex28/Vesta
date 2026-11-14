@@ -84,11 +84,20 @@ class Settings:
     persistence_mode: str = "memory"
     trusted_contact_ids: tuple[str, ...] = ("demo-contact",)
 
-    # Phone / trusted-contact access (codes from the dashboard, see app/services/access.py).
-    pairing_code_ttl_seconds: float = 600.0
-    companion_token_ttl_seconds: int = 24 * 60 * 60
-    contact_token_ttl_seconds: int = 24 * 60 * 60
+    # Phone pairing (code printed on the device) and emergency contacts (see app/services/access.py).
+    device_pairing_code: str | None = field(default=None, repr=False)
+    state_dir: str | None = None
+    max_paired_phones: int = 5
+    contact_invite_ttl_seconds: float = 24 * 60 * 60
+    companion_token_ttl_seconds: int = 30 * 24 * 60 * 60
+    contact_token_ttl_seconds: int = 30 * 24 * 60 * 60
     gps_stale_seconds: float = 60.0
+    # Web Push for emergency contacts (generated and kept in the state dir when unset).
+    vapid_private_key: str | None = field(default=None, repr=False)
+    vapid_public_key: str | None = None
+    vapid_subject: str = "mailto:vesta@example.invalid"
+    # Stable public HTTPS address, used in the QR code and documentation only.
+    public_url: str | None = None
     # Built web app (frontend/dist) served by this process, so the phone needs one address.
     frontend_dist: str | None = None
     power_poll_seconds: float = 30.0
@@ -198,10 +207,17 @@ class Settings:
             websocket_auth_timeout_seconds=_get_float("VESTA_WEBSOCKET_AUTH_TIMEOUT_SECONDS", 5.0),
             persistence_mode=persistence_mode,
             trusted_contact_ids=contacts,
-            pairing_code_ttl_seconds=_get_float("VESTA_PAIRING_CODE_TTL_SECONDS", 600.0),
-            companion_token_ttl_seconds=_get_int("VESTA_COMPANION_TOKEN_TTL_SECONDS", 86400),
-            contact_token_ttl_seconds=_get_int("VESTA_CONTACT_TOKEN_TTL_SECONDS", 86400),
+            device_pairing_code=(os.getenv("VESTA_DEVICE_PAIRING_CODE") or "").strip() or None,
+            state_dir=(os.getenv("VESTA_STATE_DIR") or "").strip() or None,
+            max_paired_phones=_get_int("VESTA_MAX_PAIRED_PHONES", 5),
+            contact_invite_ttl_seconds=_get_float("VESTA_CONTACT_INVITE_TTL_SECONDS", 86400.0),
+            companion_token_ttl_seconds=_get_int("VESTA_COMPANION_TOKEN_TTL_SECONDS", 2592000),
+            contact_token_ttl_seconds=_get_int("VESTA_CONTACT_TOKEN_TTL_SECONDS", 2592000),
             gps_stale_seconds=_get_float("VESTA_GPS_STALE_SECONDS", 60.0),
+            vapid_private_key=(os.getenv("VESTA_VAPID_PRIVATE_KEY") or "").strip() or None,
+            vapid_public_key=(os.getenv("VESTA_VAPID_PUBLIC_KEY") or "").strip() or None,
+            vapid_subject=os.getenv("VESTA_VAPID_SUBJECT", "mailto:vesta@example.invalid").strip(),
+            public_url=(os.getenv("VESTA_PUBLIC_URL") or "").strip().rstrip("/") or None,
             frontend_dist=(os.getenv("VESTA_FRONTEND_DIST") or "").strip() or None,
             power_poll_seconds=_get_float("VESTA_POWER_POLL_SECONDS", 30.0),
         )

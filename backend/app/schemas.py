@@ -252,32 +252,89 @@ class SystemStatusResponse(StrictModel):
     voice_mode: Literal["elevenlabs", "demo"]
     # Raspberry Pi power as read from vcgencmd; null until the first reading.
     power: PowerView | None = None
+    # Dispatcher only: last authorized location of sessions whose alert is ACTIVE.
+    alert_locations: list[AlertLocationView] = Field(default_factory=list)
 
 
-AccessScopeName = Literal["companion", "contact"]
+Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=32)]
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
 
 
-class PairingCodeRequest(StrictModel):
-    scope: AccessScopeName
-    device_id: Identifier | None = None
+class DevicePairRequest(StrictModel):
+    """The code printed on the Vesta device (also inside its QR code)."""
+
+    code: Code
+    label: Annotated[str, StringConstraints(strip_whitespace=True, max_length=60)] | None = None
 
 
-class PairingCodeResponse(StrictModel):
-    scope: AccessScopeName
+class AccessGrantResponse(StrictModel):
+    scope: Literal["companion", "contact"]
     device_id: str
+    access_token: str
+    expires_at: datetime
+
+
+class PhoneView(StrictModel):
+    id: str
+    label: str
+    created_at: datetime
+    last_seen_at: datetime
+
+
+class EmergencyContactView(StrictModel):
+    id: str
+    name: str
+    phone: str
+    created_at: datetime
+    accepted_at: datetime | None
+    push_enabled: bool
+    invite_pending: bool
+
+
+class CompanionProfileResponse(StrictModel):
+    device_id: str
+    display_name: str | None
+    this_phone_id: str
+    phones: list[PhoneView]
+    contacts: list[EmergencyContactView]
+
+
+class ProfileUpdateRequest(StrictModel):
+    display_name: Annotated[str, StringConstraints(strip_whitespace=True, max_length=60)] | None = None
+
+
+class ContactCreateRequest(StrictModel):
+    name: ShortText
+    phone: Annotated[str, StringConstraints(strip_whitespace=True, min_length=6, max_length=25)]
+
+
+class ContactInviteView(StrictModel):
+    contact: EmergencyContactView
     code: str
     expires_at: datetime
 
 
-class PairingClaimRequest(StrictModel):
-    code: Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=32)]
+class ContactClaimRequest(StrictModel):
+    code: Code
 
 
-class PairingClaimResponse(StrictModel):
-    scope: AccessScopeName
-    device_id: str
-    access_token: str
-    expires_at: datetime
+class PushKeys(StrictModel):
+    p256dh: Annotated[str, StringConstraints(min_length=16, max_length=256)]
+    auth: Annotated[str, StringConstraints(min_length=8, max_length=64)]
+
+
+class PushSubscribeRequest(StrictModel):
+    endpoint: Annotated[str, StringConstraints(min_length=10, max_length=1024)]
+    keys: PushKeys
+    expirationTime: float | None = None  # noqa: N815 - name defined by the Push API
+
+
+class PushUnsubscribeRequest(StrictModel):
+    endpoint: Annotated[str, StringConstraints(min_length=10, max_length=1024)]
+
+
+class PushKeyResponse(StrictModel):
+    public_key: str
 
 
 class CompanionSessionResponse(StrictModel):
@@ -287,13 +344,23 @@ class CompanionSessionResponse(StrictModel):
     control_token_expires_at: datetime | None
 
 
-class ContactLocationView(StrictModel):
+class LocationFix(StrictModel):
     latitude: float
     longitude: float
     captured_at: datetime
     age_seconds: float
     is_stale: bool
     accuracy_meters: float | None
+
+
+class ContactLocationView(LocationFix):
+    pass
+
+
+class AlertLocationView(LocationFix):
+    """Last authorized location of a session whose alert is ACTIVE (dispatcher view)."""
+
+    session_id: str
 
 
 class ContactAlertView(StrictModel):
@@ -304,11 +371,16 @@ class ContactAlertView(StrictModel):
     # Only while the alert is ACTIVE; never after it is resolved.
     location: ContactLocationView | None
     location_status: Literal["CURRENT", "STALE", "UNAVAILABLE"]
+    # Whether the push "alert raised" reached a push service for this contact's browsers.
+    push_status: str | None = None
 
 
 class ContactStatusResponse(StrictModel):
     device_id: str
     generated_at: datetime
+    person_name: str | None
+    contact_name: str
+    push_enabled: bool
     alerts: list[ContactAlertView]
 
 
@@ -320,3 +392,6 @@ class ErrorBody(StrictModel):
 
 class ErrorResponse(StrictModel):
     error: ErrorBody
+
+
+SystemStatusResponse.model_rebuild()

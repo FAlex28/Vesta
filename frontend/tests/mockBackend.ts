@@ -133,15 +133,29 @@ export class MockBackend {
   acceptSockets = true;
   /** The backend's one-conversation-per-session reservation. */
   voiceReserved = false;
-  /** One-time pairing codes issued by "the dashboard". */
-  codes = new Map<string, "companion" | "contact">();
+  /** Code printed on the device (QR label); reusable, unlike invites. */
+  deviceCode = "VESTA23456";
+  ownerName: string | null = null;
+  phones: Array<{ id: string; label: string; created_at: string; last_seen_at: string }> = [];
+  contacts: Array<{ id: string; name: string; phone: string; created_at: string; accepted_at: string | null; push_enabled: boolean; invite_pending: boolean }> = [];
+  /** One-time contact invites: code -> contact id. */
+  invites = new Map<string, string>();
   /** Last authorized location per session, as the real backend keeps it. */
   locations = new Map<string, { latitude: number; longitude: number; captured_at: string; accuracy_meters: number | null }>();
 
-  issueCode(scope: "companion" | "contact", code = scope === "companion" ? "PHONE234" : "CONTACT7") {
-    this.codes.set(code, scope);
+  /** An invite for a new contact, as if the person had added one on her phone. */
+  inviteContact(name = "Mama", phone = "+40722123456") {
+    const id = `ct-${this.contacts.length + 1}`;
+    this.contacts.push({ id, name, phone, created_at: new Date().toISOString(), accepted_at: null, push_enabled: false, invite_pending: true });
+    const code = `INV${String(this.contacts.length).padStart(5, "7")}`;
+    this.invites.set(code, id);
     return code;
   }
+
+  private profile() {
+    return { device_id: "vesta-01", display_name: this.ownerName, this_phone_id: this.phones[0]?.id ?? "ph-1", phones: this.phones, contacts: this.contacts };
+  }
+
   private eventCounter = 0;
 
   constructor(private page: Page) {}
@@ -155,6 +169,13 @@ export class MockBackend {
       latest_sequence: this.sequence,
       sessions: structuredClone(this.sessions),
       voice_mode: this.voiceMode,
+      alert_locations: this.sessions
+        .filter((item) => item.alert?.status === "ACTIVE" && this.locations.has(item.id))
+        .map((item) => {
+          const location = this.locations.get(item.id)!;
+          const age = (Date.now() - Date.parse(location.captured_at)) / 1000;
+          return { session_id: item.id, ...location, age_seconds: age, is_stale: age > 60 };
+        }),
     };
   }
 
@@ -214,28 +235,67 @@ export class MockBackend {
     if (recorded.path === "/api/v1/status") return route.fulfill({ json: this.status() });
 
     const unauthorized = () => route.fulfill({ status: 401, json: { error: { code: "UNAUTHORIZED", message: "Invalid or missing authorization" } } });
-    if (recorded.path === "/api/v1/pairing-codes" && recorded.method === "POST") {
-      const scope = body?.scope === "contact" ? "contact" : "companion";
-      const code = this.issueCode(scope, `${scope === "companion" ? "PH" : "CT"}${String(this.codes.size).padStart(6, "2")}`);
-      return route.fulfill({ json: { scope, device_id: "vesta-01", code, expires_at: new Date(Date.now() + 600_000).toISOString() } });
-    }
-    if (recorded.path === "/api/v1/pairing/claim" && recorded.method === "POST") {
-      const code = String(body?.code ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-      const scope = this.codes.get(code);
-      if (!scope) return unauthorized();
-      this.codes.delete(code);
-      return route.fulfill({
+    const normalize = (value: unknown) => String(value ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const grant = (scope: "companion" | "contact") =>
+      route.fulfill({
         json: { scope, device_id: "vesta-01", access_token: scope === "companion" ? COMPANION_TOKEN : CONTACT_TOKEN, expires_at: new Date(Date.now() + 86_400_000).toISOString() },
       });
+    if (recorded.path === "/api/v1/pairing/device" && recorded.method === "POST") {
+      if (normalize(body?.code) !== this.deviceCode) return unauthorized();
+      const now = new Date().toISOString();
+      this.phones.push({ id: `ph-${this.phones.length + 1}`, label: String(body?.label ?? "Telefon"), created_at: now, last_seen_at: now });
+      return grant("companion");
     }
-    if (recorded.path === "/api/v1/companion/session") {
+    if (recorded.path === "/api/v1/contact/claim" && recorded.method === "POST") {
+      const code = normalize(body?.code);
+      const contactId = this.invites.get(code);
+      if (!contactId) return unauthorized();
+      this.invites.delete(code);
+      const contact = this.contacts.find((item) => item.id === contactId)!;
+      contact.accepted_at = new Date().toISOString();
+      contact.invite_pending = false;
+      return grant("contact");
+    }
+    if (recorded.path.startsWith("/api/v1/companion/")) {
       if (recorded.auth !== `Bearer ${COMPANION_TOKEN}`) return unauthorized();
-      const live = this.sessions.find((item) => item.state !== "CANCELLED");
-      return route.fulfill({
-        json: live
-          ? { device_id: "vesta-01", session: structuredClone(live), control_token: TOKEN, control_token_expires_at: new Date(Date.now() + 3_600_000).toISOString() }
-          : { device_id: "vesta-01", session: null, control_token: null, control_token_expires_at: null },
-      });
+      if (recorded.path === "/api/v1/companion/session") {
+        const live = this.sessions.find((item) => item.state !== "CANCELLED");
+        return route.fulfill({
+          json: live
+            ? { device_id: "vesta-01", session: structuredClone(live), control_token: TOKEN, control_token_expires_at: new Date(Date.now() + 3_600_000).toISOString() }
+            : { device_id: "vesta-01", session: null, control_token: null, control_token_expires_at: null },
+        });
+      }
+      if (recorded.path === "/api/v1/companion/profile") {
+        if (recorded.method === "POST") this.ownerName = (body?.display_name as string | null) ?? null;
+        return route.fulfill({ json: this.profile() });
+      }
+      if (recorded.path === "/api/v1/companion/contacts" && recorded.method === "POST") {
+        if (!/^\+?[0-9 ()-]{6,}$/.test(String(body?.phone ?? ""))) return route.fulfill({ status: 422, json: { error: { code: "INVALID_INPUT", message: "phone" } } });
+        const code = this.inviteContact(String(body?.name), String(body?.phone).replace(/[^0-9+]/g, ""));
+        const contact = this.contacts[this.contacts.length - 1];
+        return route.fulfill({ json: { contact, code, expires_at: new Date(Date.now() + 86_400_000).toISOString() } });
+      }
+      const contactAction = recorded.path.match(/^\/api\/v1\/companion\/contacts\/([^/]+)\/(invite|revoke)$/);
+      if (contactAction) {
+        const [, id, what] = contactAction;
+        if (what === "revoke") {
+          this.contacts = this.contacts.filter((item) => item.id !== id);
+          return route.fulfill({ json: this.profile() });
+        }
+        const code = `RE${String(Date.now()).slice(-6)}`;
+        this.invites.set(code, id);
+        return route.fulfill({ json: { contact: this.contacts.find((item) => item.id === id), code, expires_at: new Date(Date.now() + 86_400_000).toISOString() } });
+      }
+      const phoneAction = recorded.path.match(/^\/api\/v1\/companion\/phones\/([^/]+)\/revoke$/);
+      if (phoneAction) {
+        this.phones = this.phones.filter((item) => item.id !== phoneAction[1]);
+        return route.fulfill({ json: this.profile() });
+      }
+    }
+    if (recorded.path === "/api/v1/contact/push/key") {
+      if (recorded.auth !== `Bearer ${CONTACT_TOKEN}`) return unauthorized();
+      return route.fulfill({ json: { public_key: "BMx7test-public-key" } });
     }
     if (recorded.path === "/api/v1/contact/status") {
       if (recorded.auth !== `Bearer ${CONTACT_TOKEN}`) return unauthorized();
@@ -251,9 +311,12 @@ export class MockBackend {
             alert: structuredClone(item.alert),
             location: location ? { ...location, age_seconds: age, is_stale: age > 60 } : null,
             location_status: location ? (age > 60 ? "STALE" : "CURRENT") : "UNAVAILABLE",
+            push_status: null,
           };
         });
-      return route.fulfill({ json: { device_id: "vesta-01", generated_at: new Date().toISOString(), alerts } });
+      return route.fulfill({
+        json: { device_id: "vesta-01", generated_at: new Date().toISOString(), person_name: this.ownerName, contact_name: "Mama", push_enabled: false, alerts },
+      });
     }
     const viewed = recorded.path.match(/^\/api\/v1\/contact\/alerts\/([^/]+)\/viewed$/);
     if (viewed && recorded.method === "POST") {

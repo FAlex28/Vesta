@@ -12,6 +12,8 @@ const sourceCopy: Record<string, string> = {
   dashboard: "panou",
   backend: "server",
   integration: "integrare",
+  client: "telefon",
+  checkin_delivery: "telefon",
 };
 
 function detailFor(type: string, data: Record<string, unknown>): string {

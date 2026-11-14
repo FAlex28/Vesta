@@ -75,13 +75,46 @@ export type SystemStatus = {
   voice_mode: "elevenlabs" | "demo";
   /** Raspberry Pi power from vcgencmd; null until the Pi has reported. */
   power?: { state: string; detail: string; checked_at: string } | null;
+  /** Dispatcher only: last authorized location of sessions whose alert is ACTIVE. */
+  alert_locations?: AlertLocation[];
 };
+
+export type LocationFix = {
+  latitude: number;
+  longitude: number;
+  captured_at: string;
+  age_seconds: number;
+  is_stale: boolean;
+  accuracy_meters: number | null;
+};
+
+export type AlertLocation = LocationFix & { session_id: string };
 
 export type AccessScope = "companion" | "contact";
 
-export type PairingCodeResponse = { scope: AccessScope; device_id: string; code: string; expires_at: string };
+export type AccessGrantResponse = { scope: AccessScope; device_id: string; access_token: string; expires_at: string };
 
-export type PairingClaimResponse = { scope: AccessScope; device_id: string; access_token: string; expires_at: string };
+export type PairedPhone = { id: string; label: string; created_at: string; last_seen_at: string };
+
+export type EmergencyContact = {
+  id: string;
+  name: string;
+  phone: string;
+  created_at: string;
+  accepted_at: string | null;
+  push_enabled: boolean;
+  invite_pending: boolean;
+};
+
+export type CompanionProfile = {
+  device_id: string;
+  display_name: string | null;
+  this_phone_id: string;
+  phones: PairedPhone[];
+  contacts: EmergencyContact[];
+};
+
+export type ContactInvite = { contact: EmergencyContact; code: string; expires_at: string };
 
 export type CompanionSessionResponse = {
   device_id: string;
@@ -95,18 +128,19 @@ export type ContactAlert = {
   state: SessionState;
   alert_reason: string | null;
   alert: AlertView;
-  location: {
-    latitude: number;
-    longitude: number;
-    captured_at: string;
-    age_seconds: number;
-    is_stale: boolean;
-    accuracy_meters: number | null;
-  } | null;
+  location: LocationFix | null;
   location_status: "CURRENT" | "STALE" | "UNAVAILABLE";
+  push_status?: string | null;
 };
 
-export type ContactStatusResponse = { device_id: string; generated_at: string; alerts: ContactAlert[] };
+export type ContactStatusResponse = {
+  device_id: string;
+  generated_at: string;
+  person_name: string | null;
+  contact_name: string;
+  push_enabled: boolean;
+  alerts: ContactAlert[];
+};
 
 export const EVENT_TYPES = [
   "session.activated",

@@ -188,14 +188,35 @@ test.describe("dashboard", () => {
     await expect(page.getByText(/45\.7612|21\.2298/)).toHaveCount(0);
   });
 
-  test("the operator creates one-time pairing codes for the phone and the contact", async ({ page }) => {
+  test("the dispatcher hands out no codes and sees the real location only during an active alert", async ({ page }) => {
     const backend = new MockBackend(page);
+    const now = new Date().toISOString();
+    const session = makeSession();
+    backend.sessions = [session];
+    backend.locations.set(SESSION_ID, { latitude: 45.761234, longitude: 21.229876, captured_at: now, accuracy_meters: 15 });
     await backend.install();
     await page.goto("/");
-    await page.getByTestId("pair-code-companion").click();
-    await expect(page.getByTestId("pair-code-value-companion")).toContainText("/companion");
-    await page.getByTestId("pair-code-contact").click();
-    await expect(page.getByTestId("pair-code-value-contact")).toContainText("/contact");
-    expect(backend.calls("/api/v1/pairing-codes").map((call) => call.body?.scope)).toEqual(["companion", "contact"]);
+    await expect(page.getByTestId("session-title")).toHaveAttribute("data-state", "ACTIVE");
+    await expect(page.getByRole("button", { name: /Cod pentru/ })).toHaveCount(0);
+    await expect(page.getByTestId("dashboard-location-real")).toHaveCount(0);
+    await expect(page.getByText(/45\.7612/)).toHaveCount(0);
+
+    session.state = "ALERT";
+    session.alert_reason = "SOS_EXPLICIT";
+    session.alert = { id: "alert-5", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 };
+    backend.publish("safety.alerted", { from_state: "ACTIVE", state: "ALERT", reason: "SOS_EXPLICIT" });
+    await expect(page.getByTestId("dashboard-location-real")).toContainText("45.76123, 21.22988");
+    await expect(page.getByText("Locație reală · alertă activă")).toBeVisible();
+
+    // Presentation mode hides the coordinates on a projected screen.
+    await page.getByTestId("presentation-toggle").click();
+    await expect(page.getByTestId("dashboard-location-real")).toHaveCount(0);
+    await expect(page.getByTestId("alert-location")).toHaveText("Ascunsă în modul prezentare");
+    await page.getByTestId("presentation-toggle").click();
+
+    session.state = "CANCELLED";
+    session.alert = { ...session.alert, status: "RESOLVED", resolved_at: now, resolution_action: "USER_CONFIRMED_SAFE" };
+    backend.publish("safety.alert_resolved", { from_state: "ALERT", state: "CANCELLED", alert_id: "alert-5" });
+    await expect(page.getByTestId("dashboard-location-real")).toHaveCount(0);
   });
 });

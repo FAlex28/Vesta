@@ -20,7 +20,7 @@ const alertOf = (status: "ACTIVE" | "RESOLVED") => {
 async function openWithCode(page: Page, backend: MockBackend) {
   await backend.install();
   await page.goto("/contact");
-  await page.getByLabel("Codul de acces primit").fill(backend.issueCode("contact"));
+  await page.getByLabel("Codul din SMS").fill(backend.inviteContact());
   await page.getByRole("button", { name: "Deschide alertele" }).click();
 }
 
@@ -31,13 +31,31 @@ test.describe("trusted contact", () => {
     await backend.install();
     await page.goto("/contact");
     await expect(page.getByTestId("contact-state")).toHaveCount(0);
-    await page.getByLabel("Codul de acces primit").fill("WRONG234");
+    await page.getByLabel("Codul din SMS").fill("WRONG234");
     await page.getByRole("button", { name: "Deschide alertele" }).click();
-    await expect(page.getByTestId("contact-problem")).toContainText("nu este valid");
-    await page.getByLabel("Codul de acces primit").fill(backend.issueCode("companion"));
+    await expect(page.getByTestId("contact-problem")).toContainText("nu este validă");
+    // The device code printed for the phone is not a contact invite.
+    await page.getByLabel("Codul din SMS").fill(backend.deviceCode);
     await page.getByRole("button", { name: "Deschide alertele" }).click();
-    await expect(page.getByTestId("contact-problem")).toContainText("telefonul persoanei");
+    await expect(page.getByTestId("contact-problem")).toContainText("nu este validă");
     expect(backend.calls("/api/v1/contact/status")).toHaveLength(0);
+  });
+
+  test("the SMS link opens the alerts directly, once, and offers notifications", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.ownerName = "Ana";
+    const code = backend.inviteContact();
+    await backend.install();
+    await page.goto(`/contact#cod=${code}`);
+    await expect(page.getByTestId("contact-state")).toHaveText(/Nicio alertă activă/);
+    await expect(page.getByText("Ana", { exact: true })).toBeVisible();
+    expect(page.url()).not.toContain(code);
+    await expect(page.getByTestId("push-state")).toBeVisible();
+    // The same link does not work a second time.
+    await page.evaluate(() => window.localStorage.clear());
+    await page.goto("/");
+    await page.goto(`/contact#cod=${code}`);
+    await expect(page.getByTestId("contact-problem")).toContainText("nu este validă");
   });
 
   test("active alert with location, marked as viewed once; resolved alert keeps no location", async ({ page }) => {

@@ -23,7 +23,7 @@ function Root() {
     );
   }
   if (path === "/contact") {
-    document.title = "Vesta — Contact de încredere";
+    document.title = "Vesta — Contact de urgență";
     return (
       <Suspense fallback={<p className="route-loading">Se încarcă…</p>}>
         <ContactPage />

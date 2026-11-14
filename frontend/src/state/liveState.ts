@@ -1,4 +1,5 @@
 import {
+  type AlertLocation,
   isUnfinished,
   SESSION_STATES,
   type AlertReason,
@@ -69,6 +70,8 @@ export type SystemPower = { state: string; detail: string | null; at: string };
 
 export type LiveState = {
   sessions: Record<string, SessionView>;
+  /** Dispatcher: last authorized location per session with an ACTIVE alert (from status). */
+  alertLocations: Record<string, AlertLocation>;
   alertNotices: Record<string, AlertLocationNotice>;
   systemPower: SystemPower | null;
   voiceMode: SystemStatus["voice_mode"] | null;
@@ -104,6 +107,7 @@ const MAX_LOG = 200;
 
 export const initialLiveState: LiveState = {
   sessions: {},
+  alertLocations: {},
   alertNotices: {},
   systemPower: null,
   voiceMode: null,
@@ -215,6 +219,7 @@ function applySnapshot(state: LiveState, status: SystemStatus, source: "http" | 
     sessions: {},
     voiceMode: status.voice_mode,
     systemHealth: status.system_health,
+    alertLocations: Object.fromEntries((status.alert_locations ?? []).map((item) => [item.session_id, item])),
     systemPower: status.power
       ? { state: status.power.state, detail: status.power.detail, at: status.power.checked_at }
       : state.systemPower,
@@ -441,6 +446,8 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
       next.resyncNeeded = true; // which deadline moved is not in the event
       break;
     case "safety.alerted":
+      // The status carries the alert id and, for the dispatcher, the last authorized location.
+      next.resyncNeeded = true;
       updated.alert_reason = (data.reason as AlertReason | undefined) ?? updated.alert_reason;
       updated.next_checkin_at = null;
       updated.response_deadline = null;

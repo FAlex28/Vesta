@@ -51,6 +51,20 @@ async def _watch_power(services: AppServices, stop_event: asyncio.Event) -> None
             )
 
 
+def _push_notifier(services: AppServices):
+    from app.integrations.push import PushNotifier, webpush_sender
+
+    if services.push_sender is not None:
+        return PushNotifier(services.directory, services.push_sender, backoff_seconds=0.01)
+    settings = services.settings
+
+    def send(subscription: dict, payload: str) -> int:
+        private = settings.vapid_private_key or services.directory.vapid()["private_key"]
+        return webpush_sender(private, settings.vapid_subject)(subscription, payload)
+
+    return PushNotifier(services.directory, send)
+
+
 def _mount_frontend(app: FastAPI, dist_path: str) -> None:
     """Serve frontend/dist from this process: /, /companion and /contact share one origin."""
 
@@ -93,6 +107,7 @@ def create_app(
         scheduler: asyncio.Task[None] | None = None
         hardware_task: asyncio.Task[None] | None = None
         power_task: asyncio.Task[None] | None = None
+        push_task: asyncio.Task[None] | None = None
         try:
             await resolved_services.sessions.recover_unfinished()
             if resolved_services.hardware_monitor is not None:
@@ -105,6 +120,13 @@ def create_app(
                     resolved_services.hardware_coordinator.run(stop_event),
                     name="vesta-gpio-activation-coordinator",
                 )
+            push_task = asyncio.create_task(
+                _push_notifier(resolved_services).run(resolved_services.broker, stop_event),
+                name="vesta-push",
+            )
+            if resolved_settings.environment in {"development", "test"} and not resolved_settings.device_pairing_code:
+                code = resolved_services.directory.device_code(None)
+                LOGGER.warning("Device pairing code (development only): %s-%s", code[:5], code[5:])
             if resolved_settings.gpio_mode == "gpio":
                 power_task = asyncio.create_task(
                     _watch_power(resolved_services, stop_event), name="vesta-power"
@@ -123,7 +145,9 @@ def create_app(
             stop_event.set()
             if resolved_services.hardware_monitor is not None:
                 resolved_services.hardware_monitor.stop()
-            tasks = [task for task in (scheduler, hardware_task, power_task) if task is not None]
+            tasks = [
+                task for task in (scheduler, hardware_task, power_task, push_task) if task is not None
+            ]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await resolved_services.voice.aclose()

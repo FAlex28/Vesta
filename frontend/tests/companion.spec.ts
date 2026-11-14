@@ -11,13 +11,12 @@ async function openPaired(page: Page, backend: MockBackend) {
 }
 
 test.describe("companion", () => {
-  test("pairing with a dashboard code: the phone waits, then takes over the joystick session by itself", async ({ page }) => {
+  test("pairing with the code printed on the device: the phone waits, then takes over the joystick session by itself", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
     await backend.install();
     await page.goto("/companion");
-    const code = backend.issueCode("companion");
-    await page.getByLabel("Codul de asociere din panoul Vesta").fill(`${code.slice(0, 4).toLowerCase()} ${code.slice(4)}`);
+    await page.getByLabel("Codul de pe dispozitivul Vesta").fill("vesta-23456");
     await page.getByRole("button", { name: "Asociază cu codul" }).click();
     await expect(page.getByTestId("pair-waiting")).toContainText("vesta-01");
     await expect(page.getByTestId("sos")).toBeDisabled();
@@ -42,10 +41,40 @@ test.describe("companion", () => {
     const backend = new MockBackend(page);
     await backend.install();
     await page.goto("/companion");
-    await page.getByLabel("Codul de asociere din panoul Vesta").fill("ZZZZ9999");
+    await page.getByLabel("Codul de pe dispozitivul Vesta").fill("ZZZZ999999");
     await page.getByRole("button", { name: "Asociază cu codul" }).click();
-    await expect(page.getByTestId("claim-problem")).toContainText("nu este valid");
+    await expect(page.getByTestId("claim-problem")).toContainText("nu se potrivește");
     expect(await page.evaluate(() => window.localStorage.length)).toBe(0);
+  });
+
+  test("scanning the QR on the device pairs at once and the code leaves the address bar", async ({ page }) => {
+    await installDeviceFakes(page);
+    const backend = new MockBackend(page);
+    await backend.install();
+    await page.goto("/companion#pair=VESTA-23456");
+    await expect(page.getByTestId("pair-waiting")).toBeVisible();
+    expect(page.url()).not.toContain("VESTA");
+    expect(backend.calls("/api/v1/pairing/device")[0].body).toMatchObject({ code: "VESTA-23456" });
+  });
+
+  test("the person adds an emergency contact and sends the invite by SMS from her phone", async ({ page }) => {
+    await installDeviceFakes(page);
+    const backend = new MockBackend(page);
+    await backend.install();
+    await page.goto("/companion#pair=VESTA23456");
+    await expect(page.getByTestId("emergency-contacts")).toBeVisible();
+    await page.getByTestId("owner-name").fill("Ana");
+    await page.getByTestId("contact-name").fill("Mama");
+    await page.getByTestId("contact-phone").fill("+40 722 123 456");
+    await page.getByRole("button", { name: /Adaugă și pregătește invitația/ }).click();
+    await expect(page.getByTestId("invite-card")).toContainText("Mama");
+    const href = decodeURIComponent((await page.getByTestId("invite-sms").getAttribute("href")) ?? "");
+    expect(href).toMatch(/^sms:\+40722123456\?body=Ana te-a adăugat/);
+    expect(href).toMatch(/\/contact#cod=INV/);
+    await expect(page.getByTestId("contact-item")).toContainText("Invitație în așteptare");
+    expect(backend.ownerName).toBe("Ana");
+    // No dispatcher key or dispatcher code is involved.
+    expect(backend.requests.some((request) => request.path.includes("pairing-codes"))).toBe(false);
   });
 
   test("a check-in shown on the open phone page is reported as delivered once", async ({ page }) => {

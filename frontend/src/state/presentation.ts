@@ -27,7 +27,7 @@ export const stateCopy: Record<SessionState, { title: string; detail: string; to
   },
   ALERT: {
     title: "Sesiune în alertă",
-    detail: "Serverul a emis alerta către contactul de încredere. Vesta nu apelează 112.",
+    detail: "Serverul a emis alerta; contactele de urgență care au permis notificările sunt anunțate pe telefon. Vesta nu apelează 112.",
     tone: "danger",
   },
   CANCELLED: {
@@ -242,4 +242,6 @@ export const eventCopy: Record<string, { title: string; kind: "system" | "check"
   "voice.status_changed": { title: "Starea conversației vocale actualizată", kind: "system" },
   "technical.power": { title: "Starea alimentării Raspberry Pi", kind: "warning" },
   "system.recovered": { title: "Serverul a repornit", kind: "warning" },
+  "alert.viewed": { title: "Contactul de urgență a văzut alerta", kind: "success" },
+  "location.updated": { title: "Locație nouă în timpul alertei", kind: "alert" },
 };

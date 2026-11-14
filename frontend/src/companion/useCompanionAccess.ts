@@ -6,10 +6,13 @@ import { isUnfinished, type SessionView } from "../api/contract";
 import type { CompanionSession } from "./useCompanionSession";
 
 /*
- * Pairing the phone with the Vesta device, once:
+ * Pairing the phone with the person's own Vesta device, once:
  *
- *   dashboard (operator) -> "Cod pentru telefon" -> 8-character one-time code
- *   phone /companion     -> types the code -> device-scoped companion grant (stored, 24 h)
+ *   label / QR on the device -> https://<vesta>/companion#pair=CODE (or the code typed by hand)
+ *   phone /companion         -> device-scoped companion grant (stored on the phone, revocable)
+ *
+ * The code is read from the URL fragment, which never reaches the server or its logs, and is
+ * removed from the address bar immediately. The dispatcher never hands out codes.
  *
  * From then on the phone asks GET /api/v1/companion/session every few seconds. When the
  * joystick has been held for 5 s and the server confirms a session, the answer carries that
@@ -17,7 +20,27 @@ import type { CompanionSession } from "./useCompanionSession";
  * starts a session itself.
  */
 
-export type ClaimProblem = "invalid_code" | "too_many_attempts" | "network" | "wrong_kind" | "expired" | null;
+export type ClaimProblem = "invalid_code" | "too_many_attempts" | "network" | "too_many_phones" | "expired" | null;
+
+/** A short, human label for this phone in the list of paired phones. */
+function phoneLabel(): string {
+  const agent = navigator.userAgent;
+  const model = /Android [\d.]+; ([^;)]+)/.exec(agent)?.[1]?.replace(/ Build.*$/, "").trim();
+  if (model && model !== "K") return model.slice(0, 40);
+  if (/Android/.test(agent)) return "Telefon Android";
+  if (/iPhone/.test(agent)) return "iPhone";
+  return "Browser";
+}
+
+/** Reads and removes `#pair=CODE` from the address bar. */
+function takeFragmentCode(key: string): string | null {
+  const match = new RegExp(`(?:^#|&)${key}=([A-Za-z0-9-]+)`).exec(window.location.hash);
+  if (!match) return null;
+  window.history.replaceState(null, "", window.location.pathname + window.location.search);
+  return match[1];
+}
+
+export { takeFragmentCode };
 
 export function useCompanionAccess(companion: CompanionSession) {
   const [grant, setGrant] = useState<AccessGrant | null>(() => loadGrant("companion"));
@@ -34,11 +57,7 @@ export function useCompanionAccess(companion: CompanionSession) {
     setClaiming(true);
     setProblem(null);
     try {
-      const claimed = await api.claimPairingCode(code);
-      if (claimed.scope !== "companion") {
-        setProblem("wrong_kind");
-        return false;
-      }
+      const claimed = await api.pairDevice(code, phoneLabel());
       const next: AccessGrant = { scope: "companion", deviceId: claimed.device_id, token: claimed.access_token, expiresAt: claimed.expires_at };
       saveGrant(next);
       setGrant(next);
@@ -46,13 +65,30 @@ export function useCompanionAccess(companion: CompanionSession) {
     } catch (error) {
       const failure = error instanceof ApiError ? error : null;
       setProblem(
-        failure?.status === 429 ? "too_many_attempts" : failure?.kind === "unauthorized" || failure?.kind === "invalid" ? "invalid_code" : "network",
+        failure?.status === 429
+          ? "too_many_attempts"
+          : failure?.code === "TOO_MANY_PHONES"
+            ? "too_many_phones"
+            : failure?.kind === "unauthorized" || failure?.kind === "invalid"
+              ? "invalid_code"
+              : "network",
       );
       return false;
     } finally {
       setClaiming(false);
     }
   }, []);
+
+  // QR code on the device: /companion#pair=CODE pairs on open (or when the fragment changes).
+  useEffect(() => {
+    const fromFragment = () => {
+      const code = takeFragmentCode("pair");
+      if (code) void claimCode(code);
+    };
+    fromFragment();
+    window.addEventListener("hashchange", fromFragment);
+    return () => window.removeEventListener("hashchange", fromFragment);
+  }, [claimCode]);
 
   const forget = useCallback(() => {
     clearGrant("companion");

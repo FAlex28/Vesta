@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from app.config import Settings
@@ -15,8 +16,9 @@ from app.hardware import (
 from app.realtime.broker import EventBroker
 from app.safety import SafetyEngine, SafetyPolicy
 from app.security import ControlTokenService
-from app.services.access import AccessTokenService, PairingCodeRegistry
+from app.services.access import AccessTokenService, AttemptLimiter
 from app.services.alerts import AlertRegistry
+from app.services.directory import DeviceDirectory
 from app.services.location import (
     AuthorizedLocationStore,
     InMemoryAuthorizedLocationStore,
@@ -43,11 +45,14 @@ class AppServices:
     hardware_monitor: JoystickMonitor | None
     hardware_coordinator: HardwareActivationCoordinator | None
     access_tokens: AccessTokenService
-    pairing_codes: PairingCodeRegistry
+    attempts: AttemptLimiter
+    directory: DeviceDirectory
     # TigerPersistence când VESTA_PERSISTENCE=tiger; altfel None (doar în memorie)
     persistence: Any | None = None
     # Latest Raspberry Pi power reading (vcgencmd), shared with GET /api/v1/status.
     power: dict[str, Any] | None = None
+    # Web Push transport; tests replace it. None = real pywebpush with the device's VAPID key.
+    push_sender: Any | None = None
 
 
 def build_services(
@@ -123,7 +128,11 @@ def build_services(
         hardware_monitor=selected_monitor,
         hardware_coordinator=hardware_coordinator,
         access_tokens=AccessTokenService(settings.control_signing_secret),
-        pairing_codes=PairingCodeRegistry(),
+        attempts=AttemptLimiter(),
+        directory=DeviceDirectory(
+            Path(settings.state_dir) / "directory.json" if settings.state_dir else None,
+            max_phones=settings.max_paired_phones,
+        ),
         persistence=persistence,
     )
 

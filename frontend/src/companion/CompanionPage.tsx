@@ -1,3 +1,4 @@
+import { Headphones, MapPin, QrCode, Siren, Wifi } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { configuredDeviceId, GPS_STALE_AFTER_MS, manualPairingEnabled } from "../api/config";
 import { api, newEventId } from "../api/client";
@@ -6,11 +7,13 @@ import { BrandLockup } from "../components/BrandLockup";
 import { LinkBadge } from "../components/LinkBadge";
 import { SourceTag } from "../components/SourceTag";
 import { StateLadder } from "../components/StateLadder";
+import { StatusOrb } from "../components/StatusOrb";
 import { useNow } from "../services/session";
 import { primarySession } from "../state/liveState";
 import { formatAge, formatClock, formatDuration, issueLabel, sessionDuration, stateCopy } from "../state/presentation";
 import { useLiveConnection, type LiveLink } from "../state/useLiveConnection";
 import { usePageVisibility } from "../state/usePageVisibility";
+import { EmergencyContacts } from "./EmergencyContacts";
 import { useCompanionAccess, type ClaimProblem } from "./useCompanionAccess";
 import { useCompanionSession, type ActionState, type PairingProblem } from "./useCompanionSession";
 import { freshnessOf, useGeolocation } from "./useGeolocation";
@@ -29,11 +32,11 @@ const pairingProblemCopy: Record<Exclude<PairingProblem, null>, string> = {
 };
 
 const claimProblemCopy: Record<Exclude<ClaimProblem, null>, string> = {
-  invalid_code: "Codul nu este valid sau a expirat. Cere un cod nou din panoul Vesta.",
+  invalid_code: "Codul nu se potrivește cu dispozitivul. Verifică eticheta Vesta și încearcă din nou.",
   too_many_attempts: "Prea multe coduri greșite. Așteaptă un minut și încearcă din nou.",
   network: "Serverul nu a răspuns. Verifică conexiunea și încearcă din nou.",
-  wrong_kind: "Acesta este un cod pentru contactul de încredere, nu pentru telefon.",
-  expired: "Asocierea telefonului a expirat. Introdu un cod nou din panoul Vesta.",
+  too_many_phones: "Dispozitivul are deja numărul maxim de telefoane. Elimină unul de pe un telefon asociat.",
+  expired: "Asocierea acestui telefon a expirat sau a fost eliminată. Scanează din nou codul de pe dispozitiv.",
 };
 
 const voicePhaseCopy: Record<VoicePhase, { label: string; tone: "neutral" | "safe" | "warning" | "danger" }> = {
@@ -186,6 +189,8 @@ export default function CompanionPage() {
   useEffect(() => {
     if (state === "CHECK_IN" && previousState.current !== "CHECK_IN") {
       notifyCheckIn();
+      // Bring the question on screen wherever the person had scrolled.
+      window.setTimeout(() => document.getElementById("checkin-head")?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
       try {
         navigator.vibrate?.([200, 100, 200]);
       } catch {
@@ -226,7 +231,7 @@ export default function CompanionPage() {
   }, [paired, pendingCheckin, visibility.hidden, voiceCtl.open, reportDelivery]);
 
   return (
-    <div className="companion">
+    <div className={`companion companion--${known ? state.toLowerCase() : "unknown"}`}>
       <header className="companion-bar">
         <BrandLockup caption="Telefon" />
         <LinkBadge link={link} label="Server" />
@@ -256,13 +261,17 @@ export default function CompanionPage() {
         )}
 
         {/* --- Session state ------------------------------------------------ */}
-        <section className={`c-state tone--${known ? copy.tone : "neutral"}`} aria-labelledby="c-state-head" aria-live="polite">
-          <p className="c-eyebrow">{paired ? "Sesiunea ta" : "Starea serverului"}</p>
-          <h2 id="c-state-head" className="c-state-title" data-testid="c-state" data-state={known ? state : "UNKNOWN"}>
-            <span className="tone-mark" aria-hidden="true" />
-            {known ? copy.title : "Se așteaptă serverul"}
-          </h2>
-          {known && <p className="c-state-code num">{state}</p>}
+        <section className={`c-state c-hero tone--${known ? copy.tone : "neutral"}`} aria-labelledby="c-state-head" aria-live="polite">
+          <div className="c-hero-top">
+            <StatusOrb state={known ? state : null} size="md" />
+            <div className="c-hero-text">
+              <p className="c-eyebrow">{paired ? "Sesiunea ta" : "Starea serverului"}</p>
+              <h2 id="c-state-head" className="c-state-title" data-testid="c-state" data-state={known ? state : "UNKNOWN"}>
+                {known ? copy.title : "Se așteaptă serverul"}
+              </h2>
+              {known && <p className="c-state-code num">{state}</p>}
+            </div>
+          </div>
           {known && <StateLadder state={state} compact />}
           <p className="c-state-detail">
             {!known
@@ -315,7 +324,7 @@ export default function CompanionPage() {
         {/* --- Pairing -------------------------------------------------------- */}
         {!paired && (
           <section className="c-section" aria-labelledby="pair-head">
-            <h2 id="pair-head" className="c-head">Asocierea telefonului</h2>
+            <h2 id="pair-head" className="c-head"><QrCode size={18} aria-hidden="true" /> Asocierea telefonului</h2>
             {companion.pairingProblem && (
               <p className="notice notice--warning" role="alert" data-testid="pairing-problem">
                 {pairingProblemCopy[companion.pairingProblem]}
@@ -328,6 +337,10 @@ export default function CompanionPage() {
             )}
             {access.grant ? (
               <div className="pair-waiting" data-testid="pair-waiting">
+                <div className="hold-hint" aria-hidden="true">
+                  <span className="hold-ring" />
+                  <span className="hold-label num">5 s</span>
+                </div>
                 <p className="c-text">
                   <strong>Telefon asociat cu dispozitivul <span className="num">{access.grant.deviceId}</span>.</strong>{" "}
                   Ține joystickul apăsat continuu 5 secunde. Când serverul confirmă activarea, sesiunea apare aici singură.
@@ -349,7 +362,11 @@ export default function CompanionPage() {
                   void access.claimCode(codeInput).then((ok) => ok && setCodeInput(""));
                 }}
               >
-                <label htmlFor="pair-code">Codul de asociere din panoul Vesta</label>
+                <ol className="pair-steps">
+                  <li>Deschide camera telefonului și scanează <strong>codul QR de pe eticheta dispozitivului Vesta</strong>.</li>
+                  <li>Sau scrie aici codul de 10 caractere tipărit sub QR.</li>
+                </ol>
+                <label htmlFor="pair-code">Codul de pe dispozitivul Vesta</label>
                 <input
                   id="pair-code"
                   type="text"
@@ -365,7 +382,7 @@ export default function CompanionPage() {
                   {access.claiming ? "Se verifică…" : "Asociază cu codul"}
                 </button>
                 <p className="c-hint">
-                  Codul se folosește o singură dată. Asocierea rămâne pe acest telefon 24 de ore și poate fi ștearsă oricând.
+                  Asocierea rămâne pe acest telefon 30 de zile. O poți șterge oricând, de aici sau de pe alt telefon asociat.
                 </p>
               </form>
             )}
@@ -408,12 +425,21 @@ export default function CompanionPage() {
 
           <button
             type="button"
-            className="btn btn--sos btn--xl"
+            className={`btn btn--sos btn--xl btn--sos-orb ${state === "ALERT" ? "btn--sos-orb-sent" : ""}`}
             data-testid="sos"
             onClick={() => void companion.sos()}
             disabled={!paired || !unfinished || state === "ALERT" || sosAction.status === "sending"}
           >
-            {sosAction.status === "sending" ? "Se trimite SOS…" : sosAction.status === "failed" ? "Reîncearcă SOS" : "SOS · Cer ajutor"}
+            <Siren aria-hidden="true" className="sos-icon" />
+            <span className="sos-text">
+              {sosAction.status === "sending"
+                ? "Se trimite SOS…"
+                : sosAction.status === "failed"
+                  ? "Reîncearcă SOS"
+                  : state === "ALERT"
+                    ? "Alertă activă"
+                    : "SOS · Cer ajutor"}
+            </span>
           </button>
           <ActionStatus
             action={sosAction}
@@ -438,7 +464,7 @@ export default function CompanionPage() {
           )}
           {paired && !checkInPending && <p className="c-hint">„Sunt bine” devine activ când serverul cere confirmarea.</p>}
           {/* The prompt closes as soon as the server accepts; its answer stays visible here. */}
-          {paired && !checkInPending && companion.actions.confirm.status === "confirmed" && (
+          {paired && !checkInPending && state !== "ALERT" && companion.actions.confirm.status === "confirmed" && (
             <ActionStatus
               action={companion.actions.confirm}
               sending=""
@@ -513,7 +539,7 @@ export default function CompanionPage() {
 
         {/* --- Voice ---------------------------------------------------------- */}
         <section className="c-section" aria-labelledby="voice-head">
-          <h2 id="voice-head" className="c-head">Conversație vocală</h2>
+          <h2 id="voice-head" className="c-head"><Headphones size={18} aria-hidden="true" /> Conversație vocală</h2>
           <p className={`c-status tone--${voicePhaseCopy[voice.phase].tone}`} role="status" data-testid="voice-status" data-phase={voice.phase}>
             <span className="tone-mark" aria-hidden="true" />
             {voicePhaseCopy[voice.phase].label}
@@ -573,7 +599,7 @@ export default function CompanionPage() {
         {/* --- GPS ------------------------------------------------------------ */}
         <section className="c-section" aria-labelledby="gps-head">
           <h2 id="gps-head" className="c-head">
-            Locație
+            <MapPin size={18} aria-hidden="true" /> Locație
             <span className={`fresh fresh--${fresh.toLowerCase()}`} data-testid="gps-freshness">{fresh}</span>
           </h2>
           {geo.gps.fix ? (
@@ -646,9 +672,12 @@ export default function CompanionPage() {
           </p>
         </section>
 
+        {/* --- Emergency contacts (chosen by the person, invited by SMS) ------- */}
+        {access.grant && <EmergencyContacts grant={access.grant} onGrantLost={access.forget} />}
+
         {/* --- Connectivity --------------------------------------------------- */}
         <section className="c-section" aria-labelledby="conn-head">
-          <h2 id="conn-head" className="c-head">Conexiune</h2>
+          <h2 id="conn-head" className="c-head"><Wifi size={18} aria-hidden="true" /> Conexiune</h2>
           <dl className="c-facts">
             <div><dt>Flux server</dt><dd data-testid="conn-stream">{link.state}</dd></div>
             <div>

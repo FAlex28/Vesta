@@ -10,11 +10,12 @@ type CityMapProps = {
   accuracy?: number | null;
 };
 
-// Mirrors the status tokens in styles.css. Tiles are greyscale, so this point is the only colour.
+// Mirrors the status tokens in styles.css. Tiles are dark grey, so this point is the only colour.
 const markerColor = (state: SessionState | null) => {
-  if (state === "ALERT") return "#b8321f";
-  if (state === "ACTIVE" || state === "CHECK_IN" || state === "UNCONFIRMED") return "#2b5f75";
-  return "#14202b";
+  if (state === "ALERT") return "#ff5c50";
+  if (state === "CHECK_IN" || state === "UNCONFIRMED") return "#ffc23d";
+  if (state === "ACTIVE") return "#5cc1e6";
+  return "#c3cfd7";
 };
 
 export function CityMap({ point, state, kind, accuracy }: CityMapProps) {
@@ -39,7 +40,7 @@ export function CityMap({ point, state, kind, accuracy }: CityMapProps) {
           center={point}
           radius={26}
           interactive={false}
-          pathOptions={{ color: "#14202b", weight: 1.5, dashArray: "3 5", fill: false }}
+          pathOptions={{ color: "#b8a3f5", weight: 1.5, dashArray: "3 5", fill: false }}
         />
       ) : (
         accuracy != null && (
@@ -48,7 +49,7 @@ export function CityMap({ point, state, kind, accuracy }: CityMapProps) {
             center={point}
             radius={accuracy}
             interactive={false}
-            pathOptions={{ color: "#2b5f75", weight: 1, fillColor: "#2b5f75", fillOpacity: 0.12 }}
+            pathOptions={{ color: markerColor(state), weight: 1, fillColor: markerColor(state), fillOpacity: 0.16 }}
           />
         )
       )}
@@ -56,7 +57,7 @@ export function CityMap({ point, state, kind, accuracy }: CityMapProps) {
         center={point}
         radius={8}
         interactive={false}
-        pathOptions={{ color: "#fff", fillColor: markerColor(state), fillOpacity: 1, weight: 3 }}
+        pathOptions={{ color: "#0a1117", fillColor: markerColor(state), fillOpacity: 1, weight: 3 }}
       />
     </MapContainer>
   );

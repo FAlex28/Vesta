@@ -1,7 +1,8 @@
 # Vesta API contract — backend, voice, GPIO and safety
 
-Version: `v3` (UniHack 2026 prototype). v3 adds phone pairing, trusted-contact access,
-check-in delivery semantics by channel, `viewed_at`, Pi power in status and the served web app.
+Version: `v4` (UniHack 2026 prototype). v4: phone pairing with the code printed on the device,
+emergency contacts invited from the phone, Web Push, dispatcher location during an active alert.
+v3 added check-in delivery semantics by channel, `viewed_at`, Pi power and the served web app.
 
 This file defines only the interfaces owned by Agent 2. Vesta is a controlled demonstration,
 not a validated emergency service. No endpoint calls 112 or infers that an assault occurred.
@@ -240,30 +241,58 @@ The compatibility route `POST /api/v1/sessions/{id}/technical-status` accepts an
 technical issue and `active` flag. Technical issues are history/status signals, not safety
 conclusions.
 
-## Phone pairing and trusted-contact access
+## Phone pairing, emergency contacts and push
 
-Operators create one-time codes on the authenticated dashboard; the phone or the trusted
-contact types the code once and receives a device-scoped bearer grant
-(`g1.<payload>.<signature>`, HMAC with a key derived from `VESTA_CONTROL_SIGNING_SECRET`).
-A grant never works as a control token, for another device or for the other role.
+The person controls access; the dispatcher's dashboard hands out nothing. All grants are
+device-scoped bearer tokens (`g1.<payload>.<signature>`, HMAC with a key derived from
+`VESTA_CONTROL_SIGNING_SECRET`), listed in the device directory (`VESTA_STATE_DIR`) so they can be
+revoked. A grant never works as a control token, for another device or for the other role.
 
-- `POST /api/v1/pairing-codes` (`X-Dashboard-Key`) `{"scope": "companion" | "contact",
-  "device_id"?: "..."}` → `{scope, device_id, code, expires_at}`. 8 characters, one use,
-  `VESTA_PAIRING_CODE_TTL_SECONDS` (600 s).
-- `POST /api/v1/pairing/claim` `{"code": "ABCD2345"}` → `{scope, device_id, access_token,
-  expires_at}`. Spaces/dashes and case are ignored. Wrong codes: `401`; more than 10 wrong
-  codes per minute: `429 TOO_MANY_ATTEMPTS`.
-- `GET /api/v1/companion/session` (Bearer companion grant) → `{device_id, session, control_token,
+**Phone (the person).** The device pairing code `VESTA_DEVICE_PAIRING_CODE` (10 characters) is
+printed on the Vesta device as a QR code for `<VESTA_PUBLIC_URL>/companion#pair=<code>`.
+
+- `POST /api/v1/pairing/device` `{"code": "...", "label"?: "Pixel 7"}` → `{scope:"companion",
+  device_id, access_token, expires_at}` (30 days). Case, spaces and dashes are ignored. Wrong
+  codes: `401`; more than 10 wrong codes per minute: `429 TOO_MANY_ATTEMPTS`; more than
+  `VESTA_MAX_PAIRED_PHONES`: `409 TOO_MANY_PHONES`.
+- `GET /api/v1/companion/session` → `{device_id, session, control_token,
   control_token_expires_at}` for the device's unfinished session, or `session: null`. The phone
-  polls this every 3 s, so a joystick activation is taken over without typing any token.
-- `GET /api/v1/contact/status` (Bearer contact grant) → `{device_id, generated_at, alerts[]}`;
-  each item has `session_id`, `state`, `alert_reason`, `alert`, `location_status`
-  (`CURRENT`/`STALE`/`UNAVAILABLE`, stale after `VESTA_GPS_STALE_SECONDS`) and `location`
-  (last authorized position with `age_seconds`, `is_stale`, `accuracy_meters`) **only while the
-  alert is ACTIVE**.
-- `POST /api/v1/contact/alerts/{alert_id}/viewed` (Bearer contact grant) → `AlertView`. Records
-  the first display (`viewed_at`, event `alert.viewed`); later calls keep the first time. An
-  alert of another device answers `404`.
+  polls it every 3 s, so a joystick activation is taken over without typing any token.
+- `GET|POST /api/v1/companion/profile` (`{"display_name": "Ana"}`) → `{device_id, display_name,
+  this_phone_id, phones[], contacts[]}`. The name is what contacts see in invites and alerts.
+- `POST /api/v1/companion/phones/{phone_id}/revoke`.
+- `POST /api/v1/companion/contacts` `{"name", "phone"}` → `{contact, code, expires_at}`: adds an
+  emergency contact and creates its one-time invite (24 h). The phone sends
+  `<origin>/contact#cod=<code>` by SMS from its own messaging app. Duplicate number: `409
+  CONTACT_EXISTS`; invalid number: `422`.
+- `POST /api/v1/companion/contacts/{id}/invite` (new invite), `.../revoke` (removes access and
+  push subscriptions).
+
+**Emergency contact.**
+
+- `POST /api/v1/contact/claim` `{"code"}` → `{scope:"contact", device_id, access_token,
+  expires_at}`; one use per invite.
+- `GET /api/v1/contact/status` → `{device_id, generated_at, person_name, contact_name,
+  push_enabled, alerts[]}`; each alert has `session_id`, `state`, `alert_reason`, `alert`,
+  `location_status`, `push_status` and `location` (last authorized position with `age_seconds`,
+  `is_stale`, `accuracy_meters`) **only while the alert is ACTIVE**.
+- `POST /api/v1/contact/alerts/{alert_id}/viewed` → `AlertView` with the first `viewed_at`
+  (event `alert.viewed`). An alert of another device answers `404`.
+- `GET /api/v1/contact/push/key` → `{public_key}` (VAPID, generated once in the state dir when
+  not configured); `POST /api/v1/contact/push/subscribe` with the browser's
+  `PushSubscription.toJSON()` (HTTPS endpoint only); `POST /api/v1/contact/push/unsubscribe`
+  `{"endpoint"}`.
+
+**Push delivery.** On `alert.notification_requested` the backend sends one Web Push
+(`ALERT_RAISED`) to every subscription of every active contact, and one `ALERT_RESOLVED` on
+`alert.resolved`. Payload: `title`, `body` (person's name and reason), `url: "/contact"`, `tag`,
+`kind`; never coordinates. Three attempts with backoff, then `FAILED`; `404/410` removes the
+subscription. `push_status: "SENT"` means the push service accepted it; seeing is `viewed_at`.
+
+**Dispatcher.** `GET /api/v1/status` also returns `alert_locations[]` (`session_id` + location
+fields) for sessions whose alert is ACTIVE; a new location during an active alert publishes
+`location.updated` (no coordinates in the event). The dashboard offers a presentation mode that
+hides coordinates on a projected screen.
 
 ## Alert model
 
@@ -366,7 +395,7 @@ Important event types include:
   `safety.check_in_unconfirmed`, `safety.check_in_confirmed`, `safety.check_in_deferred`
 - `safety.alerted`, `alert.notification_requested`, `safety.alert_resolved`, `alert.resolved`
 - `technical.issue_reported`, `technical.issue_resolved`, `voice.status_changed`,
-  `client.status_changed`, `technical.power`, `alert.viewed`
+  `client.status_changed`, `technical.power`, `alert.viewed`, `location.updated`
 - `system.snapshot`, `system.heartbeat`, `stream.resync_required`
 
 Each effective update includes the server-side session `version`. A client must not infer the

@@ -9,3 +9,6 @@ __pycache__/
 
 # IDE
 .idea/
+
+# Vesta runtime state (paired phones, contacts, push keys)
+.state/
