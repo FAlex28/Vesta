@@ -28,6 +28,10 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.services = resolved_services
+        persistence = resolved_services.persistence
+        if persistence is not None:
+            # înainte de scheduler: recuperarea după restart rulează înaintea oricărei activări
+            await persistence.start()
         stop_event = asyncio.Event()
         scheduler: asyncio.Task[None] | None = None
         if resolved_settings.scheduler_enabled:
@@ -46,6 +50,8 @@ def create_app(
             if scheduler is not None:
                 await scheduler
             await resolved_services.voice.aclose()
+            if persistence is not None:
+                await persistence.stop()
 
     app = FastAPI(
         title=resolved_settings.app_name,

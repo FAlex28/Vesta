@@ -41,10 +41,35 @@ python -m pytest                                  # unit + integrare (schemă te
 - **Confirmări validate:** se acceptă doar pe checkin-ul deschis al aceleiași sesiuni, înainte de `expires_at`, cât timp sesiunea nu e în ALERT. Altfel rezultatul e `LATE`, `NOT_ALLOWED`, `WRONG_SESSION` sau `NO_OPEN_CHECKIN`, iar confirmarea doar se înregistrează.
 - **Cancel refuzat cu alertă activă:** anularea nu ocolește o alertă activă; aceasta se închide explicit cu `alerts.resolve()`.
 - **Restart (`integrations/startup.recover_on_startup`):**
-  - ACTIVE, CHECK_IN și UNCONFIRMED devin INTERRUPTED.
-  - ALERT rămâne ALERT.
+  - Toate sesiunile deschise devin INTERRUPTED, pentru că SessionManager le ține în memorie și nu le poate continua.
+  - Alertele ACTIVE rămân active în `alerts` până la o rezolvare explicită.
   - Notificările SENDING se reiau, iar cele SENT, DELIVERED și VIEWED nu se retrimit.
   - Nu se creează sesiuni noi. E idempotent.
+
+## Legătura cu backendul (SessionManager)
+
+Activată cu `VESTA_PERSISTENCE=tiger`. SessionManager rămâne autoritativ (stare în memorie, Safety Engine, tokenuri HMAC). Fiecare tranziție publicată ajunge la `TigerRecorder` (`integrations/persistence.py`), care o scrie în fundal, în ordine.
+
+| Tranziție (Safety Engine) | Ce se scrie |
+|---|---|
+| `activated` | `sessions.activate` (același `session_id`) |
+| `check_in_started` | stare CHECK_IN + `safety_checkins` (rundă, încercare, timeout-ul engine-ului) |
+| `check_in_missed` | checkin TIMED_OUT + stare UNCONFIRMED |
+| `check_in_confirmed` | `checkins.confirm` (VOICE_TOOL / UI_BUTTON) + stare ACTIVE |
+| `alerted` | `alerts.raise_alert` (SOS_EXPLICIT / CHECKIN_TIMEOUT) + notificări în outbox |
+| `cancelled` din ALERT | `alerts.resolve`: alerta devine RESOLVED, contactele primesc ALERT_RESOLVED |
+| `cancelled` altfel | `sessions.cancel` (`reason` devine `end_reason`, ex. ACCIDENTAL_ACTIVATION) |
+| `technical_issue_*` | `technical_events` (PHONE_*, SERVICE_*, AUDIO_*) |
+
+- Toate marcajele de timp vin din engine, nu din ceasul bazei de date.
+- `event_id`-ul clientului (text) devine un UUID determinist, deci o comandă retrimisă nu se scrie de două ori.
+- Dacă Tiger Data e indisponibil, SOS și verificările continuă, iar erorile apar în log (testat).
+
+`integrations/runtime.TigerPersistence` pornește din lifespan-ul FastAPI:
+- recuperarea la pornire;
+- recorderul;
+- outbox-ul, care publică `contact.notification` pe `/ws/events`, fără coordonate;
+- monitorul de alimentare (`technical.power`).
 
 ## Contract cu ceilalți agenți (de confirmat)
 
@@ -55,10 +80,9 @@ python -m pytest                                  # unit + integrare (schemă te
   - rulează periodic `checkins.expire_due()`;
   - face tranzițiile cu `sessions.transition(..., expected_version=...)`.
 - Alertele se ridică prin `alerts.raise_alert(...)`, care trece singur sesiunea în ALERT.
-- **De stabilit:** starea `INTERRUPTED` e nouă față de cele 6 stări din brief.
-- **De stabilit:** la restart, o sesiune UNCONFIRMED devine INTERRUPTED. Alternativa ar fi escaladarea ei; decizia aparține Safety Engine.
-- API-ul verifică fiecare cerere cu `db.tokens.authorize(token, session_id, action)`. Acțiunile sunt `control`, `read_location`, `read_history` și `ack_notification`.
-- La pornire se apelează o singură dată `recover_on_startup(db)`, în procesul care deține monitorul GPIO.
+- `INTERRUPTED` apare doar în istoric. Starea live după restart e `IDLE` (descris în `shared/API_CONTRACT.md`).
+- Controlul sesiunii rămâne pe tokenurile HMAC ale backendului. `db.tokens` (roluri CONTACT/OPERATOR/PUBLIC_DEMO) e pentru viitoarele endpointuri de citire (locație, istoric), care nu există încă.
+- `recover_on_startup` rulează automat din lifespan; uvicorn trebuie pornit cu un singur worker.
 
 **Frontend (Agent 1):**
 - Heartbeat la 15 s: `client_id`, `session_id`, `visibility` (VISIBLE/HIDDEN). Se trimite și la `visibilitychange`.

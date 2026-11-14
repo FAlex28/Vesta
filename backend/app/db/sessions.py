@@ -22,7 +22,7 @@ ALLOWED_FROM: dict[str, tuple[str, ...]] = {
     "UNCONFIRMED": ("ACTIVE", "CHECK_IN"),
     "ALERT":       ("ACTIVE", "CHECK_IN", "UNCONFIRMED"),
     "CANCELLED":   ("ACTIVE", "CHECK_IN", "UNCONFIRMED", "ALERT"),
-    "INTERRUPTED": ("ACTIVE", "CHECK_IN", "UNCONFIRMED"),
+    "INTERRUPTED": ("ACTIVE", "CHECK_IN", "UNCONFIRMED", "ALERT"),
 }
 
 ActivationStatus = Literal["CREATED", "DUPLICATE_EVENT", "ALREADY_ACTIVE"]
@@ -58,10 +58,11 @@ class SessionsRepo:
     def activate(
         self, owner_id: str, activation_event_id: uuid.UUID | str, *,
         occurred_at: datetime | None = None, simulated: bool = False,
-        cancel_window_s: float | None = None,
+        cancel_window_s: float | None = None, session_id: uuid.UUID | str | None = None,
     ) -> ActivationResult:
         """Apelat O SINGURĂ DATĂ per apăsare validă (după cele 5 s), cu event_id generat de monitorul GPIO.
-        Idempotent: același event_id → DUPLICATE_EVENT; sesiune deja deschisă → ALREADY_ACTIVE."""
+        Idempotent: același event_id → DUPLICATE_EVENT; sesiune deja deschisă → ALREADY_ACTIVE.
+        session_id: id-ul dat de SessionManager (altfel se generează aici)."""
         ev = as_uuid(activation_event_id)
         window = self._s.cancel_window_s if cancel_window_s is None else cancel_window_s
         with self._pool.transaction() as tx:
@@ -70,10 +71,12 @@ class SessionsRepo:
                 return ActivationResult("DUPLICATE_EVENT", existing)
 
             created = tx.one(
-                "INSERT INTO sessions (owner_id, activation_event_id, cancel_window_until, simulated) "
-                "VALUES (%s, %s, now() + make_interval(secs => %s::double precision), %s) "
+                "INSERT INTO sessions (session_id, owner_id, activation_event_id, started_at, "
+                "cancel_window_until, simulated) "
+                "VALUES (COALESCE(%s::uuid, gen_random_uuid()), %s, %s, COALESCE(%s::timestamptz, now()), "
+                "COALESCE(%s::timestamptz, now()) + make_interval(secs => %s::double precision), %s) "
                 "ON CONFLICT DO NOTHING RETURNING *",
-                (owner_id, ev, window, simulated),
+                (as_uuid(session_id), owner_id, ev, occurred_at, occurred_at, window, simulated),
             )
             if created:
                 insert_session_event(
@@ -202,15 +205,16 @@ class SessionsRepo:
     # ---------- restart ----------
 
     def recover_after_restart(self) -> dict:
-        """La pornirea serverului. Sesiunile ACTIVE/CHECK_IN/UNCONFIRMED devin INTERRUPTED (conversația
-        și temporizările s-au pierdut). Sesiunile în ALERT rămân în ALERT: o alertă nu se închide
-        prin restart. Nu creează nicio sesiune nouă. Idempotent."""
+        """La pornirea serverului. Toate sesiunile deschise devin INTERRUPTED: SessionManager ține
+        sesiunile în memorie, deci după restart nu le mai poate continua (conversație și temporizări
+        pierdute). Alertele ACTIVE NU se închid: rămân active în tabelul alerts până la o rezolvare
+        explicită. Nu creează nicio sesiune nouă. Idempotent."""
         with self._pool.transaction() as tx:
             interrupted = tx.all(
                 """
                 WITH prev AS (
                     SELECT session_id, state FROM sessions
-                    WHERE state IN ('ACTIVE', 'CHECK_IN', 'UNCONFIRMED') FOR UPDATE
+                    WHERE state IN ('ACTIVE', 'CHECK_IN', 'UNCONFIRMED', 'ALERT') FOR UPDATE
                 )
                 UPDATE sessions s SET state = 'INTERRUPTED', ended_at = now(), end_reason = 'SERVER_RESTART'
                 FROM prev WHERE s.session_id = prev.session_id
@@ -236,5 +240,5 @@ class SessionsRepo:
                 "UPDATE companion_clients SET connection_state = 'RECONNECTING', updated_at = now() "
                 "WHERE connection_state = 'CONNECTED'"
             )
-            still_alert = tx.all("SELECT * FROM sessions WHERE state = 'ALERT'")
-        return {"interrupted": interrupted, "still_in_alert": still_alert, "notifications_requeued": requeued}
+            active_alerts = tx.all("SELECT * FROM alerts WHERE status = 'ACTIVE' ORDER BY created_at")
+        return {"interrupted": interrupted, "active_alerts": active_alerts, "notifications_requeued": requeued}

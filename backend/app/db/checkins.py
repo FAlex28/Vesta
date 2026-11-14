@@ -164,6 +164,24 @@ class CheckinsRepo:
                 )
             return rows
 
+    def time_out_open(self, session_id, at: datetime | None = None) -> dict | None:
+        """Închide verificarea deschisă când Safety Engine (care ține timpul) a decis că a expirat."""
+        with self._pool.transaction() as tx:
+            r = tx.one(
+                "UPDATE safety_checkins SET status = 'TIMED_OUT', closed_at = COALESCE(%s::timestamptz, now()) "
+                "WHERE session_id = %s AND status = ANY(%s::text[]) RETURNING *",
+                (at, as_uuid(session_id), list(OPEN)),
+            )
+            if r:
+                insert_session_event(
+                    tx, event_id=derived_event_id(r["checkin_id"], "timeout"), session_id=r["session_id"],
+                    event_type="CHECKIN_TIMED_OUT", source="SAFETY_ENGINE", occurred_at=at,
+                    metadata={"checkin_id": r["checkin_id"], "attempt_no": r["attempt_no"],
+                              "was_delivered": r["delivered_at"] is not None,
+                              "delivery_channel": r["delivery_channel"]},
+                )
+            return r
+
     def open_for_session(self, session_id) -> dict | None:
         with self._pool.autocommit() as tx:
             return tx.one(

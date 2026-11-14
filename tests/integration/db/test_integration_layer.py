@@ -181,11 +181,15 @@ def test_restart_recovery(fresh_db, ev):
     db.companions.heartbeat("p1", "u1", session_id=normal["session_id"])
 
     summary = recover_on_startup(db)
-    assert {s["session_id"] for s in summary["interrupted"]} == {normal["session_id"], unconfirmed["session_id"]}
-    assert {s["previous_state"] for s in summary["interrupted"]} == {"ACTIVE", "UNCONFIRMED"}
-    assert [s["session_id"] for s in summary["still_in_alert"]] == [alerted["session_id"]]
+    assert {s["session_id"] for s in summary["interrupted"]} == {
+        normal["session_id"], unconfirmed["session_id"], alerted["session_id"]}
+    assert {s["previous_state"] for s in summary["interrupted"]} == {"ACTIVE", "UNCONFIRMED", "ALERT"}
+    # alerta NU se închide prin restart
+    assert [x["alert_id"] for x in summary["active_alerts"]] == [a.alert["alert_id"]]
     assert summary["notifications_requeued"] == 1
     assert db.alerts.get(a.alert["alert_id"])["status"] == "ACTIVE"
+    assert db.alerts.resolve(a.alert["alert_id"], event_id=ev(), resolved_by="USER",
+                             reason="after restart").status == "RESOLVED"
     assert db.checkins.open_for_session(unconfirmed["session_id"]) is None
     assert db.companions.get("p1")["connection_state"] == "RECONNECTING"
     notes = {n["notification_id"]: n["status"] for n in db.notifications.for_alert(a.alert["alert_id"])}
@@ -198,5 +202,6 @@ def test_restart_recovery(fresh_db, ev):
     assert len(db.sessions.list_recent()) == 3
     # utilizatoarea poate porni o sesiune nouă după întrerupere
     assert db.sessions.activate("u1", ev()).status == "CREATED"
+    assert db.sessions.activate("u3", ev()).status == "CREATED"
     stats = {r["event_type"]: r["events"] for r in db.events.daily_stats()}
-    assert stats["SESSION_ACTIVATED"] == 4 and stats["SESSION_INTERRUPTED"] == 2
+    assert stats["SESSION_ACTIVATED"] == 5 and stats["SESSION_INTERRUPTED"] == 3

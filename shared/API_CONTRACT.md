@@ -16,8 +16,9 @@ or any other emergency service.
 - Repeating a retained `event_id` with the same command is idempotent and returns
   `"duplicate": true`. Reusing it for another payload returns `409 EVENT_ID_REUSED`. The
   in-memory MVP retains the 10,000 most recently used command IDs (LRU).
-- Idempotency and sessions are held in memory by this backend. Persistence belongs to the
-  database/integration module.
+- Idempotency and live sessions are held in memory by this backend and remain authoritative.
+  With `VESTA_PERSISTENCE=tiger`, every published transition is also written asynchronously to
+  Tiger Data (see "Persistence" below); a database outage never blocks check-ins, SOS or cancel.
 - Session control endpoints require `Authorization: Bearer <control_token>`.
 - The control token is scoped to one session, expires, and must never be placed in a URL,
   WebSocket event, log or repository.
@@ -308,6 +309,33 @@ Application errors use:
 Expected codes include `UNAUTHORIZED`, `NOT_FOUND`, `EVENT_ID_REUSED`,
 `SESSION_ALREADY_ACTIVE`, `INVALID_SESSION_TRANSITION`, `SESSION_CANCELLED` and sanitized
 `VOICE_*` service errors. Validation errors use FastAPI's standard `422` body.
+
+## Persistence (Tiger Data)
+
+Owned by Person 3 (`backend/app/db`, `backend/app/integrations`, details in `docs/database.md`).
+
+- Enabled with `VESTA_PERSISTENCE=tiger` and `TIMESCALE_SERVICE_URL`. Default `memory` keeps the
+  previous behaviour.
+- `SessionManager` passes every non-`NO_CHANGE` transition to a recorder. Writes run in order in
+  a background task, with deterministic event IDs derived from the client `event_id`, so a
+  retried command is never stored twice.
+- Cancelling a session from `ALERT` keeps the API behaviour above (`CANCELLED`), but in storage
+  the alert is never deleted: it becomes `RESOLVED` with `resolved_at` and the reason, and every
+  contact that received `ALERT_RAISED` gets an `ALERT_RESOLVED` notification.
+- Restart: live sessions are in memory, so after a backend restart the live state is `IDLE`.
+  On startup, sessions left open in storage become `INTERRUPTED` (history only, not a live
+  state). Their `ACTIVE` alerts stay active in storage and are reported in a `system.recovered`
+  WebSocket event with `alerts_still_active`.
+- Additional read-only WebSocket events:
+  - `contact.notification`: `notification_id`, `alert_id`, `kind` (`ALERT_RAISED` /
+    `ALERT_RESOLVED`), `recipient_id`, `incident_type`, `location_status`. It never contains
+    coordinates, because `/ws/events` is unauthenticated.
+  - `technical.power`: `state` (`POWER_OK`, `LOW_VOLTAGE`, `POWER_UNSTABLE` or
+    `POWER_STATUS_UNKNOWN`) and `detail`. No battery percentage is reported.
+  - `system.recovered`
+- Control tokens (`v1.<payload>.<signature>`) stay the only mechanism for session control. The
+  `access_tokens` table is reserved for future read access by the trusted contact and the
+  private dashboard (location, history) and is not used by these endpoints yet.
 
 ## Reserved interfaces owned by other roles
 

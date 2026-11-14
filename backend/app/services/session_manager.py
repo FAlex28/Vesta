@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.errors import AuthenticationError, ConflictError, NotFoundError
+from app.integrations.persistence import NullRecorder, SessionRecorder, TransitionRecord
 from app.realtime.broker import EventBroker
 from app.safety import (
     InvalidTransition,
@@ -74,6 +75,7 @@ class SessionManager:
         control_token_ttl_seconds: int,
         scheduler_tick_seconds: float,
         client_heartbeat_timeout_seconds: float,
+        recorder: SessionRecorder | None = None,
     ) -> None:
         self._engine = engine
         self._broker = broker
@@ -86,6 +88,7 @@ class SessionManager:
         self._processed_commands: OrderedDict[str, _ProcessedCommand] = OrderedDict()
         self._max_processed_commands = 10_000
         self._lock = asyncio.Lock()
+        self._recorder: SessionRecorder = recorder or NullRecorder()
 
     async def activate(
         self,
@@ -124,7 +127,7 @@ class SessionManager:
             self._active_session_by_device[device_id] = session.session_id
             self._remember(event_id, fingerprint, session.session_id)
             token, expires_at = self._issue_control_token(session.session_id, instant)
-            await self._publish_transition(session, transition)
+            await self._publish_transition(session, transition, command_event_id=event_id)
             return ActivationResult(
                 session=copy.deepcopy(session),
                 control_token=token,
@@ -155,7 +158,9 @@ class SessionManager:
             except InvalidTransition as exc:
                 raise _transition_conflict(exc) from exc
             self._remember(event_id, fingerprint, session_id)
-            await self._publish_transition(session, transition, extra={"source": source})
+            await self._publish_transition(
+                session, transition, extra={"source": source}, command_event_id=event_id
+            )
             return CommandResult(copy.deepcopy(session))
 
     async def request_sos(
@@ -184,6 +189,7 @@ class SessionManager:
                 session,
                 transition,
                 extra={"source": source},
+                command_event_id=event_id,
             )
             return CommandResult(copy.deepcopy(session))
 
@@ -209,7 +215,9 @@ class SessionManager:
                 raise _transition_conflict(exc) from exc
             self._remember(event_id, fingerprint, session_id)
             self._active_session_by_device.pop(session.device_id, None)
-            await self._publish_transition(session, transition)
+            await self._publish_transition(
+                session, transition, command_event_id=event_id, reason=reason
+            )
             return CommandResult(copy.deepcopy(session))
 
     async def heartbeat(
@@ -278,7 +286,9 @@ class SessionManager:
                 raise _transition_conflict(exc) from exc
             if not trusted_internal:
                 self._remember(event_id, fingerprint, session_id)
-            await self._publish_transition(session, transition, extra={"source": source})
+            await self._publish_transition(
+                session, transition, extra={"source": source}, command_event_id=event_id
+            )
             return CommandResult(copy.deepcopy(session))
 
     async def get(self, session_id: str) -> SafetySession:
@@ -425,6 +435,8 @@ class SessionManager:
         transition: SafetyTransition,
         *,
         extra: dict[str, Any] | None = None,
+        command_event_id: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if transition.kind is TransitionKind.NO_CHANGE:
             return
@@ -441,6 +453,21 @@ class SessionManager:
             session_id=session.session_id,
             device_id=session.device_id,
             data=data,
+        )
+        # Persistența (Tiger Data) e asincronă și nu blochează sau modifică decizia de siguranță.
+        self._recorder.submit(
+            TransitionRecord(
+                session_id=session.session_id,
+                device_id=session.device_id,
+                kind=transition.kind.value,
+                from_state=transition.from_state.value,
+                to_state=transition.to_state.value,
+                occurred_at=transition.occurred_at,
+                details=dict(transition.details),
+                source=(extra or {}).get("source"),
+                command_event_id=command_event_id,
+                reason=reason,
+            )
         )
 
 
