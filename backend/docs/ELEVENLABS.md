@@ -1,5 +1,18 @@
 # Integrarea vocală ElevenLabs
 
+## Reguli de runtime
+
+- Pentru o sesiune poate exista o singură conversație în stările de conectare, conectat sau
+  reconectare. O cerere paralelă nu creează încă o conversație.
+- Backendul urmărește separat `connected`, `disconnected`, `api_error`, `microphone_error`,
+  `timeout` și `reconnected` și publică schimbările către dashboard.
+- Retry-urile providerului sunt limitate și au backoff progresiv; o eroare lasă sesiunea de
+  siguranță activă și marchează sănătatea tehnică `DEGRADED`.
+- Întrebarea de check-in generată nu este considerată automat livrată. Clientul raportează
+  livrarea pentru `checkin_id`, iar confirmarea trebuie să includă același identificator.
+- SOS-ul, anularea autorizată și confirmarea alternativă din web nu depind de ElevenLabs.
+- Backendul nu înregistrează și nu stochează audio implicit.
+
 ## Arhitectură
 
 Vesta folosește un flux cu latență redusă, în care backendul păstrează cheia permanentă,

@@ -20,6 +20,14 @@ from .provider import (
     VoiceProviderError,
     VoiceTransport,
 )
+from .sessions import (
+    VoiceConnectionStatus,
+    VoiceConversationAlreadyActive,
+    VoiceConversationError,
+    VoiceConversationRegistry,
+    VoiceRetryLater,
+    VoiceSessionRecord,
+)
 
 __all__ = [
     "CLIENT_TOOL_SPECS",
@@ -34,4 +42,10 @@ __all__ = [
     "VoiceProvider",
     "VoiceProviderError",
     "VoiceTransport",
+    "VoiceConnectionStatus",
+    "VoiceConversationAlreadyActive",
+    "VoiceConversationError",
+    "VoiceConversationRegistry",
+    "VoiceRetryLater",
+    "VoiceSessionRecord",
 ]

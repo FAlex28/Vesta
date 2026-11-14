@@ -8,6 +8,8 @@ ENV_NAMES = (
     "VESTA_ENVIRONMENT",
     "VESTA_CONTROL_SIGNING_SECRET",
     "VESTA_DEVICE_API_KEY",
+    "VESTA_DASHBOARD_API_KEY",
+    "VESTA_GPIO_MODE",
     "VESTA_CORS_ORIGINS",
     "VESTA_VOICE_MODE",
     "ELEVENLABS_RETRY_COUNT",
@@ -32,6 +34,14 @@ def test_development_defaults_use_explicit_origins_and_ephemeral_secret() -> Non
     assert settings.checkin_max_attempts == 2
 
 
+def test_configured_signing_secret_must_have_at_least_32_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VESTA_CONTROL_SIGNING_SECRET", "too-short")
+    with pytest.raises(ConfigurationError, match="at least 32 bytes"):
+        Settings.from_env()
+
+
 def test_non_development_configuration_fails_closed_without_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -48,6 +58,14 @@ def test_non_development_configuration_fails_closed_without_secrets(
         Settings.from_env()
 
     monkeypatch.setenv("VESTA_DEVICE_API_KEY", "device-secret")
+    with pytest.raises(ConfigurationError, match="DASHBOARD_API_KEY"):
+        Settings.from_env()
+
+    monkeypatch.setenv("VESTA_DASHBOARD_API_KEY", "dashboard-secret")
+    with pytest.raises(ConfigurationError, match="GPIO_MODE"):
+        Settings.from_env()
+
+    monkeypatch.setenv("VESTA_GPIO_MODE", "gpio")
     settings = Settings.from_env()
     assert settings.environment == "production"
     assert settings.control_secret_is_ephemeral is False

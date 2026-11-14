@@ -1,90 +1,92 @@
-# Vesta API contract - backend, voice and safety
+# Vesta API contract — backend, voice, GPIO and safety
 
-Version: `v1` (UniHack 2026 prototype)
+Version: `v2` (UniHack 2026 prototype)
 
-This file defines the interfaces owned by Person 2. Changes to the shared contract must be
-agreed with the consumers in the frontend/Android, integration and firmware modules.
+This file defines only the interfaces owned by Agent 2. Vesta is a controlled demonstration,
+not a validated emergency service. No endpoint calls 112 or infers that an assault occurred.
 
-Vesta is a controlled demonstration, not a validated emergency system. No endpoint calls 112
-or any other emergency service.
+## Conventions and authorization
 
-## Conventions
+- Payloads are UTF-8 JSON, timestamps are ISO 8601 UTC and unknown fields are rejected.
+- Mutating commands carry a unique `event_id` (maximum 128 characters). Replaying the same
+  command is idempotent; reusing its ID for a different command returns `409 EVENT_ID_REUSED`.
+- Session operations and reads require `Authorization: Bearer <control_token>`. The token is
+  scoped to one session; knowing `session_id` alone is insufficient.
+- Global dashboard reads require `X-Dashboard-Key` when `VESTA_DASHBOARD_API_KEY` is set.
+- `/api/v1/device/events` is an integration/test boundary protected by `X-Device-Key` when
+  configured. The production GPIO monitor calls the session service internally.
+- Tokens and secrets must not appear in URLs, WebSocket events or logs. `ELEVENLABS_API_KEY`
+  remains server-side.
 
-- HTTP payloads use UTF-8 JSON and reject unknown fields.
-- Timestamps are ISO 8601 UTC values.
-- `event_id` is a non-empty client-generated identifier, at most 128 characters.
-- Repeating a retained `event_id` with the same command is idempotent and returns
-  `"duplicate": true`. Reusing it for another payload returns `409 EVENT_ID_REUSED`. The
-  in-memory MVP retains the 10,000 most recently used command IDs (LRU).
-- Idempotency and sessions are held in memory by this backend. Persistence belongs to the
-  database/integration module.
-- Session control endpoints require `Authorization: Bearer <control_token>`.
-- The control token is scoped to one session, expires, and must never be placed in a URL,
-  WebSocket event, log or repository.
-- If `VESTA_DEVICE_API_KEY` is configured, the ESP32 activation request also requires
-  `X-Device-Key`.
-- `GET /api/v1/status` and `/ws/events` are read-only demo interfaces without user
-  authentication.
-  They may be exposed only inside the controlled test environment; browser WebSockets enforce
-  the configured Origin allowlist.
+## Session and technical state
 
-## Session states
+Safety state: `IDLE`, `ACTIVE`, `CHECK_IN`, `UNCONFIRMED`, `ALERT`, `CANCELLED`.
 
-`IDLE`, `ACTIVE`, `CHECK_IN`, `UNCONFIRMED`, `ALERT`, `CANCELLED`
+Technical health: `HEALTHY`, `DEGRADED`, `DISCONNECTED`. It is orthogonal to safety state.
+Audio, GPS, power or connectivity loss cannot by itself become an emergency alert. Explicit
+SOS always remains available.
 
-Audio and connectivity failures are orthogonal technical issues. They do not change a session
-to `ALERT`. Only the deterministic Python safety engine can transition to `ALERT`, either after
-the configured unanswered attempts or after an explicit SOS.
-
-The common session object is:
+Example session view (nullable fields may be omitted by older consumers):
 
 ```json
 {
   "id": "5d9a9a55-1ca6-47bd-8768-43bcdb8492d4",
-  "device_id": "vesta-01",
+  "device_id": "vesta-rpi-01",
   "state": "ACTIVE",
+  "health_status": "DEGRADED",
+  "version": 1,
   "created_at": "2026-11-14T10:00:00Z",
   "updated_at": "2026-11-14T10:00:00Z",
+  "quick_cancel_until": "2026-11-14T10:00:05Z",
+  "checkin_id": null,
   "checkin_attempt": 0,
+  "checkin_status": null,
   "missed_attempts": 0,
   "next_checkin_at": "2026-11-14T10:01:00Z",
   "response_deadline": null,
   "retry_at": null,
-  "client_last_seen_at": null,
-  "connection_lease_expires_at": null,
   "active_technical_issues": [],
-  "alert_reason": null
+  "page_visibility": "UNKNOWN",
+  "connectivity_status": "UNKNOWN",
+  "audio_status": "UNKNOWN",
+  "gps_status": "GPS_UNAVAILABLE",
+  "power_status": "POWER_STATUS_UNKNOWN",
+  "alert_reason": null,
+  "cancellation_reason": null,
+  "alert": null
 }
 ```
 
-`alert_reason` is either `missed_check_ins`, `explicit_sos` or `null`.
+`version` increases on every effective state mutation and can be used by consumers to discard
+stale updates.
 
-## HTTP endpoints
+## Physical activation
 
-### Health
+The joystick is wired directly to Raspberry Pi: `SW → BCM GPIO17` (physical pin 11) and
+`GND → pin 6`. After a continuous hold of `VESTA_HOLD_SECONDS` (default 5 s), the monitor
+queues exactly one internal activation event. A short press has no effect; a long hold never
+repeats; release is required before another activation can be accepted. A low input present at
+startup must first be released. Laptop/CI uses the deterministic `mock` adapter.
 
-`GET /health`
+Only one unfinished safety session may exist. A different event during `ACTIVE`, `CHECK_IN`,
+`UNCONFIRMED` or `ALERT` returns the current session with outcome `ALREADY_ACTIVE`; it is not
+SOS, cancel or reset. A byte-identical retry of the original event has outcome `DUPLICATE`.
 
-Returns process health and the configured voice mode. It contains no secrets.
-
-### Activate from ESP32
+Integration route:
 
 `POST /api/v1/device/events`
 
 ```json
 {
   "event_id": "evt-001",
-  "device_id": "vesta-01",
+  "device_id": "vesta-rpi-01",
   "event": "activate"
 }
 ```
 
-The first accepted request returns `201`; an identical retry returns `200` and the same session.
-A different activation while that device has an unfinished session returns
-`409 SESSION_ALREADY_ACTIVE`.
-
 ```json
 {
+  "outcome": "ACTIVATED",
   "duplicate": false,
   "session": {},
   "control_token": "v1.<payload>.<signature>",
@@ -92,41 +94,65 @@ A different activation while that device has an unfinished session returns
 }
 ```
 
-The Android client must keep the session token only in memory and send it as a bearer token for
-the remaining session operations.
+Outcomes are `ACTIVATED`, `DUPLICATE` or `ALREADY_ACTIVE`.
 
-### System status
+## Session endpoints
 
-`GET /api/v1/status`
+### Read and heartbeat
+
+- `GET /api/v1/sessions/{id}` — scoped bearer token required; used for resynchronization.
+- `POST /api/v1/sessions/{id}/heartbeat` with `{}` — renews the connectivity lease.
+
+Lease expiry marks `DISCONNECTED`/`network_disconnected` but does not itself create `ALERT`.
+
+### Quick or normal cancellation
+
+`POST /api/v1/sessions/{id}/cancel`
 
 ```json
 {
-  "system_state": "ACTIVE",
-  "generated_at": "2026-11-14T10:00:02Z",
-  "latest_sequence": 1,
-  "sessions": [],
-  "voice_mode": "elevenlabs"
+  "event_id": "cancel-001",
+  "reason": "ACCIDENTAL_ACTIVATION"
 }
 ```
 
-The dashboard should call this endpoint after connecting or after a
-`stream.resync_required` event.
+`ACCIDENTAL_ACTIVATION` is valid only during the server-side quick-cancel window (default 5 s).
+During that window, conversation and SOS are already usable. A transmitted alert cannot be
+deleted through cancel; it must be resolved explicitly and retained in history.
 
-### Confirm a safety check
+### Safety check lifecycle
+
+When the engine requests a check, it creates a unique `checkin_id`. Generation is not proof of
+delivery.
+
+`POST /api/v1/sessions/{id}/checkins/{checkin_id}/delivery`
+
+```json
+{
+  "event_id": "delivery-001",
+  "channel": "voice",
+  "status": "DELIVERED"
+}
+```
+
+`channel` is `voice`, `web` or `android`; `status` is `DELIVERED` or `UNDELIVERED`.
+The session view distinguishes the initial `REQUESTED` state from these outcomes. Audio
+disconnect is recorded explicitly, and the web interface may still confirm.
 
 `POST /api/v1/sessions/{id}/checkins`
 
 ```json
 {
   "event_id": "checkin-001",
+  "checkin_id": "chk-...",
   "confirmation": "safe",
-  "source": "android"
+  "source": "web"
 }
 ```
 
-`source` is `android`, `voice_agent` or `dashboard`. A confirmation is accepted only during
-`CHECK_IN` or `UNCONFIRMED`; it resets the unanswered-attempt counter and returns the session to
-`ACTIVE`.
+`source` is `android`, `voice_agent`, `dashboard` or `web`. The backend validates the scoped
+session, active `checkin_id`, allowed safety state and response deadline. A late confirmation
+returns a conflict and cannot change or close an alert.
 
 ### Explicit SOS
 
@@ -140,68 +166,112 @@ The dashboard should call this endpoint after connecting or after a
 }
 ```
 
-This immediately and deterministically changes an active session to `ALERT`. It only emits the
-demonstration alert event; it does not contact emergency services. The optional free-text
-`reason` is not broadcast on the shared WebSocket stream.
+The authorized command immediately transitions to `ALERT` with reason `SOS_EXPLICIT`, creates
+or reuses the session's active alert, publishes dashboard state and requests one contact
+notification. It works independently of ElevenLabs, GPS, power or connectivity.
 
-### Authorized cancellation and demo reset
+### Resolve a transmitted alert
 
-`POST /api/v1/sessions/{id}/cancel`
+`POST /api/v1/sessions/{id}/alerts/{alert_id}/resolve`
 
 ```json
 {
-  "event_id": "cancel-001",
-  "reason": "Am ajuns în siguranță"
+  "event_id": "resolve-001",
+  "action": "USER_CONFIRMED_SAFE"
 }
 ```
 
-Cancellation requires the bearer token and is allowed from `ACTIVE`, `CHECK_IN`, `UNCONFIRMED`
-or `ALERT`. It changes the session to `CANCELLED`. A new activation for the same device then
-starts a fresh session, which is the supported reset flow for the next demonstration.
+Resolution is explicit and authorized. The alert record is retained with `status: "RESOLVED"`,
+`resolved_at` and `resolution_action`, and the outcome is published to dashboard/contact flows.
+A late check-in never resolves an alert.
 
-The check-in, SOS, cancellation and technical-status endpoints return:
+### Client conditions
+
+`POST /api/v1/sessions/{id}/client-status`
 
 ```json
 {
-  "duplicate": false,
-  "session": {}
+  "event_id": "client-001",
+  "page_visibility": "HIDDEN",
+  "connectivity_status": "DISCONNECTED",
+  "audio_status": "DISCONNECTED",
+  "gps_status": "GPS_STALE",
+  "power_status": "LOW_VOLTAGE"
 }
 ```
 
-### Renew the Android connectivity lease
+The backend accepts `GPS_AVAILABLE`, `GPS_STALE` and `GPS_UNAVAILABLE`, but location is not
+required and coordinates are never fabricated. It accepts `POWER_UNSTABLE` and `LOW_VOLTAGE`,
+but never invents a battery percentage. All timers stay server-side. Any subset of these flat
+`*_status` fields may be submitted, but at least one field is required.
 
-`POST /api/v1/sessions/{id}/heartbeat`
+### Authorized last-known location
 
-Send an authenticated `{}` body periodically while the Android session is connected. The first
-heartbeat enables connection monitoring for that session. Each heartbeat updates
-`client_last_seen_at` and `connection_lease_expires_at`. If the lease expires, the backend marks
-`network_disconnected` before evaluating check-in timeouts, so a real connection loss cannot by
-itself become `ALERT`. A later heartbeat resolves that technical issue.
-
-### Report an audio or network condition
-
-`POST /api/v1/sessions/{id}/technical-status`
+`POST /api/v1/sessions/{id}/location` requires the scoped bearer token.
 
 ```json
 {
-  "event_id": "tech-001",
-  "issue": "microphone_denied",
-  "active": true,
+  "event_id": "location-001",
+  "latitude": 44.4268,
+  "longitude": 26.1025,
+  "captured_at": "2026-11-14T10:02:00Z",
+  "accuracy_meters": 18.5,
   "source": "android"
 }
 ```
 
-`issue` is one of:
+The response contains `duplicate`, `accepted_as_latest` and the accepted last-known location,
+including `received_at`. Coordinates are validated, scoped to the authorized session and never
+fabricated. An older but valid event is retained for idempotency without replacing a newer
+location. A future timestamp outside the accepted skew returns `LOCATION_TIMESTAMP_INVALID`.
 
-- `network_disconnected`
-- `voice_unavailable`
-- `microphone_denied`
-- `audio_interrupted`
+The compatibility route `POST /api/v1/sessions/{id}/technical-status` accepts an explicit
+technical issue and `active` flag. Technical issues are history/status signals, not safety
+conclusions.
 
-Send the same issue with `active: false` after recovery. While an issue is active, automatic
-check-in escalation is deferred. Explicit SOS remains available.
+## Alert model
 
-### Request temporary ElevenLabs access
+Exactly one active alert exists per session. Concurrent SOS and automatic timeout converge on
+the same `alert_id`; notification is requested once. An alert includes:
+
+```json
+{
+  "id": "alert-...",
+  "incident_type": "EXPLICIT_SOS",
+  "status": "ACTIVE",
+  "created_at": "2026-11-14T10:03:00Z",
+  "updated_at": "2026-11-14T10:03:00Z",
+  "notification_requested_at": "2026-11-14T10:03:00Z",
+  "resolved_at": null,
+  "resolution_action": null,
+  "version": 1
+}
+```
+
+When the alert is first transmitted, `alert.notification_requested` includes the last location
+previously accepted through the authorized session endpoint, when one exists:
+
+```json
+{
+  "alert_id": "alert-...",
+  "gps_status": "GPS_STALE",
+  "location_available": true,
+  "location": {
+    "latitude": 44.4268,
+    "longitude": 26.1025,
+    "captured_at": "2026-11-14T10:02:00Z",
+    "age_seconds": 60.0,
+    "is_stale": true,
+    "accuracy_meters": 18.5,
+    "source": "android"
+  }
+}
+```
+
+If no authorized location exists, `location` is `null` and `location_available` is `false`.
+The alert is still transmitted; missing GPS never blocks SOS or timeout escalation.
+
+## Voice
 
 `POST /api/v1/sessions/{id}/voice/access`
 
@@ -213,83 +283,49 @@ check-in escalation is deferred. Explicit SOS remains available.
 }
 ```
 
-In live mode, the response contains a short-lived ElevenLabs `conversation_token` and
-`conversation_id`. The permanent `ELEVENLABS_API_KEY` never leaves the backend. The Android
-client connects directly to ElevenLabs over WebRTC; audio is not proxied through Raspberry Pi.
+Live mode returns a short-lived `conversation_token`, never the permanent API key. Only one
+conversation may be `CONNECTING`, `CONNECTED` or `RECONNECTING` for a session. Provider
+failures use limited progressive backoff and mark the session degraded without blocking
+SOS/cancel.
 
-```json
-{
-  "provider": "elevenlabs",
-  "mode": "live",
-  "transport": "webrtc",
-  "conversation_token": "temporary-token",
-  "conversation_id": "conv_123",
-  "client_config": {
-    "language": "ro",
-    "first_message": "...",
-    "system_prompt": "...",
-    "client_tools": [],
-    "session_id": "5d9a9a55-1ca6-47bd-8768-43bcdb8492d4",
-    "safety_event": "safety.check_in_requested"
-  }
-}
-```
+`POST /api/v1/sessions/{id}/voice/status` reports one of `CONNECTED`, `DISCONNECTED`,
+`API_ERROR`, `MICROPHONE_ERROR`, `TIMEOUT`, `RECONNECTING`, `RECONNECTED` or
+`SERVICE_UNAVAILABLE`, with the issued `conversation_id` where applicable. The payload also
+contains a unique `event_id`. The backend does not store audio by default.
 
-Offline demo mode returns `provider: "demo"`, `mode: "demo"`, `transport: "scripted"` and
-scripted Romanian messages in `client_config.demo_messages`.
+The language model cannot mutate safety state directly. Client tools only submit authorized,
+validated commands for explicit confirmation or SOS.
 
-The client tools map only explicit user actions to the Vesta endpoints:
+## Recovery
 
-- `vesta_confirm_safe` -> `POST .../checkins`
-- `vesta_request_help` -> `POST .../sos`
-- `vesta_report_technical_issue` -> `POST .../technical-status`
+At startup, the backend asks its recovery provider for unfinished sessions. Recovered
+`ACTIVE`, `CHECK_IN`, `UNCONFIRMED` or `ALERT` records keep their identifiers, are marked as
+process/audio interrupted and are republished. Restart never creates a replacement session and
+never assumes the previous audio connection survived. A persistent adapter returns a
+`RecoveredSessionBundle` containing the safety session, its existing alert record and persisted
+idempotency records; this preserves `alert_id` and command replay behavior. More than one
+unfinished session is rejected as an inconsistent GPIO deployment state. The persistence
+provider is owned by the database/integration role; this repository defines only the hook and
+safety behavior.
 
-The language model cannot write the safety state directly.
+## Dashboard and events
 
-## WebSocket
+`GET /api/v1/status` returns `system_state`, `system_health`, `generated_at`,
+`latest_sequence`, `sessions` and `voice_mode`. `WS /ws/events` starts with an authenticated
+snapshot and then ordered events. A slow client may receive `stream.resync_required` and must
+refresh through an authorized read.
 
-`WS /ws/events`
+Important event types include:
 
-The first message is `system.snapshot`; its `sequence` is an atomic watermark matching
-`data.latest_sequence`. Subsequent messages use this envelope:
+- `session.activated`, `session.already_active`, `session.cancelled`, `session.recovered`
+- `safety.check_in_requested`, `safety.check_in_delivered`, `safety.check_in_undelivered`,
+  `safety.check_in_unconfirmed`, `safety.check_in_confirmed`, `safety.check_in_deferred`
+- `safety.alerted`, `alert.notification_requested`, `safety.alert_resolved`, `alert.resolved`
+- `technical.issue_reported`, `technical.issue_resolved`, `voice.status_changed`
+- `system.snapshot`, `system.heartbeat`, `stream.resync_required`
 
-```json
-{
-  "event_id": "srv-...",
-  "sequence": 12,
-  "type": "safety.check_in_requested",
-  "occurred_at": "2026-11-14T10:01:00Z",
-  "session_id": "5d9a9a55-1ca6-47bd-8768-43bcdb8492d4",
-  "device_id": "vesta-01",
-  "data": {
-    "from_state": "ACTIVE",
-    "state": "CHECK_IN",
-    "attempt": 1,
-    "response_deadline": "2026-11-14T10:01:15+00:00"
-  }
-}
-```
-
-Published types:
-
-- `session.activated`
-- `safety.check_in_requested`
-- `safety.check_in_unconfirmed`
-- `safety.check_in_confirmed`
-- `safety.check_in_deferred`
-- `safety.alerted`
-- `session.cancelled`
-- `technical.issue_reported`
-- `technical.issue_resolved`
-- `system.snapshot`
-- `system.heartbeat`
-- `stream.resync_required`
-
-A slow or reconnected client must refresh from `GET /api/v1/status`; it must not infer safety
-state solely from its local WebSocket history.
-
-`system.heartbeat` is a transport keepalive with `sequence: 0`; it does not advance the ordered
-event watermark.
+Each effective update includes the server-side session `version`. A client must not infer the
+current safety state only from its local event history.
 
 ## Errors
 
@@ -305,14 +341,12 @@ Application errors use:
 }
 ```
 
-Expected codes include `UNAUTHORIZED`, `NOT_FOUND`, `EVENT_ID_REUSED`,
-`SESSION_ALREADY_ACTIVE`, `INVALID_SESSION_TRANSITION`, `SESSION_CANCELLED` and sanitized
-`VOICE_*` service errors. Validation errors use FastAPI's standard `422` body.
+Expected conflict codes include `EVENT_ID_REUSED`, `INVALID_SESSION_TRANSITION`,
+`QUICK_CANCEL_EXPIRED`, `CHECKIN_MISMATCH`,
+`CHECKIN_EXPIRED` and `ALERT_ALREADY_RESOLVED`. Provider errors are sanitized.
 
-## Reserved interfaces owned by other roles
+## Interfaces outside Agent 2
 
-The proposal also names `POST /api/v1/telemetry`, `POST /api/v1/location` and
-`GET /api/v1/sensors/history`. They are intentionally not implemented here: storage,
-TimescaleDB/Tiger Data, location ingestion, ESP32 integration beyond activation and historical
-queries belong to Person 3. Their schemas must be added here through an agreed contract before
-implementation.
+Storage, Tiger/TimescaleDB schema, frontend/Android implementation, location acquisition and
+actual contact notification belong to other roles. Agent 2 receives their events or publishes
+requests through this contract; it does not implement or alter those components.

@@ -63,13 +63,21 @@ CLIENT_TOOL_SPECS = (
         parameters={
             "type": "object",
             "properties": {
+                "checkin_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Identificatorul verificării active primit în "
+                        "evenimentul safety.check_in_requested."
+                    ),
+                },
                 "confirmation": {
                     "type": "string",
                     "enum": ["safe"],
                     "description": "Confirmarea explicită a utilizatoarei.",
-                }
+                },
             },
-            "required": ["confirmation"],
+            "required": ["checkin_id", "confirmation"],
             "additionalProperties": False,
         },
     ),
@@ -106,6 +114,8 @@ CLIENT_TOOL_SPECS = (
                     "enum": [
                         "microphone_denied",
                         "audio_interrupted",
+                        "audio_disconnected",
+                        "voice_timeout",
                         "network_disconnected",
                     ],
                 }

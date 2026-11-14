@@ -1,19 +1,18 @@
-# Vesta backend
+# Vesta backend — Agent 2
 
-Acest director conține strict nucleul atribuit rolului „Persoana 2”: serverul FastAPI,
-mașina deterministă de stări, gateway-ul vocal ElevenLabs, autorizarea comenzilor de
-sesiune și fluxul de evenimente WebSocket.
+Acest director conține exclusiv componentele rolului „VESTA — AGENT 2: BACKEND, AI ȘI
+SAFETY ENGINE”: serverul FastAPI, motorul determinist de siguranță, integrarea vocală
+ElevenLabs, monitorizarea joystickului conectat direct la Raspberry Pi și contractele de
+comunicare aferente.
 
-Vesta este un prototip demonstrativ de siguranță personală. Backendul nu apelează 112,
-nu confirmă că a avut loc o agresiune și nu trebuie folosit ca serviciu de urgență real.
+Vesta este un prototip demonstrativ. Backendul nu apelează 112, nu deduce că a avut loc o
+agresiune și nu trebuie tratat ca serviciu real de urgență.
 
-## Pornire rapidă
+## Pornire
 
-Este necesar Python 3.11 sau mai nou. Aceleași comenzi funcționează pe un laptop și pe
-un Raspberry Pi cu Python compatibil; configurarea sistemului de operare și deploymentul
-pe Raspberry Pi aparțin fluxului de integrare, nu acestui modul.
+Este necesar Python 3.11 sau mai nou.
 
-### PowerShell
+### Laptop / CI (GPIO simulat)
 
 ```powershell
 cd backend
@@ -22,209 +21,132 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 
 $env:VESTA_CONTROL_SIGNING_SECRET = "înlocuiește-cu-minim-32-caractere-aleatoare"
+$env:VESTA_GPIO_MODE = "mock"
 $env:VESTA_VOICE_MODE = "demo"
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-### Linux / Raspberry Pi OS
+### Raspberry Pi (GPIO real)
+
+Conectare joystick: `SW → GPIO17` (pin fizic 11), `GND → GND` (pin fizic 6).
 
 ```bash
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,raspberry]'
 
 export VESTA_CONTROL_SIGNING_SECRET='înlocuiește-cu-minim-32-caractere-aleatoare'
-export VESTA_VOICE_MODE='demo'
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+export VESTA_ENVIRONMENT='production'
+export VESTA_DEVICE_API_KEY='înlocuiește-cu-secret-pentru-ruta-de-integrare'
+export VESTA_DASHBOARD_API_KEY='înlocuiește-cu-secret-pentru-dashboard'
+export VESTA_GPIO_MODE='gpio'
+export VESTA_GPIO_PIN='17'
+export VESTA_HOLD_SECONDS='5.0'
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Pentru acces din rețeaua locală se poate folosi `--host 0.0.0.0`, dar numai într-o rețea
-de test controlată, cu `VESTA_DEVICE_API_KEY` setat și originile CORS restrânse. Aplicația
-citește variabilele din mediul procesului; nu încarcă automat un fișier `.env`.
-`backend/.env.example` este doar inventarul valorilor necesare.
+Monitorul folosește numerotare BCM, `pull_up=True`, debounce `0.08 s`, `when_held` și
+`hold_repeat=False`. O apăsare continuă produce un singur eveniment după 5 secunde, fără a
+aștepta eliberarea; o apăsare nouă este eligibilă numai după release. Dacă butonul este deja
+apăsat la pornire, monitorul se armează abia după prima eliberare. Un lock de proces împiedică
+mai multe instanțe să revendice simultan GPIO17. Callbackul GPIO pune doar un eveniment în
+coada internă; I/O-ul extern se face în afara callbackului.
 
-În afara mediilor `development` și `test`, pornirea eșuează intenționat dacă lipsesc
-`VESTA_CONTROL_SIGNING_SECRET` sau `VESTA_DEVICE_API_KEY`. Statusul și fluxul WebSocket
-sunt read-only și nu au autentificare de utilizator în MVP, deci serverul nu trebuie expus
-public; conexiunile WebSocket din browser sunt limitate la originile configurate.
+Procesul trebuie pornit cu exact `--workers 1`. Sesiunile, registrul de idempotency și adaptoarele
+implicite sunt în memorie, iar un singur proces trebuie să dețină monitorul GPIO. Pentru mai
+multe instanțe ar fi necesară coordonare distribuită și un provider persistent comun, care nu
+fac parte din acest rol.
 
-După pornire:
-
-- health check: `GET http://127.0.0.1:8000/health`;
-- documentație interactivă: `http://127.0.0.1:8000/docs`;
-- schema OpenAPI: `http://127.0.0.1:8000/openapi.json`.
+Pentru acces din LAN, expunerea pe `0.0.0.0` se face numai într-o rețea de test controlată,
+cu cheile configurate și originile CORS restrânse. Aplicația nu încarcă automat `.env`;
+`.env.example` este inventarul configurației.
 
 ## Configurare
 
 | Variabilă | Implicit | Rol |
 | --- | --- | --- |
-| `VESTA_APP_NAME` | `Vesta Safety Backend` | Titlul aplicației și al documentației OpenAPI. |
-| `VESTA_ENVIRONMENT` | `development` | Eticheta mediului de rulare. |
-| `VESTA_CONTROL_SIGNING_SECRET` | secret efemer | Secret HMAC de minimum 32 bytes pentru tokenurile de control. Trebuie setat pentru ca tokenurile să rămână valide după restart. |
-| `VESTA_CONTROL_TOKEN_TTL_SECONDS` | `14400` | Durata tokenului de control al sesiunii. |
-| `VESTA_DEVICE_API_KEY` | neconfigurat | Dacă este setată, activarea ESP32 cere headerul `X-Device-Key`. |
-| `VESTA_VOICE_MODE` | `elevenlabs` | `elevenlabs` pentru WebRTC live sau `demo` pentru răspunsuri scriptate offline. |
-| `ELEVENLABS_API_KEY` | neconfigurat | Cheia permanentă folosită exclusiv server-side. |
-| `ELEVENLABS_AGENT_ID` | neconfigurat | Agentul privat ElevenLabs folosit pentru conversație. |
-| `ELEVENLABS_TIMEOUT_SECONDS` | `5` | Timeoutul cererii de credential temporar. |
-| `ELEVENLABS_RETRY_COUNT` | `1` | Numărul de retry-uri; providerul acceptă doar `0` sau `1`. |
-| `VESTA_CHECKIN_INTERVAL_SECONDS` | `60` | Timpul dintre activare/confirmare și următorul check-in. |
-| `VESTA_CHECKIN_RESPONSE_TIMEOUT_SECONDS` | `15` | Fereastra de răspuns pentru o încercare. |
-| `VESTA_CHECKIN_RETRY_DELAY_SECONDS` | `5` | Pauza până la noua încercare și replanificarea în caz de eroare tehnică. |
-| `VESTA_CHECKIN_MAX_ATTEMPTS` | `2` | Numărul de încercări fără confirmare înainte de `ALERT`. |
-| `VESTA_CLIENT_HEARTBEAT_TIMEOUT_SECONDS` | `20` | Lease-ul Android; expirarea lui devine problemă tehnică de rețea, nu alertă. |
-| `VESTA_SCHEDULER_TICK_SECONDS` | `0.25` | Frecvența schedulerului intern. |
-| `VESTA_SCHEDULER_ENABLED` | `true` | Activează tranzițiile temporizate automate. |
-| `VESTA_CORS_ORIGINS` | originile Vite locale | Listă separată prin virgulă; wildcardul `*` este respins. |
-| `VESTA_WEBSOCKET_QUEUE_SIZE` | `256` | Capacitatea cozii fiecărui client WebSocket. |
-| `VESTA_WEBSOCKET_HEARTBEAT_SECONDS` | `15` | Intervalul heartbeat-ului WebSocket. |
+| `VESTA_ENVIRONMENT` | `development` | Mediul de rulare. În afara `development`/`test`, se cer secrete stabile. |
+| `VESTA_CONTROL_SIGNING_SECRET` | secret efemer în dev | HMAC de minimum 32 bytes pentru tokenurile scoped pe sesiune. |
+| `VESTA_CONTROL_TOKEN_TTL_SECONDS` | `14400` | Durata tokenului de control. |
+| `VESTA_DEVICE_API_KEY` | neconfigurat | Protejează ruta de integrare `/device/events`; activarea GPIO internă nu o folosește. |
+| `VESTA_DASHBOARD_API_KEY` | neconfigurat | Protejează statusul global și fluxul dashboard unde este configurat. |
+| `VESTA_GPIO_MODE` | `mock` în dev/test | `gpio`, `mock` sau `disabled`; în afara dev/test este obligatoriu `gpio`. |
+| `VESTA_GPIO_PIN` | `17` | Pin BCM al butonului. |
+| `VESTA_HOLD_SECONDS` | `5.0` | Durata continuă necesară activării. |
+| `VESTA_GPIO_DEBOUNCE_SECONDS` | `0.08` | Debounce hardware. |
+| `VESTA_GPIO_DEVICE_ID` | `vesta-rpi-01` | Identificatorul sursei fizice. |
+| `VESTA_GPIO_LOCK_PATH` | `/tmp/vesta-gpio17.lock` | Lock inter-proces pentru un singur monitor. |
+| `VESTA_QUICK_CANCEL_SECONDS` | `5` | Fereastra de anulare accidentală după activare. |
+| `VESTA_CHECKIN_INTERVAL_SECONDS` | `60` | Intervalul până la check-in. |
+| `VESTA_CHECKIN_RESPONSE_TIMEOUT_SECONDS` | `15` | Fereastra de răspuns la check-in. |
+| `VESTA_CHECKIN_RETRY_DELAY_SECONDS` | `5` | Pauza dintre încercări. |
+| `VESTA_CHECKIN_MAX_ATTEMPTS` | `2` | Încercări fără răspuns înainte de alertă. |
+| `VESTA_CLIENT_HEARTBEAT_TIMEOUT_SECONDS` | `45` | Lease-ul conexiunii clientului. |
+| `VESTA_VOICE_MODE` | `elevenlabs` | `elevenlabs` live sau `demo` scriptat. |
+| `ELEVENLABS_API_KEY` | neconfigurat | Secret permanent, folosit numai server-side. |
+| `ELEVENLABS_AGENT_ID` | neconfigurat | Agentul privat ElevenLabs. |
 
-Pentru modul live:
+## Reguli de siguranță
 
-```powershell
-$env:VESTA_VOICE_MODE = "elevenlabs"
-$env:ELEVENLABS_API_KEY = "..."
-$env:ELEVENLABS_AGENT_ID = "..."
-```
-
-Cheia ElevenLabs nu apare în răspunsurile API, tokenurile de control, schema OpenAPI sau
-mesajele de eroare ale providerului.
-
-## Modelul de autorizare și idempotency
-
-`POST /api/v1/device/events` este protejat cu `X-Device-Key` numai când
-`VESTA_DEVICE_API_KEY` este configurat. O activare reușită returnează un
-`control_token` scoped pe sesiune și data lui de expirare. Toate comenzile ulterioare ale
-sesiunii cer:
-
-```http
-Authorization: Bearer <control_token>
-```
-
-Tokenul nu reprezintă identitatea unei persoane; autorizează doar comenzile pentru
-sesiunea din claim. Fiecare comandă conține un `event_id`. Retrimiterea aceleiași comenzi
-este idempotentă (`duplicate: true`), iar reutilizarea aceluiași `event_id` pentru altă
-comandă produce `409 EVENT_ID_REUSED`. MVP-ul păstrează în memorie o fereastră LRU cu
-ultimele 10.000 de ID-uri de comandă.
-
-## API
-
-### Sistem și activare
-
-| Metodă | Rută | Autorizare | Scop |
-| --- | --- | --- | --- |
-| `GET` | `/health` | - | Verifică procesul și modul vocal configurat. |
-| `GET` | `/api/v1/status` | - | Returnează starea agregată și sesiunile din memorie. |
-| `POST` | `/api/v1/device/events` | `X-Device-Key` dacă este configurat | Procesează evenimentul ESP32 `activate`. Răspunde `201` la creare și `200` la duplicat. |
-
-Activare:
-
-```json
-{
-  "event_id": "evt-001",
-  "device_id": "vesta-01",
-  "event": "activate"
-}
-```
-
-Câmpul opțional `occurred_at` este acceptat pentru contractul dispozitivului, dar timpul
-tranziției este stabilit de server.
-
-### Comenzi de sesiune
-
-| Metodă | Rută | Corp minim | Efect |
-| --- | --- | --- | --- |
-| `POST` | `/api/v1/sessions/{session_id}/checkins` | `{"event_id":"...","confirmation":"safe","source":"android"}` | Confirmă explicit starea de bine din `CHECK_IN` sau `UNCONFIRMED`. |
-| `POST` | `/api/v1/sessions/{session_id}/sos` | `{"event_id":"...","source":"android"}` | Trece imediat în `ALERT`, independent de ElevenLabs. `reason` este opțional. |
-| `POST` | `/api/v1/sessions/{session_id}/cancel` | `{"event_id":"..."}` | Anulează autorizat o sesiune activă sau aflată în alertă. `reason` este opțional. |
-| `POST` | `/api/v1/sessions/{session_id}/heartbeat` | `{}` | Reînnoiește lease-ul autentificat al conexiunii Android. |
-| `POST` | `/api/v1/sessions/{session_id}/technical-status` | `{"event_id":"...","issue":"microphone_denied","active":true}` | Raportează sau rezolvă separat o problemă tehnică. |
-| `POST` | `/api/v1/sessions/{session_id}/voice/access` | `{"transport":"webrtc"}` | Emite credentialul temporar ElevenLabs sau configurația scriptată demo. |
-
-Valorile acceptate pentru `source` sunt documentate în OpenAPI. Problemele tehnice sunt
-`network_disconnected`, `voice_unavailable`, `microphone_denied` și
-`audio_interrupted`; `active: false` marchează rezolvarea lor.
-
-După pornirea interfeței audio, Android trebuie să trimită periodic `POST .../heartbeat`.
-Primul heartbeat activează monitorizarea conexiunii pentru sesiune. Dacă lease-ul expiră,
-backendul adaugă automat `network_disconnected` înainte de evaluarea timeoutului și amână
-escaladarea. Primul heartbeat de după reconectare rezolvă problema tehnică.
-
-Răspunsul live al rutei de voce conține un `conversation_token` temporar și
-`conversation_id`. Răspunsul demo este marcat explicit cu `provider: "demo"`,
-`mode: "demo"`, `transport: "scripted"` și include replici simulate în `client_config`.
-
-## Mașina de stări
-
-Stările sunt `IDLE`, `ACTIVE`, `CHECK_IN`, `UNCONFIRMED`, `ALERT` și `CANCELLED`.
-`IDLE` este starea sistemului când nu există sesiuni neterminate; o sesiune nouă este
-activată direct în `ACTIVE`.
+Stările sesiunii sunt `IDLE`, `ACTIVE`, `CHECK_IN`, `UNCONFIRMED`, `ALERT` și
+`CANCELLED`. Starea tehnică este separată: `HEALTHY`, `DEGRADED` sau `DISCONNECTED`.
+Fiecare modificare are o versiune monotonă pentru controlul concurenței.
 
 ```text
 IDLE -> ACTIVE -> CHECK_IN -> ACTIVE
+                   |            ^
+                   v            |
+              UNCONFIRMED ------+
                    |
-                   v
-              UNCONFIRMED -> CHECK_IN
-                                  |
-                                  v (după numărul configurat de timeouturi)
-                                ALERT
+                   v (după timeouturile configurate)
+                 ALERT --rezolvare explicită--> CANCELLED
 
-ACTIVE / CHECK_IN / UNCONFIRMED --SOS--> ALERT
-ACTIVE / CHECK_IN / UNCONFIRMED / ALERT --cancel autorizat--> CANCELLED
+ACTIVE / CHECK_IN / UNCONFIRMED --SOS explicit--> ALERT
 ```
 
-O confirmare validă resetează contorul de încercări și programează următorul check-in.
-Problemele tehnice sunt ortogonale stării de siguranță: cât timp una este activă,
-schedulerul amână timeoutul și nu produce automat `ALERT`. SOS-ul explicit rămâne
-funcțional. Agentul vocal poate transmite acțiuni explicite, dar nu poate modifica direct
-starea și nu decide dacă a avut loc o agresiune.
+- O activare nouă în timp ce există o sesiune neterminată nu creează altă sesiune. Răspunsul
+  semantic este `ALREADY_ACTIVE`, iar starea curentă este republicată.
+- SOS-ul este independent de conversația vocală și de fereastra de anulare rapidă.
+- `ACCIDENTAL_ACTIVATION` este acceptată numai în fereastra configurată; sesiunea rămâne
+  activă până când comanda autorizată este validată.
+- Un check-in are `checkin_id` unic. Generarea întrebării, livrarea audio și confirmarea sunt
+  evenimente distincte. Confirmările validează sesiunea, check-in-ul activ și termenul; un
+  răspuns întârziat nu modifică o alertă deja emisă.
+- O alertă are un singur `alert_id` activ pe sesiune. SOS și timeout concurente sunt deduplicate,
+  iar notificarea este solicitată o singură dată. Închiderea păstrează alerta ca `RESOLVED`, cu
+  timestamp și acțiune; nu o șterge.
+- GPS-ul este opțional (`GPS_AVAILABLE`, `GPS_STALE`, `GPS_UNAVAILABLE`). Backendul nu inventează
+  coordonate și nu blochează SOS-ul dacă lipsesc.
+- `POWER_UNSTABLE` și `LOW_VOLTAGE` sunt condiții tehnice; backendul nu estimează procentul bateriei.
+- La restart, providerul de recovery poate restitui sesiuni neterminate. Backendul marchează
+  întreruperea, nu presupune că audio continuă, nu creează o sesiune nouă și republică starea.
+- Ruta autorizată `POST /api/v1/sessions/{id}/location` păstrează implicit numai ultima locație
+  validă în memorie. La alertare, cererea de notificare include această locație și vechimea ei,
+  dacă există; lipsa ei nu blochează SOS-ul și coordonatele nu sunt inventate.
 
-Pentru resetarea demo-ului, anulează autorizat sesiunea curentă (inclusiv din `ALERT`), apoi
-trimite o activare nouă cu un `event_id` nou. Refolosirea vechiului `event_id` este tratată
-ca retransmitere și returnează sesiunea inițială.
+## Autorizare și idempotency
 
-## WebSocket
+Comenzile sesiunii folosesc `Authorization: Bearer <control_token>`. Tokenul este scoped pe
+o singură sesiune; `session_id` singur nu autorizează citirea sau modificarea datelor. Statusul
+global folosește `X-Dashboard-Key` atunci când cheia este configurată. Secretele nu se trimit
+în URL și cheia permanentă ElevenLabs nu părăsește backendul.
 
-`WS /ws/events` se abonează înainte de snapshot, apoi trimite `system.snapshot` cu un
-watermark `sequence`/`latest_sequence` atomic și evenimente ordonate pentru
-schimbările backendului:
+Fiecare comandă mutabilă are `event_id`. Retrimiterea aceleiași comenzi este idempotentă;
+refolosirea ID-ului pentru alt payload produce `409 EVENT_ID_REUSED`.
 
-- `session.activated`;
-- `safety.check_in_requested`;
-- `safety.check_in_unconfirmed`;
-- `safety.check_in_confirmed`;
-- `safety.check_in_deferred`;
-- `safety.alerted`;
-- `session.cancelled`;
-- `technical.issue_reported`;
-- `technical.issue_resolved`;
-- `system.heartbeat`;
-- `stream.resync_required` când un client lent pierde evenimente și trebuie să refacă
-  snapshotul prin `GET /api/v1/status`.
+Contractul complet al rutelor este în [`../shared/API_CONTRACT.md`](../shared/API_CONTRACT.md).
 
-Fiecare mesaj conține `event_id`, `sequence`, `type`, `occurred_at`, `session_id`,
-`device_id` și `data`. Un client WebSocket deconectat sau lent nu poate bloca tranzițiile
-de siguranță.
+## ElevenLabs și fallback
 
-## Erori
+Backendul emite un credential temporar, iar telefonul transmite audio direct către ElevenLabs.
+Registry-ul vocal nu permite două conversații active pentru aceeași sesiune și urmărește
+`connected`, `disconnected`, eroare API, eroare microfon, timeout și reconectare. Retry-urile
+sunt limitate și progresive. O eroare vocală produce stare `DEGRADED`, fără a anula sesiunea;
+SOS-ul, anularea autorizată și confirmarea alternativă din interfața web rămân disponibile.
+Audio nu este stocat implicit.
 
-Erorile aplicației au forma:
-
-```json
-{
-  "error": {
-    "code": "INVALID_SESSION_TRANSITION",
-    "message": "...",
-    "details": {}
-  }
-}
-```
-
-Codurile HTTP uzuale sunt `401` pentru token/device key invalid, `404` pentru sesiune
-inexistentă, `409` pentru conflict de stare sau idempotency, `422` pentru payload invalid
-și `503` pentru indisponibilitatea configurării/providerului vocal. Un eșec vocal este
-publicat ca problemă tehnică și nu declanșează singur o alertă.
+Detaliile și checklistul manual sunt în [`docs/ELEVENLABS.md`](docs/ELEVENLABS.md).
 
 ## Testare
 
@@ -236,25 +158,26 @@ python -m ruff format --check .
 python -m compileall -q app tests
 ```
 
-Testele live cu ElevenLabs trebuie rulate separat, numai cu credențiale și dispozitive de
-test autorizate:
+Testele automate folosesc adaptorul GPIO mock. Verificarea pinului fizic, a exactității pragului
+de 5 secunde și a comportamentului electric necesită Raspberry Pi și joystick reale. Testele
+live ElevenLabs se rulează separat, numai cu credențiale și dispozitive autorizate:
 
 ```bash
 RUN_ELEVENLABS_LIVE=1 python -m pytest -m live -s tests/live
 ```
 
-Testul live verifică emiterea tokenului WebRTC și bugetul de latență al gateway-ului.
-Calitatea audio, conversația și rutarea Bluetooth necesită telefonul și căștile reale.
-Verificarea manuală Android este descrisă în
-[`docs/ELEVENLABS.md`](docs/ELEVENLABS.md).
-
 ## Limite intenționate
 
-- Starea, idempotency și istoricul WebSocket sunt păstrate doar în memorie și se pierd la
-  restart. Persistența/Tiger Data aparțin rolului de bază de date și integrare.
-- Nu sunt implementate telemetria senzorilor, locația, istoricul TimescaleDB, notificarea
-  contactului de încredere, frontendul, aplicația Android, firmware-ul sau deploymentul.
-- Backendul nu pornește microfonul Android, nu selectează căștile Bluetooth și nu
-  proxiază audio prin Raspberry Pi.
+- Persistența și schema Tiger/TimescaleDB aparțin altui rol; backendul expune doar hookul de
+  recovery și contractele necesare. Configurația implicită folosește
+  `NoopSessionRecoveryProvider`, deci nu recuperează nimic fără adaptorul persistent furnizat de
+  integrare. Adaptorul persistent trebuie să returneze `RecoveredSessionBundle` pentru a păstra
+  același `alert_id` și înregistrările de idempotency după restart.
+- `InMemoryAuthorizedLocationStore` este adaptorul implicit pentru ultima locație autorizată.
+  Persistența locației între restarturi necesită un `AuthorizedLocationStore` implementat și
+  injectat de componenta de integrare; Agent 2 nu modifică schema de date.
+- Frontendul, aplicația Android, notificarea efectivă a contactului și deploymentul nu sunt
+  implementate aici. Backendul doar publică cererea de notificare.
+- Backendul nu pornește microfonul Android, nu selectează Bluetooth și nu proxiază sau stochează
+  audio.
 - Nu există apeluri reale către 112 sau alte servicii de urgență.
-

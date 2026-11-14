@@ -135,7 +135,11 @@ def test_invalid_session_token_is_rejected_before_command(client: TestClient) ->
     response = client.post(
         f"/api/v1/sessions/{session_id}/checkins",
         headers={"Authorization": "Bearer invalid-token"},
-        json={"event_id": "checkin-unauthorized", "confirmation": "safe"},
+        json={
+            "event_id": "checkin-unauthorized",
+            "checkin_id": "checkin-does-not-matter",
+            "confirmation": "safe",
+        },
     )
 
     assert response.status_code == 401
@@ -150,11 +154,20 @@ def test_normal_checkin_returns_session_to_active(client: TestClient) -> None:
     assert initial.next_check_in_at is not None
 
     asyncio.run(manager.advance_all(now=initial.next_check_in_at))
+    checkin = asyncio.run(manager.get(session_id))
+    assert checkin.current_checkin_id is not None
+    delivered = client.post(
+        f"/api/v1/sessions/{session_id}/checkins/{checkin.current_checkin_id}/delivery",
+        headers=bearer(activation["control_token"]),
+        json={"event_id": "delivery-1", "status": "DELIVERED", "channel": "voice"},
+    )
+    assert delivered.status_code == 200
     response = client.post(
         f"/api/v1/sessions/{session_id}/checkins",
         headers=bearer(activation["control_token"]),
         json={
             "event_id": "checkin-safe-1",
+            "checkin_id": checkin.current_checkin_id,
             "confirmation": "safe",
             "source": "android",
         },
@@ -181,7 +194,18 @@ def test_timeouts_retry_once_then_raise_deterministic_alert() -> None:
 
         first = await services.sessions.advance_all(now=BASE_TIME + timedelta(seconds=10))
         assert [transition.kind.value for transition in first] == ["check_in_started"]
-        assert (await services.sessions.get(session_id)).state is SessionState.CHECK_IN
+        first_checkin = await services.sessions.get(session_id)
+        assert first_checkin.state is SessionState.CHECK_IN
+        assert first_checkin.current_checkin_id is not None
+        await services.sessions.mark_checkin_delivery(
+            session_id,
+            first_checkin.current_checkin_id,
+            token=result.control_token,
+            event_id="timed-delivery-1",
+            delivered=True,
+            channel="voice",
+            now=BASE_TIME + timedelta(seconds=11),
+        )
 
         missed = await services.sessions.advance_all(now=BASE_TIME + timedelta(seconds=14))
         assert [transition.kind.value for transition in missed] == ["check_in_missed"]
@@ -189,28 +213,44 @@ def test_timeouts_retry_once_then_raise_deterministic_alert() -> None:
 
         retry = await services.sessions.advance_all(now=BASE_TIME + timedelta(seconds=16))
         assert [transition.kind.value for transition in retry] == ["check_in_started"]
+        second_checkin = await services.sessions.get(session_id)
+        assert second_checkin.current_checkin_id is not None
+        await services.sessions.mark_checkin_delivery(
+            session_id,
+            second_checkin.current_checkin_id,
+            token=result.control_token,
+            event_id="timed-delivery-2",
+            delivered=True,
+            channel="voice",
+            now=BASE_TIME + timedelta(seconds=17),
+        )
 
         alerted = await services.sessions.advance_all(now=BASE_TIME + timedelta(seconds=20))
         assert [transition.kind.value for transition in alerted] == ["alerted"]
         final = await services.sessions.get(session_id)
         assert final.state is SessionState.ALERT
         assert final.alert_reason is not None
-        assert final.alert_reason.value == "missed_check_ins"
+        assert final.alert_reason.value == "MISSED_CHECK_INS"
 
         event_types = [event.type for event in await services.broker.recent()]
         assert event_types == [
             "session.activated",
             "safety.check_in_requested",
+            "safety.check_in_delivered",
             "safety.check_in_unconfirmed",
             "safety.check_in_requested",
+            "safety.check_in_delivered",
             "safety.alerted",
+            "alert.notification_requested",
         ]
         await services.voice.aclose()
 
     asyncio.run(scenario())
 
 
-def test_sos_cancel_and_new_session_for_same_device(client: TestClient) -> None:
+def test_sos_requires_explicit_alert_resolution_before_new_session(
+    client: TestClient,
+) -> None:
     activation = activate(client)
     session_id = activation["session"]["id"]
     headers = bearer(activation["control_token"])
@@ -226,15 +266,26 @@ def test_sos_cancel_and_new_session_for_same_device(client: TestClient) -> None:
     )
     assert sos.status_code == 200
     assert sos.json()["session"]["state"] == "ALERT"
-    assert sos.json()["session"]["alert_reason"] == "explicit_sos"
+    sos_session = sos.json()["session"]
+    assert sos_session["alert_reason"] == "SOS_EXPLICIT"
+    alert_id = sos_session["alert"]["id"]
 
     cancelled = client.post(
         f"/api/v1/sessions/{session_id}/cancel",
         headers=headers,
-        json={"event_id": "cancel-1", "reason": "Reset demo autorizat"},
+        json={"event_id": "cancel-1", "reason": "USER_CANCELLED"},
     )
-    assert cancelled.status_code == 200
-    assert cancelled.json()["session"]["state"] == "CANCELLED"
+    assert cancelled.status_code == 409
+    assert cancelled.json()["error"]["code"] == "ALERT_REQUIRES_RESOLUTION"
+
+    resolved = client.post(
+        f"/api/v1/sessions/{session_id}/alerts/{alert_id}/resolve",
+        headers=headers,
+        json={"event_id": "resolve-1", "action": "USER_CONFIRMED_SAFE"},
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["session"]["state"] == "CANCELLED"
+    assert resolved.json()["session"]["alert"]["status"] == "RESOLVED"
     assert client.get("/api/v1/status").json()["system_state"] == "IDLE"
 
     restarted = activate(client, event_id="activate-2")
@@ -471,11 +522,17 @@ def test_openapi_does_not_contain_permanent_secrets(client: TestClient) -> None:
         "/api/v1/status",
         "/api/v1/device/events",
         "/api/v1/sessions/{session_id}/checkins",
+        "/api/v1/sessions/{session_id}/checkins/{checkin_id}/delivery",
+        "/api/v1/sessions/{session_id}",
         "/api/v1/sessions/{session_id}/sos",
         "/api/v1/sessions/{session_id}/cancel",
+        "/api/v1/sessions/{session_id}/alerts/{alert_id}/resolve",
         "/api/v1/sessions/{session_id}/heartbeat",
+        "/api/v1/sessions/{session_id}/client-status",
+        "/api/v1/sessions/{session_id}/location",
         "/api/v1/sessions/{session_id}/technical-status",
         "/api/v1/sessions/{session_id}/voice/access",
+        "/api/v1/sessions/{session_id}/voice/status",
     }
 
 

@@ -30,21 +30,36 @@ def create_app(
         app.state.services = resolved_services
         stop_event = asyncio.Event()
         scheduler: asyncio.Task[None] | None = None
-        if resolved_settings.scheduler_enabled:
-            scheduler = asyncio.create_task(
-                resolved_services.sessions.run_scheduler(stop_event),
-                name="vesta-safety-scheduler",
-            )
-        if resolved_settings.control_secret_is_ephemeral:
-            LOGGER.warning(
-                "VESTA_CONTROL_SIGNING_SECRET is unset; control tokens will not survive restart"
-            )
+        hardware_task: asyncio.Task[None] | None = None
         try:
+            await resolved_services.sessions.recover_unfinished()
+            if resolved_services.hardware_monitor is not None:
+                # The gpiozero callback only queues events. Session work is handled
+                # asynchronously by this single event-loop coordinator.
+                resolved_services.hardware_monitor.start()
+                if resolved_services.hardware_coordinator is None:
+                    raise RuntimeError("Hardware monitor has no activation coordinator")
+                hardware_task = asyncio.create_task(
+                    resolved_services.hardware_coordinator.run(stop_event),
+                    name="vesta-gpio-activation-coordinator",
+                )
+            if resolved_settings.scheduler_enabled:
+                scheduler = asyncio.create_task(
+                    resolved_services.sessions.run_scheduler(stop_event),
+                    name="vesta-safety-scheduler",
+                )
+            if resolved_settings.control_secret_is_ephemeral:
+                LOGGER.warning(
+                    "VESTA_CONTROL_SIGNING_SECRET is unset; control tokens will not survive restart"
+                )
             yield
         finally:
             stop_event.set()
-            if scheduler is not None:
-                await scheduler
+            if resolved_services.hardware_monitor is not None:
+                resolved_services.hardware_monitor.stop()
+            tasks = [task for task in (scheduler, hardware_task) if task is not None]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             await resolved_services.voice.aclose()
 
     app = FastAPI(
@@ -62,7 +77,12 @@ def create_app(
         allow_origins=list(resolved_settings.cors_origins),
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "X-Device-Key"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Dashboard-Key",
+            "X-Device-Key",
+        ],
     )
 
     @app.exception_handler(AppError)
