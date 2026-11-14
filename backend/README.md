@@ -83,6 +83,9 @@ cu cheile configurate și originile CORS restrânse. Aplicația nu încarcă aut
 | `VESTA_CHECKIN_RETRY_DELAY_SECONDS` | `5` | Pauza dintre încercări. |
 | `VESTA_CHECKIN_MAX_ATTEMPTS` | `2` | Încercări fără răspuns înainte de alertă. |
 | `VESTA_CLIENT_HEARTBEAT_TIMEOUT_SECONDS` | `45` | Lease-ul conexiunii clientului. |
+| `VESTA_PERSISTENCE` | `memory` | `memory` pentru rulare locală/teste sau `tiger` pentru istoricul Tiger Data. |
+| `TIMESCALE_SERVICE_URL` | neconfigurat | URL-ul PostgreSQL/Tiger Data, obligatoriu când persistența este `tiger`. |
+| `VESTA_TRUSTED_CONTACT_IDS` | `demo-contact` | Lista separată prin virgulă a destinatarilor din outbox. |
 | `VESTA_VOICE_MODE` | `elevenlabs` | `elevenlabs` live sau `demo` scriptat. |
 | `ELEVENLABS_API_KEY` | neconfigurat | Secret permanent, folosit numai server-side. |
 | `ELEVENLABS_AGENT_ID` | neconfigurat | Agentul privat ElevenLabs. |
@@ -168,11 +171,11 @@ RUN_ELEVENLABS_LIVE=1 python -m pytest -m live -s tests/live
 
 ## Limite intenționate
 
-- Persistența și schema Tiger/TimescaleDB aparțin altui rol; backendul expune doar hookul de
-  recovery și contractele necesare. Configurația implicită folosește
-  `NoopSessionRecoveryProvider`, deci nu recuperează nimic fără adaptorul persistent furnizat de
-  integrare. Adaptorul persistent trebuie să returneze `RecoveredSessionBundle` pentru a păstra
-  același `alert_id` și înregistrările de idempotency după restart.
+- Integrarea Tiger/TimescaleDB este opțională și scrie tranzițiile asincron, fără să blocheze
+  Safety Engine. Politica Tiger implicită marchează sesiunile stocate neterminate `INTERRUPTED`
+  la restart și păstrează alertele active în istoric. Deploymentul poate înlocui această politică
+  cu un `SessionRecoveryProvider` persistent dacă trebuie să reconstruiască o sesiune live prin
+  `RecoveredSessionBundle`; cele două politici nu se rulează pentru aceeași sesiune stocată.
 - `InMemoryAuthorizedLocationStore` este adaptorul implicit pentru ultima locație autorizată.
   Persistența locației între restarturi necesită un `AuthorizedLocationStore` implementat și
   injectat de componenta de integrare; Agent 2 nu modifică schema de date.

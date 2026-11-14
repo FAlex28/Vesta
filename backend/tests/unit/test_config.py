@@ -15,6 +15,8 @@ ENV_NAMES = (
     "ELEVENLABS_RETRY_COUNT",
     "VESTA_CHECKIN_MAX_ATTEMPTS",
     "VESTA_SCHEDULER_ENABLED",
+    "VESTA_PERSISTENCE",
+    "VESTA_TRUSTED_CONTACT_IDS",
 )
 
 
@@ -79,6 +81,7 @@ def test_non_development_configuration_fails_closed_without_secrets(
         ("VESTA_VOICE_MODE", "unknown", "VOICE_MODE"),
         ("VESTA_CORS_ORIGINS", "*", "CORS_ORIGINS"),
         ("VESTA_SCHEDULER_ENABLED", "sometimes", "boolean"),
+        ("VESTA_PERSISTENCE", "unknown", "PERSISTENCE"),
     ],
 )
 def test_invalid_environment_values_are_rejected(

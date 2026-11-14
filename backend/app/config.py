@@ -80,6 +80,10 @@ class Settings:
     websocket_heartbeat_seconds: float = 15.0
     websocket_auth_timeout_seconds: float = 5.0
 
+    # "memory": doar în memorie (implicit, teste). "tiger": istoric în Tiger Data / TimescaleDB.
+    persistence_mode: str = "memory"
+    trusted_contact_ids: tuple[str, ...] = ("demo-contact",)
+
     @classmethod
     def from_env(cls) -> Settings:
         secret = (os.getenv("VESTA_CONTROL_SIGNING_SECRET") or "").strip() or None
@@ -122,6 +126,15 @@ class Settings:
                 )
             if gpio_mode != "gpio":
                 raise ConfigurationError("VESTA_GPIO_MODE must be 'gpio' outside development/test")
+
+        persistence_mode = os.getenv("VESTA_PERSISTENCE", "memory").strip().lower()
+        if persistence_mode not in {"memory", "tiger"}:
+            raise ConfigurationError("VESTA_PERSISTENCE must be 'memory' or 'tiger'")
+        contacts = tuple(
+            c.strip()
+            for c in os.getenv("VESTA_TRUSTED_CONTACT_IDS", "demo-contact").split(",")
+            if c.strip()
+        )
 
         retry_count = int(os.getenv("ELEVENLABS_RETRY_COUNT", "1"))
         if retry_count not in {0, 1}:
@@ -174,4 +187,6 @@ class Settings:
             websocket_queue_size=_get_int("VESTA_WEBSOCKET_QUEUE_SIZE", 256),
             websocket_heartbeat_seconds=_get_float("VESTA_WEBSOCKET_HEARTBEAT_SECONDS", 15.0),
             websocket_auth_timeout_seconds=_get_float("VESTA_WEBSOCKET_AUTH_TIMEOUT_SECONDS", 5.0),
+            persistence_mode=persistence_mode,
+            trusted_contact_ids=contacts,
         )

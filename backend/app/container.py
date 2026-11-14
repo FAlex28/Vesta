@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from app.config import Settings
 from app.hardware import (
@@ -40,6 +41,8 @@ class AppServices:
     voice_sessions: VoiceConversationRegistry
     hardware_monitor: JoystickMonitor | None
     hardware_coordinator: HardwareActivationCoordinator | None
+    # TigerPersistence când VESTA_PERSISTENCE=tiger; altfel None (doar în memorie)
+    persistence: Any | None = None
 
 
 def build_services(
@@ -59,6 +62,18 @@ def build_services(
         max_attempts=settings.checkin_max_attempts,
     )
     engine = SafetyEngine(policy)
+    persistence = None
+    if settings.persistence_mode == "tiger":
+        # import întârziat: modul memory nu are nevoie de pg8000 / Tiger Data
+        from app.db import Database
+        from app.integrations.runtime import TigerPersistence
+
+        persistence = TigerPersistence(
+            Database(),
+            broker,
+            recipients=settings.trusted_contact_ids,
+            response_timeout_s=settings.checkin_response_timeout_seconds,
+        )
     tokens = ControlTokenService(
         settings.control_signing_secret,
         default_ttl=timedelta(seconds=settings.control_token_ttl_seconds),
@@ -75,6 +90,7 @@ def build_services(
         alerts=alerts,
         recovery_provider=recovery_provider or NoopSessionRecoveryProvider(),
         location_provider=locations,
+        recorder=persistence.recorder if persistence is not None else None,
     )
     if settings.voice_mode == "demo":
         voice: VoiceProvider = DemoVoiceProvider()
@@ -101,6 +117,7 @@ def build_services(
         voice_sessions=VoiceConversationRegistry(),
         hardware_monitor=selected_monitor,
         hardware_coordinator=hardware_coordinator,
+        persistence=persistence,
     )
 
 

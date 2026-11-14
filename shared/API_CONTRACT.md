@@ -17,6 +17,9 @@ not a validated emergency service. No endpoint calls 112 or infers that an assau
   configured. The production GPIO monitor calls the session service internally.
 - Tokens and secrets must not appear in URLs, WebSocket events or logs. `ELEVENLABS_API_KEY`
   remains server-side.
+- The in-memory idempotency registry retains the 10,000 most recent command IDs (LRU).
+- With `VESTA_PERSISTENCE=tiger`, safety transitions are also queued asynchronously for Tiger
+  Data. A database outage must not block check-ins, SOS, cancellation or alert resolution.
 
 ## Session and technical state
 
@@ -344,6 +347,35 @@ Application errors use:
 Expected conflict codes include `EVENT_ID_REUSED`, `INVALID_SESSION_TRANSITION`,
 `QUICK_CANCEL_EXPIRED`, `CHECKIN_MISMATCH`,
 `CHECKIN_EXPIRED` and `ALERT_ALREADY_RESOLVED`. Provider errors are sanitized.
+
+## Persistence (Tiger Data)
+
+Owned by Agent 3 (`backend/app/db`, `backend/app/integrations`; see `docs/database.md`).
+
+- Enabled with `VESTA_PERSISTENCE=tiger` and `TIMESCALE_SERVICE_URL`. Default `memory` keeps the
+  in-memory-only behaviour.
+- `SessionManager` passes every non-`NO_CHANGE` transition to a recorder. Writes run in order in
+  a background task, with deterministic event IDs derived from the client `event_id`, so a
+  retried command is never stored twice.
+- Alert closure still uses the explicit authorized resolve endpoint. Storage retains the alert
+  as `RESOLVED`, including its timestamp/action, and queues one `ALERT_RESOLVED` notification
+  for contacts that received the original alert.
+- The default Tiger restart policy marks unfinished stored sessions `INTERRUPTED` in history,
+  keeps stored active alerts open and publishes `system.recovered`; it does not invent a new live
+  session. A deployment may replace that default startup policy with a persistent
+  `SessionRecoveryProvider` that reconstructs one live `RecoveredSessionBundle`, preserving its
+  `session_id`, `alert_id` and idempotency records; the two recovery policies must not run over
+  the same stored session.
+- Additional read-only WebSocket events:
+  - `contact.notification`: `notification_id`, `alert_id`, `kind` (`ALERT_RAISED` /
+    `ALERT_RESOLVED`), `recipient_id`, `incident_type`, `location_status`. It omits coordinates
+    by data-minimization policy; the WebSocket itself remains authenticated as described above.
+  - `technical.power`: `state` (`POWER_OK`, `LOW_VOLTAGE`, `POWER_UNSTABLE` or
+    `POWER_STATUS_UNKNOWN`) and `detail`. No battery percentage is reported.
+  - `system.recovered`
+- Control tokens (`v1.<payload>.<signature>`) stay the only mechanism for session control. The
+  `access_tokens` table is reserved for future read access by the trusted contact and the
+  private dashboard (location, history) and is not used by these endpoints yet.
 
 ## Interfaces outside Agent 2
 

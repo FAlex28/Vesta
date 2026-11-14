@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.errors import AuthenticationError, ConflictError, NotFoundError
+from app.integrations.persistence import NullRecorder, SessionRecorder, TransitionRecord
 from app.realtime.broker import EventBroker
 from app.safety import (
     AlertReason,
@@ -125,6 +126,7 @@ class SessionManager:
         alerts: AlertRegistry | None = None,
         recovery_provider: SessionRecoveryProvider | None = None,
         location_provider: AuthorizedLocationProvider | None = None,
+        recorder: SessionRecorder | None = None,
     ) -> None:
         self._engine = engine
         self._broker = broker
@@ -139,6 +141,7 @@ class SessionManager:
         self._processed_commands: OrderedDict[str, _ProcessedCommand] = OrderedDict()
         self._max_processed_commands = 10_000
         self._lock = asyncio.Lock()
+        self._recorder: SessionRecorder = recorder or NullRecorder()
 
     @property
     def alerts(self) -> AlertRegistry:
@@ -194,7 +197,11 @@ class SessionManager:
             self._sessions[session.session_id] = session
             self._remember(event_id, fingerprint, session.session_id)
             token, expires_at = self._issue_control_token(session.session_id, instant)
-            await self._handle_transition(session, transition)
+            await self._handle_transition(
+                session,
+                transition,
+                command_event_id=event_id,
+            )
             return ActivationResult(
                 session=copy.deepcopy(session),
                 outcome=ActivationOutcome.ACTIVATED,
@@ -229,7 +236,12 @@ class SessionManager:
             except InvalidTransition as exc:
                 raise _checkin_state_conflict(exc, session) from exc
             self._remember(event_id, fingerprint, session_id)
-            await self._handle_transition(session, transition, extra={"source": source})
+            await self._handle_transition(
+                session,
+                transition,
+                extra={"source": source},
+                command_event_id=event_id,
+            )
             return CommandResult(copy.deepcopy(session))
 
     async def mark_checkin_delivery(
@@ -269,6 +281,7 @@ class SessionManager:
                 session,
                 transition,
                 extra={"channel": channel},
+                command_event_id=event_id,
             )
             if channel == "voice":
                 session.audio_status = (
@@ -280,10 +293,11 @@ class SessionManager:
                     active=not delivered,
                     now=instant,
                 )
-                await self._publish_transition(
+                await self._handle_transition(
                     session,
                     issue_transition,
                     extra={"source": "checkin_delivery"},
+                    command_event_id=event_id,
                 )
             self._remember(event_id, fingerprint, session_id)
             return CommandResult(copy.deepcopy(session))
@@ -315,26 +329,26 @@ class SessionManager:
                     session.alert_reason = AlertReason.SOS_EXPLICIT
                     session.updated_at = instant
                     session.version += 1
-                alert, created = self._alerts.ensure_active(
-                    session_id,
-                    AlertIncidentType.EXPLICIT_SOS,
-                    now=instant,
-                )
-                await self._broker.publish(
-                    "safety.alerted",
-                    session_id=session.session_id,
-                    device_id=session.device_id,
-                    data={
-                        "state": SessionState.ALERT.value,
+                transition = SafetyTransition(
+                    kind=TransitionKind.ALERTED,
+                    from_state=SessionState.ALERT,
+                    to_state=SessionState.ALERT,
+                    occurred_at=instant,
+                    version=session.version,
+                    checkin_id=session.current_checkin_id,
+                    details={
                         "reason": AlertReason.SOS_EXPLICIT.value,
-                        "source": source,
-                        "alert_id": alert.alert_id,
                         "already_alerting": True,
                         "version": session.version,
                     },
                 )
-                if created:
-                    await self._publish_notification_request(session, alert)
+                alert = await self._handle_transition(
+                    session,
+                    transition,
+                    extra={"source": source},
+                    command_event_id=event_id,
+                    reason=reason,
+                )
             else:
                 try:
                     transition = self._engine.request_sos(session, now=instant)
@@ -344,6 +358,8 @@ class SessionManager:
                     session,
                     transition,
                     extra={"source": source},
+                    command_event_id=event_id,
+                    reason=reason,
                 )
             self._remember(event_id, fingerprint, session_id)
             return AlertCommandResult(copy.deepcopy(session), alert=alert)
@@ -389,6 +405,7 @@ class SessionManager:
                     now=instant,
                     action=CancellationReason.ACCIDENTAL_ACTIVATION.value,
                     cancellation_reason=CancellationReason.ACCIDENTAL_ACTIVATION.value,
+                    command_event_id=event_id,
                 )
                 self._remember(event_id, fingerprint, session_id)
                 return result
@@ -402,7 +419,12 @@ class SessionManager:
             except InvalidTransition as exc:
                 raise _transition_conflict(exc) from exc
             self._remember(event_id, fingerprint, session_id)
-            await self._handle_transition(session, transition)
+            await self._handle_transition(
+                session,
+                transition,
+                command_event_id=event_id,
+                reason=normalized_reason,
+            )
             return AlertCommandResult(
                 copy.deepcopy(session),
                 alert=self._alerts.get_for_session(session_id),
@@ -434,6 +456,7 @@ class SessionManager:
                 alert_id=alert_id,
                 now=instant,
                 action=action,
+                command_event_id=event_id,
             )
             self._remember(event_id, fingerprint, session_id)
             return result
@@ -482,7 +505,7 @@ class SessionManager:
                 session.updated_at = instant
                 session.version += 1
             for transition in effective:
-                await self._publish_transition(
+                await self._handle_transition(
                     session,
                     transition,
                     extra={"source": "client_heartbeat"},
@@ -612,7 +635,12 @@ class SessionManager:
                 session.updated_at = instant
                 session.version += 1
             for transition in effective:
-                await self._publish_transition(session, transition, extra={"source": source})
+                await self._handle_transition(
+                    session,
+                    transition,
+                    extra={"source": source},
+                    command_event_id=event_id,
+                )
             self._remember(event_id, fingerprint, session_id)
             await self._publish_client_status(session, source=source)
             return CommandResult(copy.deepcopy(session))
@@ -673,10 +701,11 @@ class SessionManager:
                 transition = self._set_issue_locked(session, issue, active=active, now=instant)
                 if transition.kind is not TransitionKind.NO_CHANGE:
                     effective.append(transition)
-                    await self._publish_transition(
+                    await self._handle_transition(
                         session,
                         transition,
                         extra={"source": "voice_gateway"},
+                        command_event_id=event_id,
                     )
             if not effective:
                 session.updated_at = instant
@@ -732,7 +761,9 @@ class SessionManager:
                 raise _transition_conflict(exc) from exc
             if not trusted_internal:
                 self._remember(event_id, fingerprint, session_id)
-            await self._publish_transition(session, transition, extra={"source": source})
+            await self._handle_transition(
+                session, transition, extra={"source": source}, command_event_id=event_id
+            )
             return CommandResult(copy.deepcopy(session))
 
     async def recover_unfinished(
@@ -898,7 +929,7 @@ class SessionManager:
                 connection_transition = self._expire_connectivity_lease(session, instant)
                 if connection_transition is not None:
                     transitions.append(connection_transition)
-                    await self._publish_transition(
+                    await self._handle_transition(
                         session,
                         connection_transition,
                         extra={"source": "heartbeat_timeout"},
@@ -916,7 +947,7 @@ class SessionManager:
                             now=instant,
                         )
                         session.audio_status = AudioStatus.DISCONNECTED
-                        await self._publish_transition(
+                        await self._handle_transition(
                             session,
                             issue_transition,
                             extra={"source": "checkin_delivery_timeout"},
@@ -960,6 +991,7 @@ class SessionManager:
         now: datetime,
         action: str,
         cancellation_reason: str | None = None,
+        command_event_id: str | None = None,
     ) -> AlertCommandResult:
         current = self._alerts.get_for_session(session.session_id)
         if current is None:
@@ -999,6 +1031,8 @@ class SessionManager:
                 "resolution_action": alert.resolution_action,
                 "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
             },
+            command_event_id=command_event_id,
+            reason=cancellation_reason or action,
         )
         await self._broker.publish(
             "alert.resolved",
@@ -1134,6 +1168,8 @@ class SessionManager:
         transition: SafetyTransition,
         *,
         extra: dict[str, Any] | None = None,
+        command_event_id: str | None = None,
+        reason: str | None = None,
     ) -> AlertRecord | None:
         if transition.kind is TransitionKind.NO_CHANGE:
             return self._alerts.get_for_session(session.session_id)
@@ -1152,7 +1188,13 @@ class SessionManager:
                     "alert_status": alert.status.value,
                 }
             )
-        await self._publish_transition(session, transition, extra=enriched)
+        await self._publish_transition(
+            session,
+            transition,
+            extra=enriched,
+            command_event_id=command_event_id,
+            reason=reason,
+        )
         if alert is not None and created:
             await self._publish_notification_request(session, alert)
         return alert
@@ -1163,6 +1205,8 @@ class SessionManager:
         transition: SafetyTransition,
         *,
         extra: dict[str, Any] | None = None,
+        command_event_id: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if transition.kind is TransitionKind.NO_CHANGE:
             return
@@ -1183,6 +1227,21 @@ class SessionManager:
             session_id=session.session_id,
             device_id=session.device_id,
             data=data,
+        )
+        # Persistența (Tiger Data) e asincronă și nu blochează sau modifică decizia de siguranță.
+        self._recorder.submit(
+            TransitionRecord(
+                session_id=session.session_id,
+                device_id=session.device_id,
+                kind=transition.kind.value,
+                from_state=transition.from_state.value,
+                to_state=transition.to_state.value,
+                occurred_at=transition.occurred_at,
+                details=dict(data),
+                source=(extra or {}).get("source"),
+                command_event_id=command_event_id,
+                reason=reason,
+            )
         )
 
     async def _publish_notification_request(
