@@ -12,3 +12,9 @@ __pycache__/
 
 # Vesta runtime state (paired phones, contacts, push keys)
 .state/
+
+# Local AI agent tooling and browser captures
+.claude/
+CLAUDE.md
+.mcp.json
+.playwright-mcp/
