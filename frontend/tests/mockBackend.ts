@@ -156,6 +156,10 @@ export class MockBackend {
   chunks = new Map<string, number[]>();
   /** Dispatcher's push-to-talk messages per session. */
   operatorMessages = new Map<string, Array<{ id: string; at: string; mime_type: string; audio_base64: string }>>();
+  /** The route of each session (GET /locations); the latest location when not set. */
+  routes = new Map<string, Array<{ latitude: number; longitude: number; captured_at: string; accuracy_meters: number | null; source: string }>>();
+  /** Live calls (WebRTC offer/answer passed between dashboard and phone) per session. */
+  liveCalls = new Map<string, { id: string; offer: string; answer: string | null }>();
 
   /** An invite for a new contact, as if the person had added one on her phone. */
   inviteContact(name = "Mama", phone = "+40722123456") {
@@ -198,9 +202,10 @@ export class MockBackend {
     return this.sessions.find((session) => session.id === id);
   }
 
-  async install() {
-    await this.page.route("**/api/v1/**", (route) => this.handle(route));
-    await this.page.routeWebSocket(/\/ws\/events$/, (ws) => {
+  /** Also serves a second page (e.g. the phone next to the dashboard) from the same state. */
+  async install(page: Page = this.page) {
+    await page.route("**/api/v1/**", (route) => this.handle(route));
+    await page.routeWebSocket(/\/ws\/events$/, (ws) => {
       if (!this.acceptSockets) {
         void ws.close({ code: 1011, reason: "unavailable" });
         return;
@@ -390,6 +395,51 @@ export class MockBackend {
 
     const match = recorded.path.match(/^\/api\/v1\/sessions\/([^/]+)\/(.+)$/);
     if (!match) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "not found" } } });
+    // The route: only for a session that became an alert, never a false alarm.
+    if (recorded.method === "GET" && match[2] === "locations") {
+      const owner = this.session(decodeURIComponent(match[1]));
+      if (!owner?.alert || owner.alert.resolution_action === "FALSE_ALARM") {
+        return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Nothing shared" } } });
+      }
+      const latest = this.locations.get(owner.id);
+      const points = this.routes.get(owner.id) ?? (latest ? [latest] : []);
+      return route.fulfill({ json: { session_id: owner.id, points } });
+    }
+    // Live call: the dashboard offers (and takes over), the phone answers.
+    if (match[2] === "call" || match[2].startsWith("call/")) {
+      const owner = this.session(decodeURIComponent(match[1]));
+      if (!owner) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Unknown session" } } });
+      const phone = match[2] === "call" || (match[2] === "call/answer" && recorded.method === "POST");
+      if (phone && recorded.auth !== `Bearer ${TOKEN}`) return route.fulfill({ status: 401, json: { error: { code: "UNAUTHORIZED", message: "token" } } });
+      const call = this.liveCalls.get(owner.id) ?? null;
+      if (match[2] === "call/offer" && recorded.method === "POST") {
+        if (owner.state === "CANCELLED") return route.fulfill({ status: 409, json: { error: { code: "SESSION_CANCELLED", message: "ended" } } });
+        if (!owner.operator_connected_at) {
+          owner.operator_connected_at = new Date().toISOString();
+          this.publish("call.taken_over", { operator_connected_at: owner.operator_connected_at }, owner.id);
+        }
+        const next = { id: `call-${this.liveCalls.size + 1}-${Date.now()}`, offer: String(recorded.body?.sdp ?? ""), answer: null };
+        this.liveCalls.set(owner.id, next);
+        this.publish("call.offer", { call_id: next.id }, owner.id);
+        return route.fulfill({ json: { call_id: next.id, offer: null, answer: null } });
+      }
+      if (match[2] === "call" && recorded.method === "GET") {
+        return route.fulfill({ json: call ? { call_id: call.id, offer: call.answer === null ? call.offer : null, answer: null } : { call_id: null } });
+      }
+      if (match[2] === "call/answer" && recorded.method === "POST") {
+        if (!call || call.id !== recorded.body?.call_id) return route.fulfill({ status: 409, json: { error: { code: "CALL_ENDED", message: "closed" } } });
+        call.answer = String(recorded.body?.sdp ?? "");
+        this.publish("call.answered", { call_id: call.id }, owner.id);
+        return route.fulfill({ json: { call_id: call.id } });
+      }
+      if (match[2] === "call/answer" && recorded.method === "GET") {
+        return route.fulfill({ json: call ? { call_id: call.id, offer: null, answer: call.answer } : { call_id: null } });
+      }
+      if (match[2] === "call/hangup" && recorded.method === "POST") {
+        if (this.liveCalls.delete(owner.id)) this.publish("call.ended", {}, owner.id);
+        return route.fulfill({ json: { call_id: null } });
+      }
+    }
     // Dispatcher takes the call / talks (dashboard key).
     if (recorded.method === "POST" && (match[2] === "takeover" || match[2] === "operator/messages")) {
       const owner = this.session(decodeURIComponent(match[1]));
@@ -407,7 +457,7 @@ export class MockBackend {
       const message = { id: `op-${list.length + 1}`, at: new Date().toISOString(), mime_type: "audio/webm", audio_base64: "AAAA" };
       list.push(message);
       this.operatorMessages.set(owner.id, list);
-      this.addTurn(owner.id, "operator", "Mesaj vocal — transcriere indisponibilă.");
+      this.addTurn(owner.id, "operator", "Mesaj vocal al dispecerului.");
       this.publish("operator.message", { message_id: message.id }, owner.id);
       return route.fulfill({ json: { id: message.id, at: message.at } });
     }

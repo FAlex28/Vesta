@@ -54,6 +54,7 @@ test.describe("trusted contact", () => {
     backend.sessions[0].state = "CANCELLED";
     await expect(page.getByTestId("contact-state")).toContainText("Nicio alertă activă", { timeout: 8000 });
     await expect(page.getByTestId("contact-coordinates")).toHaveCount(0);
+    await expect(page.getByTestId("contact-safe-notice")).toContainText("Ana este în siguranță");
   });
 
   test("an alert without a location is still shown", async ({ page }) => {

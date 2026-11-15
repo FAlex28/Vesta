@@ -5,7 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from app.assistant import AssistantService, ElevenLabsSpeech, GeminiUnderstanding
+from app.assistant import AssistantService, ElevenLabsSpeech, GeminiUnderstanding, GroqUnderstanding
 from app.config import Settings
 from app.hardware import (
     GpioZeroJoystickMonitor,
@@ -62,6 +62,8 @@ class AppServices:
     device_fix: dict[str, Any] | None = None
     # Sessions whose call the dispatcher took over (the assistant in the earbuds stops).
     takeovers: dict[str, Any] = field(default_factory=dict)
+    # Live calls (dispatcher <-> her phone): session_id -> {"id", "offer", "answer"}.
+    calls: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def build_services(
@@ -135,7 +137,14 @@ def build_services(
     assistant = AssistantService(
         broker,
         understanding=(
-            GeminiUnderstanding(settings.gemini_api_key, settings.gemini_model, timeout_seconds=timeout)
+            GroqUnderstanding(
+                settings.groq_api_key,
+                stt_model=settings.groq_stt_model,
+                llm_model=settings.groq_llm_model,
+                timeout_seconds=timeout,
+            )
+            if settings.groq_api_key
+            else GeminiUnderstanding(settings.gemini_api_key, settings.gemini_model, timeout_seconds=timeout)
             if settings.gemini_api_key
             else None
         ),
@@ -157,6 +166,8 @@ def build_services(
     else:
         database = None
     recordings = RecordingStore(database, max_bytes=settings.max_recording_bytes)
+    if persistence is not None:
+        recordings.mirror = persistence  # Tiger Data keeps every recording, transcript and message
 
     def keep_turn(session_id: str, turn) -> None:
         # Every line of the conversation goes to the local database (and to Tiger Data if used).

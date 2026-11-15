@@ -1,13 +1,14 @@
-import { Eye, EyeOff } from "lucide-react";
+import { Eye, EyeOff, ShieldCheck } from "lucide-react";
 import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
 import { configuredDeviceId } from "./api/config";
-import { isUnfinished } from "./api/contract";
+import { isUnfinished, USER_RESOLUTION_ACTION } from "./api/contract";
 import { AlertList } from "./components/AlertList";
 import { BrandLockup } from "./components/BrandLockup";
 import { EventLog } from "./components/EventLog";
 import { CameraFeeds } from "./components/CameraFeeds";
 import { LinkBadge } from "./components/LinkBadge";
 import { LiveCall } from "./components/LiveCall";
+import { LocationHistoryPanel, useLocationHistory } from "./components/LocationHistory";
 import { RecordingsArchive } from "./components/RecordingsArchive";
 import { SectionHead } from "./components/SectionHead";
 import { StateLadder } from "./components/StateLadder";
@@ -120,11 +121,21 @@ function App() {
   const tone = known ? copy.tone : "neutral";
   const stale = known && link.state !== "CONNECTED";
   const alerts = sortedAlerts(state);
+  // She closed the alert herself from her phone: the dispatcher reads it at once.
+  const closedBySelf =
+    session?.state === "CANCELLED"
+      ? session.alert?.resolution_action === USER_RESOLUTION_ACTION
+        ? session.alert.resolved_at ?? session.updated_at
+        : alerts.find((item) => item.sessionId === session.id && item.resolutionAction === USER_RESOLUTION_ACTION)?.resolvedAt ?? null
+      : null;
   const activeAlerts = alerts.filter((alert) => alert.status === "ALERT").length;
   const duration = sessionDuration(session, now);
   const lastConfirmed = session ? session.last_confirmation_at ?? state.lastConfirmedAt[session.id] : undefined;
   const notice = session ? state.alertNotices[session.id] : undefined;
   const realLocation = session && session.state === "ALERT" ? state.alertLocations[session.id] : undefined;
+  // The route: for a session that became an alert (never a false alarm), live while it lasts.
+  const routeSession = session?.alert && session.cancellation_reason !== "FALSE_ALARM" ? session.id : null;
+  const route = useLocationHistory(routeSession, live.dashboardKey, session?.state === "ALERT", realLocation?.captured_at ?? session?.state);
   const showReal = Boolean(realLocation) && !presentation;
   const otherIssues = issuesOfKind(session, "other");
   const phone = phoneSignal(session, now);
@@ -287,6 +298,15 @@ function App() {
         )}
         <CameraFeeds dashboardKey={live.dashboardKey} />
 
+        {closedBySelf && (
+          <p className="notice safe-notice" role="status" data-testid="safe-notice">
+            <ShieldCheck size={20} aria-hidden="true" />
+            <span>
+              <strong>Persoana este în siguranță.</strong> A închis singură alerta de pe telefon la{" "}
+              <span className="num">{formatClock(closedBySelf)}</span>.
+            </span>
+          </p>
+        )}
         {session?.cancellation_reason === "FALSE_ALARM" && (
           <p className="notice false-alarm-notice" role="status" data-testid="false-alarm-notice">
             <strong>Alarmă falsă</strong> la {formatClock(session.updated_at)}. Înregistrarea și locația au fost șterse.
@@ -346,7 +366,13 @@ function App() {
                 </p>
                 <Suspense fallback={<div className="map-loading">Se încarcă harta…</div>}>
                   {showReal && realLocation ? (
-                    <CityMap point={[realLocation.latitude, realLocation.longitude]} state="ALERT" kind="device" accuracy={realLocation.accuracy_meters} />
+                    <CityMap
+                      point={[realLocation.latitude, realLocation.longitude]}
+                      state="ALERT"
+                      kind="device"
+                      accuracy={realLocation.accuracy_meters}
+                      trail={route?.map((p) => [p.latitude, p.longitude] as [number, number])}
+                    />
                   ) : (
                     <CityMap point={TIMISOARA_TEST_POINT} state={null} kind="area" />
                   )}
@@ -394,6 +420,7 @@ function App() {
                 </p>
               )}
             </section>
+            {route && <LocationHistoryPanel points={route} live={session?.state === "ALERT"} presentation={presentation} />}
           </div>
         </div>
 

@@ -75,10 +75,10 @@ if (Test-Path $cameraKeyFile) {
 # Hackathon: telefonul și persoana de încredere deschid paginile fără cod de asociere.
 $env:VESTA_OPEN_ACCESS = "true"
 # Fluxul vocal: la apăsarea de 5 s Vesta întreabă imediat dacă a fost o greșeală; fără răspuns
-# întreabă încă o dată, apoi anunță dispeceratul (~55 s în total).
+# întreabă din nou la 15 s, iar după ~30 s fără răspuns sesiunea trece în alertă (roșu).
 $env:VESTA_FIRST_CHECKIN_DELAY_SECONDS = "2"
-$env:VESTA_CHECKIN_RESPONSE_TIMEOUT_SECONDS = "25"
-$env:VESTA_CHECKIN_RETRY_DELAY_SECONDS = "3"
+$env:VESTA_CHECKIN_RESPONSE_TIMEOUT_SECONDS = "14"
+$env:VESTA_CHECKIN_RETRY_DELAY_SECONDS = "2"
 $env:VESTA_CHECKIN_INTERVAL_SECONDS = "120"
 
 # Cheile Gemini și ElevenLabs: în .state\ai-keys.env (nu ajunge în git). La prima rulare se
@@ -99,13 +99,20 @@ if (-not (Test-Path $aiKeysFile)) {
     Start-Process notepad.exe $aiKeysFile
 }
 foreach ($line in [System.IO.File]::ReadAllLines($aiKeysFile)) {
-    if ($line -match '^\s*(GEMINI_API_KEY|GEMINI_MODEL|ELEVENLABS_API_KEY|ELEVENLABS_VOICE_ID|ELEVENLABS_TTS_MODEL)\s*=\s*(\S+)\s*$') {
+    if ($line -match '^\s*(GROQ_API_KEY|GROQ_STT_MODEL|GROQ_LLM_MODEL|GEMINI_API_KEY|GEMINI_MODEL|ELEVENLABS_API_KEY|ELEVENLABS_VOICE_ID|ELEVENLABS_TTS_MODEL|TIMESCALE_SERVICE_URL)\s*=\s*(\S+)\s*$') {
         Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
     }
 }
-$gemini = if ($env:GEMINI_API_KEY) { "da" } else { "NU (răspunsuri doar cu butoanele)" }
+$gemini = if ($env:GROQ_API_KEY) { "Groq" } elseif ($env:GEMINI_API_KEY) { "Gemini" } else { "NU (răspunsuri doar cu butoanele)" }
 $eleven = if ($env:ELEVENLABS_API_KEY) { "da" } else { "NU (vocea telefonului)" }
-Write-Host "Asistent: Gemini $gemini · ElevenLabs $eleven"
+Write-Host "Asistent: înțelegere $gemini · voce ElevenLabs $eleven"
+# Tiger Data: cu adresa în ai-keys.env, istoricul, transcrierile și înregistrările merg și în Tiger.
+if ($env:TIMESCALE_SERVICE_URL) {
+    $env:VESTA_PERSISTENCE = "tiger"
+    Write-Host "Baza de date: Tiger Data"
+} else {
+    Write-Host "Baza de date: locală (adaugă TIMESCALE_SERVICE_URL în .state\ai-keys.env pentru Tiger Data)"
+}
 
 # Telefonul deschide pagina prin HTTPS pe IP-ul laptopului (frontend\start-lan.ps1): originile
 # acelea trebuie permise pentru WebSocket.

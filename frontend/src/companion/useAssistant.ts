@@ -3,6 +3,7 @@ import { api, ApiError, newEventId } from "../api/client";
 import { isUnfinished, type AssistantLine, type AssistantSpeech, type SessionView } from "../api/contract";
 import { AudioEngine } from "./audioEngine";
 import type { Credential } from "./useCompanionSession";
+import { usePhoneCall } from "./usePhoneCall";
 
 /*
  * Vesta in the earbuds.
@@ -60,10 +61,13 @@ export function useAssistant({ credential, session, applySession, reportDelivery
   const announcedAlert = useRef(new Set<string>());
   const spokenCheckins = useRef(new Set<string>());
   const saidFalseAlarm = useRef(new Set<string>());
+  const saidOperator = useRef(new Set<string>());
   const lastActivity = useRef(Date.now());
   const busy = useRef(false); // speaking or waiting for the assistant's answer
   const loopListening = useRef(false);
+  const loopRun = useRef(0);
   const [soundBlocked, setSoundBlocked] = useState(false);
+  const [micStalled, setMicStalled] = useState(false);
   const armed = phase !== "off" && phase !== "arming";
 
   const addLine = useCallback((role: ChatLine["role"], text: string) => {
@@ -115,7 +119,18 @@ export function useAssistant({ credential, session, applySession, reportDelivery
     [arm],
   );
 
-  useEffect(() => () => void engine.current.disarm(), []);
+  // Only a real unmount (leaving the page) releases the microphone, not React's dev re-mount.
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    const audio = engine.current;
+    return () => {
+      mounted.current = false;
+      window.setTimeout(() => {
+        if (!mounted.current) void audio.disarm();
+      }, 0);
+    };
+  }, []);
 
   // No touch needed after the first time: once the browser remembers the microphone permission,
   // the phone prepares Vesta on its own (on load, and again when a session starts).
@@ -137,7 +152,10 @@ export function useAssistant({ credential, session, applySession, reportDelivery
     const unlock = () => void engine.current.unlock().then(() => setSoundBlocked(armed && !engine.current.canPlay));
     window.addEventListener("pointerdown", unlock);
     window.addEventListener("keydown", unlock);
-    const timer = window.setInterval(() => setSoundBlocked(armed && !engine.current.canPlay), 1000);
+    const timer = window.setInterval(() => {
+      setSoundBlocked(armed && !engine.current.canPlay);
+      setMicStalled(armed && !engine.current.micAlive);
+    }, 1000);
     return () => {
       window.removeEventListener("pointerdown", unlock);
       window.removeEventListener("keydown", unlock);
@@ -234,46 +252,64 @@ export function useAssistant({ credential, session, applySession, reportDelivery
   const latestSession = useRef(session);
   latestSession.current = session;
 
+  // What Vesta says on her own: the server's question, the alert, the dispatcher taking over.
+  // Played between her phrases; it never interrupts the listening below.
   useEffect(() => {
     if (!credential || !sessionId || !state) return;
+    // The dispatcher took the call: Vesta says so once, then stays quiet.
+    if (takenOver) {
+      if (!saidOperator.current.has(sessionId)) {
+        saidOperator.current.add(sessionId);
+        void prompt("operator", `operator-${sessionId}`);
+      }
+      return;
+    }
+    // The server's question: spoken once per check-in, then reported as delivered.
+    if (checkinKey && !spokenCheckins.current.has(checkinKey)) {
+      if (engine.current.armed) {
+        spokenCheckins.current.add(checkinKey);
+        try {
+          navigator.vibrate?.([200, 100, 200]);
+        } catch {
+          // optional
+        }
+        // Delivered as soon as the question starts playing: its length must not eat the answer time.
+        void prompt("checkin", `prompt-${checkinKey}`, () => {
+          if (checkinRequested) void reportDelivery(checkinKey, "voice");
+        });
+      } else if (checkinRequested && document.visibilityState === "visible") {
+        // Earbuds not prepared: the question on the open screen is what reached her.
+        void reportDelivery(checkinKey, "android");
+      }
+    } else if (state === "ALERT" && !announcedAlert.current.has(sessionId)) {
+      announcedAlert.current.add(sessionId);
+      void prompt("alert", `alert-${sessionId}`);
+    }
+  }, [armed, takenOver, credential, sessionId, state, checkinKey, checkinRequested, prompt, reportDelivery]);
+
+  // Listening: one loop for the whole session. A change of state on the server (question,
+  // no answer, alert) must not cut off the phrase she is saying, so it is not restarted for it.
+  useEffect(() => {
+    if (!armed || !credential || !sessionId || !listening || takenOver) return;
     const controller = new AbortController();
     const { signal } = controller;
+    loopRun.current += 1;
+    const mine = loopRun.current;
+    const newest = () => loopRun.current === mine;
+    const pause = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
     const run = async () => {
-      // The dispatcher took the call: Vesta says so once, then stays quiet.
-      if (takenOver) {
-        await prompt("operator", `operator-${sessionId}`);
-        return;
-      }
-      // The server's question: spoken once per check-in, then reported as delivered.
-      if (checkinKey && !spokenCheckins.current.has(checkinKey)) {
-        if (engine.current.armed) {
-          spokenCheckins.current.add(checkinKey);
-          try {
-            navigator.vibrate?.([200, 100, 200]);
-          } catch {
-            // optional
-          }
-          // Delivered as soon as the question starts playing: its length must not eat the answer time.
-          await prompt("checkin", `prompt-${checkinKey}`, () => {
-            if (checkinRequested) void reportDelivery(checkinKey, "voice");
-          });
-        } else if (checkinRequested && document.visibilityState === "visible") {
-          // Earbuds not prepared: the question on the open screen is what reached her.
-          void reportDelivery(checkinKey, "android");
-        }
-      } else if (state === "ALERT" && !announcedAlert.current.has(sessionId)) {
-        announcedAlert.current.add(sessionId);
-        await prompt("alert", `alert-${sessionId}`);
-      }
-      if (!engine.current.armed || !listening) return;
-
       loopListening.current = true;
       while (!signal.aborted) {
-        setPhase("listening");
+        if (!busy.current) setPhase("listening");
+        await engine.current.unlock();
+        const startedAt = Date.now();
         const phrase = await engine.current.listen({ startTimeoutMs: 6000, signal });
         if (signal.aborted) break;
-        if (!phrase || phrase.durationMs < 350) continue;
+        if (!phrase || phrase.durationMs < 350) {
+          if (Date.now() - startedAt < 300) await pause(500); // microphone not ready: do not spin
+          continue;
+        }
         lastActivity.current = Date.now();
         busy.current = true;
         setPhase("thinking");
@@ -287,18 +323,20 @@ export function useAssistant({ credential, session, applySession, reportDelivery
           const current = reply.session.state;
           if (!isUnfinished(current) || !LISTEN_STATES.has(current)) break;
         } catch {
-          setPhase(engine.current.armed ? "ready" : "off");
+          if (newest()) setPhase(engine.current.armed ? "ready" : "off");
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         } finally {
           busy.current = false;
         }
       }
+      // An older run that just stopped must not switch off the listening of the new one.
+      if (!newest()) return;
       loopListening.current = false;
       if (engine.current.armed) setPhase((current) => (current === "listening" || current === "thinking" ? "ready" : current));
     };
     void run();
     return () => controller.abort();
-  }, [armed, takenOver, credential, sessionId, state, checkinKey, checkinRequested, listening, prompt, say, addLine, applySession, reportDelivery]);
+  }, [armed, takenOver, credential, sessionId, listening, say, addLine, applySession]);
 
   // Every 15 s of silence (in ACTIVE or ALERT) Vesta asks something: is she fine, where is she,
   // what helps the police. The official check-ins of the server keep their own timing.
@@ -310,7 +348,7 @@ export function useAssistant({ credential, session, applySession, reportDelivery
     let asking = false;
     const timer = window.setInterval(() => {
       const current = latestState.current;
-      if (asking || busy.current || takenOverRef.current || !current || !NUDGE_STATES.has(current)) return;
+      if (asking || busy.current || engine.current.hearing || takenOverRef.current || !current || !NUDGE_STATES.has(current)) return;
       if (Date.now() - lastActivity.current < NUDGE_AFTER_MS) return;
       asking = true;
       lastActivity.current = Date.now();
@@ -364,6 +402,10 @@ export function useAssistant({ credential, session, applySession, reportDelivery
     };
   }, [takenOver, credential, sessionId, addLine]);
 
+  // The dispatcher calls: answered by itself, they talk live.
+  const ensureMic = useCallback(async () => engine.current.armed || (await arm()), [arm]);
+  const call = usePhoneCall({ engine, credential, active: unfinished, ensureMic });
+
   // A false alarm stopped by the on-screen button is confirmed in the earbuds too.
   const cancelledFalseAlarm = session?.state === "CANCELLED" && session.cancellation_reason === "FALSE_ALARM";
   useEffect(() => {
@@ -377,5 +419,20 @@ export function useAssistant({ credential, session, applySession, reportDelivery
     if (sessionId) setLines([]);
   }, [sessionId]);
 
-  return { phase, armed, arm, disarm, armError, lines, recording, soundBlocked, loud, setLoud, takenOver, level: () => engine.current.level } as const;
+  return {
+    phase,
+    armed,
+    arm,
+    disarm,
+    armError,
+    lines,
+    recording,
+    soundBlocked,
+    micStalled,
+    loud,
+    setLoud,
+    takenOver,
+    call,
+    level: () => engine.current.level,
+  } as const;
 }

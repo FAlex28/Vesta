@@ -54,6 +54,9 @@ from app.schemas import (
     AssistantReplyRequest,
     AssistantReplyResponse,
     AssistantSpeechView,
+    CallAnswerRequest,
+    CallOfferRequest,
+    CallView,
     CancelRequest,
     CheckInDeliveryRequest,
     CheckInRequest,
@@ -75,6 +78,8 @@ from app.schemas import (
     DevicePairRequest,
     EmergencyContactView,
     HeartbeatRequest,
+    LocationHistoryResponse,
+    LocationPointView,
     LocationUpdateRequest,
     LocationUpdateResponse,
     LocationView,
@@ -412,6 +417,15 @@ async def _record_location(
         raise ConflictError("LOCATION_TIMESTAMP_INVALID", str(exc)) from exc
     location = result.location
     if result.accepted_as_latest and not result.duplicate:
+        if services.recordings is not None:
+            services.recordings.add_location(
+                session_id,
+                latitude=location.latitude,
+                longitude=location.longitude,
+                captured_at=location.captured_at,
+                accuracy_meters=location.accuracy_meters,
+                source=source,
+            )
         if services.persistence is not None:
             services.persistence.record_location(
                 session_id=session_id,
@@ -1562,8 +1576,11 @@ async def upload_recording_chunk(
     return RecordingChunkResponse(chunks=info.chunks, size_bytes=info.size_bytes)
 
 
-async def _shared_with_dispatcher(services: AppServices, session_id: str) -> None:
-    """Share live sessions and real alerts with the authenticated dispatcher, never false alarms."""
+async def _shared_with_dispatcher(services: AppServices, session_id: str, *, live: bool = True) -> None:
+    """Share live sessions and real alerts with the authenticated dispatcher, never false alarms.
+
+    `live=False`: only sessions that became an alert (the location route is private before that).
+    """
 
     alert = services.alerts.get_for_session(session_id)
     if alert is not None:
@@ -1574,7 +1591,7 @@ async def _shared_with_dispatcher(services: AppServices, session_id: str) -> Non
         session = await services.sessions.get(session_id)
     except NotFoundError:
         session = None
-    if session and session.state in {
+    if live and session and session.state in {
         SessionState.ACTIVE,
         SessionState.CHECK_IN,
         SessionState.UNCONFIRMED,
@@ -1582,8 +1599,18 @@ async def _shared_with_dispatcher(services: AppServices, session_id: str) -> Non
     }:
         return
     stored = services.recordings.record(session_id) if services.recordings else None
-    if stored is None or stored.alert_id is None or stored.resolution == CancellationReason.FALSE_ALARM.value:
-        raise NotFoundError("Nothing shared for this session")
+    if stored is not None and stored.alert_id is not None:
+        if stored.resolution == CancellationReason.FALSE_ALARM.value:
+            raise NotFoundError("Nothing shared for this session")
+        return
+    if services.persistence is not None:
+        try:
+            meta = await services.persistence.recording_meta_read(session_id)
+        except Exception:
+            meta = None
+        if meta and meta.get("alert_id") and meta.get("resolution") != CancellationReason.FALSE_ALARM.value:
+            return
+    raise NotFoundError("Nothing shared for this session")
 
 
 @router.get(
@@ -1602,13 +1629,29 @@ async def session_conversation(
     await _shared_with_dispatcher(services, session_id)
     info = services.recordings.info(session_id) if services.recordings else None
     turns = services.recordings.turns(session_id) if services.recordings else []
+    views = [
+        ConversationTurnView(id=t.id, role=t.role, text=t.text, at=t.at, action=t.action) for t in turns
+    ]
+    if not views and services.persistence is not None:
+        try:
+            rows = await services.persistence.conversation_turns(session_id)
+        except Exception:
+            rows = []
+        views = [
+            ConversationTurnView(
+                id=str(row["turn_id"]),
+                role=str(row["role"]).lower(),
+                text=row["text"],
+                at=row["occurred_at"],
+                action=row.get("action"),
+            )
+            for row in rows
+            if str(row["role"]).lower() in {"person", "assistant", "operator"}
+        ]
     response.headers["Cache-Control"] = "no-store"
     return ConversationResponse(
         session_id=session_id,
-        turns=[
-            ConversationTurnView(id=t.id, role=t.role, text=t.text, at=t.at, action=t.action)
-            for t in turns
-        ],
+        turns=views,
         recording=(
             RecordingView(
                 mime_type=info.mime_type,
@@ -1637,6 +1680,13 @@ async def session_recording(
     await _shared_with_dispatcher(services, session_id)
     assert services.recordings is not None
     info = services.recordings.info(session_id)
+    if info is None and services.persistence is not None:
+        try:
+            audio = await services.persistence.recording_audio(session_id)
+        except Exception:
+            audio = b""
+        if audio:
+            return Response(content=audio, media_type="audio/webm", headers={"Cache-Control": "no-store"})
     if info is None:
         raise NotFoundError("No recording for this session yet")
 
@@ -1685,10 +1735,40 @@ async def recordings_archive(
     assert services.recordings is not None
     response.headers["Cache-Control"] = "no-store"
     items = []
+    seen: set[str] = set()
     for info in services.recordings.archive():
         view = _archived(info)
         view.turns = len(services.recordings.turns(info.session_id))
         items.append(view)
+        seen.add(info.session_id)
+    if services.persistence is not None:
+        try:
+            rows = await services.persistence.recordings_archive()
+        except Exception:
+            rows = []
+        for row in rows:
+            sid = str(row["session_id"])
+            if sid in seen:
+                continue
+            items.append(
+                ArchivedRecordingView(
+                    session_id=sid,
+                    device_id=row.get("device_id"),
+                    started_at=row["started_at"],
+                    updated_at=row["updated_at"],
+                    size_bytes=row["size_bytes"],
+                    chunks=row["chunks"],
+                    finalized=bool(row["finalized"]),
+                    alert_id=row.get("alert_id"),
+                    alert_reason=row.get("alert_reason"),
+                    alert_at=row.get("alert_at"),
+                    resolution=row.get("resolution"),
+                    resolved_at=row.get("resolved_at"),
+                    operator_at=row.get("operator_at"),
+                    turns=0,
+                )
+            )
+        items.sort(key=lambda item: item.alert_at or item.started_at, reverse=True)
     return items
 
 
@@ -1753,6 +1833,18 @@ async def send_operator_message(
     await services.broker.publish(
         "operator.message", session_id=session_id, data={"message_id": message.id}
     )
+    text = None
+    if services.assistant is not None:
+        text = await services.assistant.transcribe(body, mime)
+    turn_text = text or "Mesaj vocal al dispecerului."
+    if text:
+        services.recordings.set_turn_text(message.id, text)
+    if services.persistence is not None:
+        from app.assistant import ConversationTurn
+
+        services.persistence.record_conversation_turn(
+            session_id, ConversationTurn(id=message.id, role="operator", text=turn_text, at=message.at)
+        )
     await services.broker.publish(
         "conversation.updated", session_id=session_id, data={"turn_id": message.id, "role": "operator"}
     )
@@ -1786,6 +1878,150 @@ async def receive_operator_messages(
         )
         for item in services.recordings.operator_messages(session_id, after=after)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Live call: the dispatcher talks with her directly (WebRTC). The server only passes the
+# offer/answer between the dashboard and her phone; audio goes peer to peer on the network.
+# ---------------------------------------------------------------------------
+
+
+async def _take_over(services: AppServices, session_id: str) -> None:
+    if session_id in services.takeovers:
+        return
+    at = services.takeovers[session_id] = datetime.now(UTC)
+    if services.recordings is not None:
+        await services.recordings.annotate(session_id, operator_at=at)
+    await services.broker.publish(
+        "call.taken_over", session_id=session_id, data={"operator_connected_at": at.isoformat()}
+    )
+
+
+@router.get(
+    "/api/v1/sessions/{session_id}/locations", response_model=LocationHistoryResponse, tags=["dispatcher"]
+)
+async def location_history(
+    session_id: str,
+    request: Request,
+    response: Response,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> LocationHistoryResponse:
+    """Dispatcher: where she has been, for an alert (kept with the recording, never for a false alarm)."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    await _shared_with_dispatcher(services, session_id, live=False)
+    points = [
+        LocationPointView(
+            latitude=p.latitude,
+            longitude=p.longitude,
+            captured_at=p.captured_at,
+            accuracy_meters=p.accuracy_meters,
+            source=p.source,
+        )
+        for p in (services.recordings.locations(session_id) if services.recordings else [])
+    ]
+    if not points and services.persistence is not None:
+        try:
+            rows = await services.persistence.location_history(session_id)
+        except Exception:
+            rows = []
+        points = [
+            LocationPointView(
+                latitude=row["lat"],
+                longitude=row["lon"],
+                captured_at=row["occurred_at"],
+                accuracy_meters=row.get("accuracy_m"),
+                source="device_gps" if str(row.get("source", "")).upper().startswith("DEVICE") else "android",
+            )
+            for row in rows
+        ]
+    response.headers["Cache-Control"] = "no-store"
+    return LocationHistoryResponse(session_id=session_id, points=points)
+
+
+@router.post("/api/v1/sessions/{session_id}/call/offer", response_model=CallView, tags=["call"])
+async def call_offer(
+    session_id: str,
+    payload: CallOfferRequest,
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> CallView:
+    """The dispatcher calls her: the assistant stops, her phone answers by itself."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    session = await services.sessions.get(session_id)
+    if session.state is SessionState.CANCELLED:
+        raise ConflictError("SESSION_CANCELLED", "The session has ended")
+    await _take_over(services, session_id)
+    call = services.calls[session_id] = {"id": str(uuid4()), "offer": payload.sdp, "answer": None}
+    await services.broker.publish("call.offer", session_id=session_id, data={"call_id": call["id"]})
+    return CallView(call_id=call["id"], offer=None, answer=None)
+
+
+@router.get("/api/v1/sessions/{session_id}/call", response_model=CallView, tags=["call"])
+async def call_for_phone(
+    session_id: str,
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+) -> CallView:
+    """Her phone asks whether the dispatcher is calling."""
+
+    services = _services(request)
+    await services.sessions.authorize(session_id, _bearer(authorization))
+    response.headers["Cache-Control"] = "no-store"
+    call = services.calls.get(session_id)
+    if call is None:
+        return CallView(call_id=None)
+    return CallView(call_id=call["id"], offer=call["offer"] if call["answer"] is None else None)
+
+
+@router.post("/api/v1/sessions/{session_id}/call/answer", response_model=CallView, tags=["call"])
+async def call_answer(
+    session_id: str,
+    payload: CallAnswerRequest,
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> CallView:
+    services = _services(request)
+    await services.sessions.authorize(session_id, _bearer(authorization))
+    call = services.calls.get(session_id)
+    if call is None or call["id"] != payload.call_id:
+        raise ConflictError("CALL_ENDED", "This call is no longer open")
+    call["answer"] = payload.sdp
+    await services.broker.publish("call.answered", session_id=session_id, data={"call_id": call["id"]})
+    return CallView(call_id=call["id"])
+
+
+@router.get("/api/v1/sessions/{session_id}/call/answer", response_model=CallView, tags=["call"])
+async def call_answer_for_dispatcher(
+    session_id: str,
+    request: Request,
+    response: Response,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> CallView:
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    response.headers["Cache-Control"] = "no-store"
+    call = services.calls.get(session_id)
+    if call is None:
+        return CallView(call_id=None)
+    return CallView(call_id=call["id"], answer=call["answer"])
+
+
+@router.post("/api/v1/sessions/{session_id}/call/hangup", response_model=CallView, tags=["call"])
+async def call_hangup(
+    session_id: str,
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> CallView:
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    if services.calls.pop(session_id, None) is not None:
+        await services.broker.publish("call.ended", session_id=session_id, data={})
+    return CallView(call_id=None)
 
 
 async def purge_session_media(services: AppServices, session_id: str) -> None:
@@ -1884,18 +2120,25 @@ async def websocket_events(websocket: WebSocket) -> None:
                     "data": snapshot.model_dump(mode="json"),
                 }
             )
+            every = services.settings.websocket_heartbeat_seconds
+            loop = asyncio.get_running_loop()
+            last_sent = loop.time()
             while True:
                 try:
-                    event = await asyncio.wait_for(
-                        queue.get(),
-                        timeout=services.settings.websocket_heartbeat_seconds,
-                    )
+                    # Events of other sessions are skipped, so the beat follows what this socket
+                    # actually received, not the queue: a phone must not go silent while others talk.
+                    wait = max(0.0, every - (loop.time() - last_sent))
+                    event = await asyncio.wait_for(queue.get(), timeout=wait)
                     if event.sequence <= snapshot_sequence:
                         continue
                     if session_scope is not None and event.session_id != session_scope:
+                        if loop.time() - last_sent >= every:
+                            raise TimeoutError
                         continue
                     await websocket.send_json(event.model_dump(mode="json"))
+                    last_sent = loop.time()
                 except TimeoutError:
+                    last_sent = loop.time()
                     await websocket.send_json(
                         {
                             "event_id": f"heartbeat-{uuid4()}",

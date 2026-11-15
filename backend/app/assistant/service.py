@@ -196,6 +196,119 @@ class GeminiUnderstanding:
         )
 
 
+# Whisper invents these on silence or noise (video-subtitle habits): never her words.
+_HALLUCINATIONS = (
+    "pentru vizionare",
+    "abonați-vă",
+    "abonati-va",
+    "subtitrare",
+    "subtitrarea",
+    "mulțumesc pentru atenție",
+    "thank you for watching",
+)
+
+
+def _clean_transcript(payload: dict) -> str:
+    text = str(payload.get("text") or "").strip()
+    segments = payload.get("segments") or []
+    if segments:
+        speech = [seg for seg in segments if float(seg.get("no_speech_prob", 0.0)) < 0.6]
+        if not speech:
+            return ""
+        text = " ".join(str(seg.get("text", "")).strip() for seg in speech).strip() or text
+    lowered = text.lower()
+    if any(marker in lowered for marker in _HALLUCINATIONS):
+        return ""
+    return text[:1000]
+
+
+class GroqUnderstanding:
+    """Groq: Whisper writes down what she said, then a language model decides (JSON)."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        stt_model: str = "whisper-large-v3",
+        llm_model: str = "openai/gpt-oss-120b",
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        self._api_key = api_key
+        self._stt_model = stt_model
+        self._llm_model = llm_model
+        self._timeout = timeout_seconds
+
+    async def transcribe(self, audio: bytes, mime_type: str) -> str:
+        extension = {"audio/wav": "wav", "audio/webm": "webm", "audio/ogg": "ogg", "audio/mpeg": "mp3"}.get(mime_type, "webm")
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            heard = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                files={"file": (f"phrase.{extension}", audio, mime_type)},
+                data={"model": self._stt_model, "language": "ro", "response_format": "verbose_json", "temperature": "0"},
+            )
+        heard.raise_for_status()
+        return _clean_transcript(heard.json())
+
+    async def decide(
+        self, *, audio: bytes, mime_type: str, history: list[ConversationTurn], context: str
+    ) -> AssistantDecision:
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        extension = {"audio/wav": "wav", "audio/webm": "webm", "audio/ogg": "ogg", "audio/mpeg": "mp3"}.get(mime_type, "wav")
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                heard = await client.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers=headers,
+                    files={"file": (f"phrase.{extension}", audio, mime_type)},
+                    data={"model": self._stt_model, "language": "ro", "response_format": "verbose_json", "temperature": "0"},
+                )
+                if heard.status_code != 200:
+                    LOGGER.warning("Groq STT HTTP %s: %s", heard.status_code, heard.text[:300])
+                    raise AssistantUnavailable(f"Groq transcription answered HTTP {heard.status_code}")
+                transcript = _clean_transcript(heard.json())
+                if not transcript:
+                    return AssistantDecision("", LINES["unclear"], AssistantAction.NONE)
+                messages: list[dict[str, str]] = [
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT
+                        + '\nRăspunde DOAR cu JSON: {"reply": "...", "action": "NONE|FALSE_ALARM|ESCALATE|CONFIRM_SAFE"}.',
+                    }
+                ]
+                for turn in history[-12:]:
+                    messages.append(
+                        {"role": "assistant" if turn.role == "assistant" else "user", "content": turn.text}
+                    )
+                messages.append({"role": "user", "content": f"[{context}]\n{transcript}"})
+                answer = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": self._llm_model,
+                        "messages": messages,
+                        "temperature": 0.2,
+                        "max_tokens": 400,
+                        "response_format": {"type": "json_object"},
+                        "reasoning_effort": "low",
+                    },
+                )
+        except httpx.HTTPError as exc:
+            raise AssistantUnavailable(f"Groq did not answer: {type(exc).__name__}") from None
+        if answer.status_code != 200:
+            LOGGER.warning("Groq LLM HTTP %s: %s", answer.status_code, answer.text[:300])
+            # She was heard: keep her words, the timers decide if nobody understood.
+            return AssistantDecision(transcript, LINES["unclear"], AssistantAction.NONE)
+        try:
+            data = json.loads(answer.json()["choices"][0]["message"]["content"])
+            action = AssistantAction(str(data.get("action", "NONE")).upper())
+            reply = str(data.get("reply") or "").strip()[:500] or LINES["unclear"]
+        except (KeyError, IndexError, ValueError, TypeError):
+            LOGGER.warning("Groq answer could not be parsed: %s", answer.text[:300])
+            return AssistantDecision(transcript, LINES["unclear"], AssistantAction.NONE)
+        return AssistantDecision(transcript=transcript, reply=reply, action=action)
+
+
 class ElevenLabsSpeech:
     """ElevenLabs text-to-speech (mp3). The key stays on the server."""
 
@@ -331,6 +444,18 @@ class AssistantService:
         reply = SpokenReply(text=text, audio=audio, mime_type=mime, turn=turn)
         self._cache(cache_key, reply)
         return reply
+
+    async def transcribe(self, audio: bytes, mime_type: str) -> str | None:
+        """Plain transcription (the dispatcher's phrases), when the provider can do it."""
+
+        helper = getattr(self.understanding, "transcribe", None)
+        if helper is None:
+            return None
+        try:
+            return await helper(audio, mime_type) or None
+        except Exception:
+            LOGGER.warning("transcription failed", exc_info=True)
+            return None
 
     # -- what she says --------------------------------------------------------------------
 

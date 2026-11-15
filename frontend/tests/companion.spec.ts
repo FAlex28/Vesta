@@ -233,4 +233,38 @@ test.describe("companion", () => {
     await page.waitForTimeout(16_000);
     expect(backend.calls(/\/assistant\/prompt$/).filter((call) => call.body?.line === "nudge")).toHaveLength(0);
   });
+
+  test("after the danger passes, she closes the alert from her phone; it closes at the dispatcher too", async ({ page }) => {
+    await installDeviceFakes(page);
+    const backend = new MockBackend(page);
+    const now = new Date().toISOString();
+    backend.sessions = [
+      makeSession({
+        state: "ALERT",
+        alert_reason: "SOS_EXPLICIT",
+        alert: { id: "alert-safe", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 },
+      }),
+    ];
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: /Sunt bine/ })).toHaveCount(0);
+    await page.getByTestId("safe").click();
+    await page.getByTestId("safe-confirm").click();
+    await expect(page.getByText(/Alerta s-a închis la/)).toBeVisible();
+    const resolve = backend.calls(/\/alerts\/alert-safe\/resolve$/);
+    expect(resolve).toHaveLength(1);
+    expect(resolve[0].body).toMatchObject({ action: "USER_CONFIRMED_SAFE" });
+    expect(backend.session(SESSION_ID)?.alert).toMatchObject({ status: "RESOLVED" });
+  });
+
+  test("while Vesta waits for an answer, only the red emergency button is offered", async ({ page }) => {
+    await installDeviceFakes(page);
+    const backend = new MockBackend(page);
+    backend.sessions = [checkIn()];
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByTestId("sos")).toBeEnabled();
+    await expect(page.getByRole("button", { name: /Sunt bine/ })).toHaveCount(0);
+    await expect(page.getByTestId("safe")).toHaveCount(0);
+  });
 });

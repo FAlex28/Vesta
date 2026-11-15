@@ -777,6 +777,19 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
   background: var(--device-tint);
 }
 .arm-phase { display: flex; align-items: center; gap: 8px; margin: 2px 0 0; color: var(--ink-2); font-size: var(--t-small); }
+.call-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 14px 16px;
+  color: var(--ink);
+  font-weight: 700;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.call-banner--live { color: var(--safe); background: var(--safe-tint); border-color: color-mix(in srgb, var(--safe) 45%, transparent); }
 .listen-dot, .rec-dot {
   display: inline-block;
   width: 9px;
@@ -810,6 +823,17 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
 .stop-block { display: grid; gap: 10px; margin-top: 6px; }
 .btn--false-alarm { display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
 .false-alarm-notice { border-left: 3px solid var(--muted); }
+.safe-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--ink);
+  background: var(--safe-tint);
+  border-color: color-mix(in srgb, var(--safe) 45%, transparent);
+  border-left: 3px solid var(--safe);
+}
+.safe-notice > svg { flex: none; margin-top: 2px; color: var(--safe); }
+.safe-notice strong { color: var(--safe); }
 
 /* --- Dispatcher: emergency call --------------------------------------------------------- */
 .btn--danger { display: inline-flex; align-items: center; gap: 8px; color: #fff; background: var(--danger-solid); border-color: var(--danger); }
@@ -932,7 +956,22 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
 }
 .sound-unlock { width: 100%; text-align: left; cursor: pointer; font: inherit; }
 
-/* --- Dispatcher: push to talk, recordings ----------------------------------------------- */
+/* --- Dispatcher: live call, push to talk, recordings ------------------------------------- */
+.call-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 0;
+  padding: 10px 14px;
+  color: var(--ink-2);
+  font-weight: 600;
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius);
+}
+.call-line--live { color: var(--safe); background: var(--safe-tint); border-color: color-mix(in srgb, var(--safe) 40%, transparent); }
+.call-line--live .live-dot { background: var(--safe); }
+.call-line--failed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 .ptt { display: grid; gap: 8px; margin-top: 16px; }
 .ptt-button {
   display: inline-flex;
@@ -971,6 +1010,35 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
 .rec-title, .rec-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0; }
 .rec-meta { color: var(--muted); font-size: var(--t-small); }
 .rec-audio { width: 100%; margin-top: 6px; color-scheme: dark; }
+.rec-route { margin-top: 8px; }
+
+/* --- Location history (route of an alert) --------------------------------------------- */
+.route-summary { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; color: var(--ink-2); }
+.route-summary > svg { flex: none; color: var(--muted); }
+.trail { display: grid; gap: 0; margin: 0 0 8px; padding: 0; list-style: none; }
+.trail-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  padding: 8px 0 8px 14px;
+  border-left: 2px solid var(--rule);
+  position: relative;
+}
+.trail-row::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: 13px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  border: 1px solid var(--muted);
+}
+.trail-row--latest::before { background: var(--danger); border-color: var(--danger); }
+.trail-row time { color: var(--ink); font-weight: 600; }
+.trail-coords { color: var(--ink-2); overflow-wrap: anywhere; }
+.trail-meta { grid-column: 2; color: var(--muted); font-size: var(--t-small); }
 .rec-transcript { display: grid; gap: 6px; margin-top: 6px; color: var(--ink-2); }
 .rec-transcript p { margin: 0; }
 .loud-toggle { display: flex; align-items: center; gap: 8px; color: var(--ink-2); }

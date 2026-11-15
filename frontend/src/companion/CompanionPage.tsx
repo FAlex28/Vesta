@@ -1,4 +1,4 @@
-import { Headphones, MapPin, Mic, ShieldOff, Siren, Wifi } from "lucide-react";
+import { Headphones, MapPin, Mic, PhoneCall, ShieldCheck, ShieldOff, Siren, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { GPS_STALE_AFTER_MS } from "../api/config";
 import { api, newEventId } from "../api/client";
@@ -24,10 +24,13 @@ const phaseCopy: Record<AssistantPhase, string> = {
   thinking: "Vesta se gândește…",
 };
 
-function companionLink(link: LiveLink, paired: boolean, heartbeatFailures: number): LiveLink {
-  if (!paired) return link;
-  if (heartbeatFailures >= 3) return { ...link, state: "DISCONNECTED" };
-  if (heartbeatFailures >= 1 && link.state === "CONNECTED") return { ...link, state: "RECONNECTING" };
+/** The server answered an HTTP call this recently: the phone is connected even without the socket. */
+const HTTP_FRESH_MS = 25_000;
+
+function companionLink(link: LiveLink, paired: boolean, heartbeatFailures: number, lastHttpOk: number | null, now: number): LiveLink {
+  if (paired && heartbeatFailures >= 3) return { ...link, state: "DISCONNECTED" };
+  if (paired && heartbeatFailures >= 2 && link.state === "CONNECTED") return { ...link, state: "RECONNECTING" };
+  if (link.state !== "CONNECTED" && lastHttpOk !== null && now - lastHttpOk < HTTP_FRESH_MS) return { ...link, state: "CONNECTED" };
   return link;
 }
 
@@ -65,6 +68,7 @@ export default function CompanionPage() {
     geo.refresh();
   });
   const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmSafe, setConfirmSafe] = useState(false);
   const chatEnd = useRef<HTMLDivElement | null>(null);
 
   const paired = companion.credential !== null;
@@ -75,7 +79,9 @@ export default function CompanionPage() {
   const falseAlarm = session?.state === "CANCELLED" && session.cancellation_reason === "FALSE_ALARM";
   const copy = stateCopy[state];
   const duration = sessionDuration(session, now);
-  const link = companionLink(live.link, paired, companion.heartbeat.consecutiveFailures);
+  const [lastSyncOk, setLastSyncOk] = useState<number | null>(null);
+  const lastHttpOk = Math.max(companion.heartbeat.lastOkAt ?? 0, access.lastPollOk ?? 0, lastSyncOk ?? 0) || null;
+  const link = companionLink(live.link, paired, companion.heartbeat.consecutiveFailures, lastHttpOk, now);
   const fix = geo.gps.fix;
   const fresh = freshnessOf(fix, now);
   const understanding = live.state.assistant.understanding;
@@ -110,6 +116,28 @@ export default function CompanionPage() {
     };
   }, [companion.credential, unfinished, fix]);
 
+  // --- The session is also read over HTTP every few seconds: nothing is missed if the socket drops.
+  const { applySession } = companion;
+  useEffect(() => {
+    const credential = companion.credential;
+    if (!credential || !unfinished) return;
+    let stopped = false;
+    const sync = () =>
+      api
+        .session(credential.sessionId, credential.token)
+        .then((next) => {
+          if (stopped) return;
+          applySession(next);
+          setLastSyncOk(Date.now());
+        })
+        .catch(() => undefined);
+    const timer = window.setInterval(sync, 4000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [companion.credential, unfinished, applySession]);
+
   // --- Technical signals for the dispatcher ---------------------------------------------------
   const { reportClientStatus } = companion;
   useEffect(() => {
@@ -120,9 +148,21 @@ export default function CompanionPage() {
     if (!paired || !unfinished || !assistant.armed) return;
     void reportClientStatus({ audio_status: "CONNECTED" });
   }, [paired, unfinished, assistant.armed, reportClientStatus]);
+  // The dispatcher's "GPS telefon" card follows what the phone really sends.
+  const gpsStatus =
+    fix?.source === "device" && phoneLocation === "sent"
+      ? fresh === "STALE" ? "GPS_STALE" : "GPS_AVAILABLE"
+      : geo.gps.permission === "denied" ? "GPS_UNAVAILABLE" : null;
+  useEffect(() => {
+    if (!paired || !unfinished || !gpsStatus) return;
+    void reportClientStatus({ gps_status: gpsStatus });
+  }, [paired, unfinished, gpsStatus, reportClientStatus]);
 
   useEffect(() => {
-    if (!unfinished) setConfirmStop(false);
+    if (!unfinished) {
+      setConfirmStop(false);
+      setConfirmSafe(false);
+    }
   }, [unfinished]);
   useEffect(() => {
     chatEnd.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -181,7 +221,7 @@ export default function CompanionPage() {
               <h2 id="arm-head">Vesta în căști</h2>
               <p className="arm-phase" role="status" data-testid="assistant-phase" data-phase={assistant.phase}>
                 {assistant.phase === "listening" && <span className="listen-dot" aria-hidden="true" />}
-                {phaseCopy[assistant.phase]}
+                {assistant.call === "live" ? "Vorbești cu dispecerul" : phaseCopy[assistant.phase]}
               </p>
             </div>
           </div>
@@ -211,7 +251,19 @@ export default function CompanionPage() {
           {!understanding && (
             <p className="c-hint" data-testid="no-understanding">Mesajele nu pot fi transcrise acum.</p>
           )}
+          {assistant.micStalled && unfinished && (
+            <p className="notice notice--warning" role="status" data-testid="mic-stalled">
+              Microfonul nu primește sunet. Atinge ecranul o dată.
+            </p>
+          )}
         </section>
+
+        {assistant.call !== "idle" && (
+          <p className={`call-banner call-banner--${assistant.call}`} role="status" data-testid="phone-call" data-state={assistant.call}>
+            <PhoneCall size={18} aria-hidden="true" />
+            {assistant.call === "live" ? "În apel cu dispecerul. Vorbește normal." : "Dispecerul te sună…"}
+          </p>
+        )}
 
         {/* --- Session ------------------------------------------------------------------- */}
         <section className={`c-state c-hero tone--${known ? (falseAlarm ? "neutral" : copy.tone) : "neutral"}`} aria-labelledby="c-state-head" aria-live="polite">
@@ -303,6 +355,30 @@ export default function CompanionPage() {
               failed="Alerta nu a plecat."
             />
 
+            {state === "ALERT" && (
+              <div className="stop-block">
+                {confirmSafe ? (
+                  <div className="confirm-row" role="group" aria-label="Confirmă că ești în siguranță">
+                    <p>Ești în siguranță acum? Alerta se închide și la dispecerat.</p>
+                    <button
+                      type="button"
+                      className="btn btn--safe"
+                      data-testid="safe-confirm"
+                      onClick={() => void companion.resolveAlert()}
+                      disabled={companion.actions.resolve.status === "sending"}
+                    >
+                      Da, sunt în siguranță
+                    </button>
+                    <button type="button" className="btn btn--ghost" onClick={() => setConfirmSafe(false)}>Nu</button>
+                  </div>
+                ) : (
+                  <button type="button" className="btn btn--safe btn--xl" data-testid="safe" onClick={() => setConfirmSafe(true)}>
+                    <ShieldCheck size={20} aria-hidden="true" /> Sunt în siguranță, opresc alerta
+                  </button>
+                )}
+              </div>
+            )}
+
             <div className="stop-block">
               {confirmStop ? (
                 <div className="confirm-row" role="group" aria-label="Confirmă alarma falsă">
@@ -329,6 +405,14 @@ export default function CompanionPage() {
               )}
             </div>
           </section>
+        )}
+        {paired && (
+          <ActionStatus
+            action={companion.actions.resolve}
+            sending="Se închide alerta…"
+            confirmed={(at) => `Alerta s-a închis la ${formatClock(at)}.`}
+            failed="Alerta nu s-a închis. Încearcă din nou."
+          />
         )}
         {paired && (
           <ActionStatus

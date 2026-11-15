@@ -11,6 +11,8 @@ const PORT = 5179;
 export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,
+  // Each test drives timers, audio and maps: fewer parallel workers keeps them deterministic.
+  workers: 3,
   reporter: [["list"]],
   timeout: 30_000,
   use: {

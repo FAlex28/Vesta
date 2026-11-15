@@ -20,6 +20,7 @@ from .migrate import migrate as _migrate
 from .migrate import status as _status
 from .notifications import NotificationsRepo
 from .pool import ConnectionPool, load_dsn
+from .recordings import RecordingsRepo
 from .sessions import SessionsRepo
 from .tokens import TokensRepo
 
@@ -43,6 +44,7 @@ class Database:
         self.locations = LocationsRepo(self.pool, s)
         self.companions = CompanionsRepo(self.pool, s)
         self.conversations = ConversationsRepo(self.pool, s)
+        self.recordings = RecordingsRepo(self.pool, s)
         self.tokens = TokensRepo(self.pool, s)
         self.events = EventsRepo(self.pool)
 

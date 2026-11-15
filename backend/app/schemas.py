@@ -482,6 +482,41 @@ class ConversationResponse(StrictModel):
     recording: RecordingView | None
 
 
+class LocationPointView(StrictModel):
+    latitude: float
+    longitude: float
+    captured_at: datetime
+    accuracy_meters: float | None = None
+    source: str
+
+
+class LocationHistoryResponse(StrictModel):
+    """The route of a session that became an alert (never a false alarm), oldest first."""
+
+    session_id: str
+    points: list[LocationPointView]
+
+
+SdpText = Annotated[str, StringConstraints(min_length=10, max_length=20_000)]
+
+
+class CallOfferRequest(StrictModel):
+    sdp: SdpText
+
+
+class CallAnswerRequest(StrictModel):
+    call_id: Identifier
+    sdp: SdpText
+
+
+class CallView(StrictModel):
+    """Live call between the dispatcher and her phone (WebRTC; the server only relays SDP)."""
+
+    call_id: str | None
+    offer: str | None = None
+    answer: str | None = None
+
+
 class TakeoverResponse(StrictModel):
     session_id: str
     operator_connected_at: datetime
