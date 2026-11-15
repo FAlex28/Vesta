@@ -304,3 +304,30 @@ def test_restart_recovery(fresh_db, ev):
     assert db.sessions.activate("u3", ev()).status == "CREATED"
     stats = {r["event_type"]: r["events"] for r in db.events.daily_stats()}
     assert stats["SESSION_ACTIVATED"] == 5 and stats["SESSION_INTERRUPTED"] == 3
+
+
+def test_contact_views_alert_before_outbox_sends_it(db, active_session, ev):
+    """Pagina contactului vede alerta live înainte de outbox: vizualizarea nu se pierde."""
+    r = db.alerts.raise_alert(
+        active_session["session_id"], "SOS_EXPLICIT", event_id=ev(), recipients=["c"]
+    )
+    nid = r.notifications_queued[0]["notification_id"]
+    early = db.notifications.mark_viewed(nid)  # încă PENDING
+    assert early["status"] == "PENDING" and early["viewed_at"] is not None
+    OutboxDispatcher(db, lambda n: None, batch=50).run_once()  # notificarea tot pleacă
+    n = db.notifications.for_alert(r.alert["alert_id"])[0]
+    assert n["status"] == "VIEWED" and n["sent_at"] is not None and n["viewed_at"] == early["viewed_at"]
+
+
+def test_untranscribed_phrase_is_kept_in_the_transcript(db, active_session):
+    """Fără cheie Groq (sau la o eroare), fraza netranscrisă rămâne în istoric."""
+    import uuid as _uuid
+    from datetime import UTC, datetime
+
+    sid = active_session["session_id"]
+    db.conversations.add_turn(
+        turn_id=str(_uuid.uuid4()), session_id=sid, occurred_at=datetime.now(UTC), role="person",
+        text="Mesajul nu a putut fi transcris.", action="TRANSCRIPTION_UNAVAILABLE",
+    )
+    turns = db.conversations.for_session(sid)
+    assert [t["action"] for t in turns] == ["TRANSCRIPTION_UNAVAILABLE"]

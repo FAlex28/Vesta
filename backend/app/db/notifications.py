@@ -36,7 +36,11 @@ class NotificationsRepo:
     def mark_sent(self, notification_id) -> dict | None:
         with self._pool.autocommit() as tx:
             return tx.one(
-                "UPDATE notification_attempts SET status = 'SENT', sent_at = now(), last_error = NULL, "
+                # Pagina contactului poate vedea alerta (flux live) înainte ca outbox-ul să o trimită:
+                # atunci notificarea trece direct în VIEWED, nu înapoi în SENT.
+                "UPDATE notification_attempts SET "
+                "status = CASE WHEN viewed_at IS NOT NULL THEN 'VIEWED' ELSE 'SENT' END, "
+                "sent_at = now(), last_error = NULL, "
                 "updated_at = now() WHERE notification_id = %s AND status = 'SENDING' RETURNING *",
                 (as_uuid(notification_id),),
             )
@@ -69,9 +73,13 @@ class NotificationsRepo:
     def mark_viewed(self, notification_id) -> dict | None:
         with self._pool.autocommit() as tx:
             return tx.one(
-                "UPDATE notification_attempts SET status = 'VIEWED', viewed_at = COALESCE(viewed_at, now()), "
+                # Vizualizată înainte de trimitere (PENDING / SENDING): se păstrează momentul, iar
+                # statusul îl schimbă outbox-ul la trimitere (mark_sent), deci notificarea tot pleacă.
+                "UPDATE notification_attempts SET "
+                "status = CASE WHEN status IN ('PENDING', 'SENDING') THEN status ELSE 'VIEWED' END, "
+                "viewed_at = COALESCE(viewed_at, now()), "
                 "delivered_at = COALESCE(delivered_at, now()), updated_at = now() "
-                "WHERE notification_id = %s AND status <> 'PENDING' RETURNING *",
+                "WHERE notification_id = %s RETURNING *",
                 (as_uuid(notification_id),),
             )
 

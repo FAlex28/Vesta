@@ -254,7 +254,12 @@ class SerialLink:
         import serial  # pyserial
 
         try:
-            ser = serial.Serial(self.port, self.baud, timeout=0.5, write_timeout=1)
+            if "://" in self.port:
+                # Adresă URL pyserial (ex. socket://127.0.0.1:7701): placă virtuală, fără USB.
+                ser = serial.serial_for_url(self.port, self.baud, timeout=0.5, write_timeout=1)
+            else:
+                # Dispecerul fizic: COM7 pe Windows, /dev/ttyUSB0 pe Raspberry Pi.
+                ser = serial.Serial(self.port, self.baud, timeout=0.5, write_timeout=1)
         except (serial.SerialException, OSError) as exc:
             _log(f"Portul {self.port} nu se poate deschide: {exc}")
             return False
