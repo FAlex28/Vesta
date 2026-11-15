@@ -17,6 +17,8 @@ ENV_NAMES = (
     "VESTA_SCHEDULER_ENABLED",
     "VESTA_PERSISTENCE",
     "VESTA_TRUSTED_CONTACT_IDS",
+    "VESTA_CAMERA_BASE_URL",
+    "VESTA_CAMERA_API_KEY",
 )
 
 
@@ -41,6 +43,23 @@ def test_configured_signing_secret_must_have_at_least_32_bytes(
 ) -> None:
     monkeypatch.setenv("VESTA_CONTROL_SIGNING_SECRET", "too-short")
     with pytest.raises(ConfigurationError, match="at least 32 bytes"):
+        Settings.from_env()
+
+
+def test_remote_camera_service_requires_a_server_side_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VESTA_CAMERA_BASE_URL", "http://172.20.10.9:8080")
+    with pytest.raises(ConfigurationError, match="VESTA_CAMERA_API_KEY"):
+        Settings.from_env()
+
+    monkeypatch.setenv("VESTA_CAMERA_API_KEY", "camera-secret")
+    settings = Settings.from_env()
+    assert settings.camera_base_url == "http://172.20.10.9:8080"
+    assert settings.camera_api_key == "camera-secret"
+
+
+def test_camera_service_url_must_be_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VESTA_CAMERA_BASE_URL", "file:///tmp/cameras")
+    with pytest.raises(ConfigurationError, match=r"HTTP\(S\) URL"):
         Settings.from_env()
 
 

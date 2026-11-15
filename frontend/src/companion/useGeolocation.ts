@@ -3,7 +3,9 @@ import { GPS_STALE_AFTER_MS } from "../api/config";
 import { TIMISOARA_TEST_POINT } from "../data/dashboardData";
 
 /*
- * Phone GPS through navigator.geolocation, only after the user taps "Permite locația".
+ * Phone GPS through navigator.geolocation. The person's phone starts it on its own (the first
+ * time the browser asks for permission); afterwards a fresh fix is requested every 5 s, so the
+ * position keeps updating even when she stands still (watchPosition alone reports only moves).
  *
  * Freshness is computed from the fix's own timestamp:
  *   CURRENT      fix younger than GPS_STALE_AFTER_MS
@@ -14,6 +16,11 @@ import { TIMISOARA_TEST_POINT } from "../data/dashboardData";
  * an upload would require a separate, explicit sharing choice.
  * A clearly labelled simulated point (the fixed test point) can be shown instead.
  */
+
+/** How often the phone asks for a fresh fix while sharing (seconds matter in an alert). */
+export const LOCATION_REFRESH_MS = 5_000;
+/** How long a precise fix beats a coarse one. */
+const COARSE_FIX_GRACE_MS = 30_000;
 
 export type GpsPermission = "not_requested" | "requesting" | "granted" | "denied" | "unsupported" | "insecure";
 export type GpsFreshness = "CURRENT" | "STALE" | "UNAVAILABLE";
@@ -45,18 +52,35 @@ export function useGeolocation() {
     error: null,
   });
   const watchId = useRef<number | null>(null);
+  const pollId = useRef<number | null>(null);
 
   const onPosition = useCallback((position: GeolocationPosition) => {
-    setState({
-      permission: "granted",
-      error: null,
-      fix: {
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
-        accuracy: Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : null,
-        timestamp: position.timestamp || Date.now(),
-        source: "device",
-      },
+    const accuracy = Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : null;
+    setState((current) => {
+      const previous = current.fix;
+      // A coarse network fix (hundreds of metres) must not replace a recent precise GPS fix:
+      // that is what made the point jump on the map.
+      if (
+        previous?.source === "device" &&
+        previous.accuracy != null &&
+        accuracy != null &&
+        accuracy > 50 &&
+        accuracy > previous.accuracy * 2 &&
+        Date.now() - previous.timestamp < COARSE_FIX_GRACE_MS
+      ) {
+        return current;
+      }
+      return {
+        permission: "granted",
+        error: null,
+        fix: {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          accuracy,
+          timestamp: position.timestamp || Date.now(),
+          source: "device",
+        },
+      };
     });
   }, []);
 
@@ -81,9 +105,17 @@ export function useGeolocation() {
     setState((current) => ({ ...current, permission: current.permission === "granted" ? "granted" : "requesting", error: null }));
     watchId.current = navigator.geolocation.watchPosition(onPosition, onError, {
       enableHighAccuracy: true,
-      maximumAge: 10_000,
+      maximumAge: 0,
       timeout: 20_000,
     });
+    if (pollId.current !== null) window.clearInterval(pollId.current);
+    pollId.current = window.setInterval(() => {
+      navigator.geolocation.getCurrentPosition(onPosition, () => undefined, {
+        enableHighAccuracy: true,
+        maximumAge: 0,
+        timeout: 4_500,
+      });
+    }, LOCATION_REFRESH_MS);
   }, [supported, onPosition, onError]);
 
   /** Ask once more for a fresh fix, e.g. when the page returns to the foreground. */
@@ -94,7 +126,9 @@ export function useGeolocation() {
 
   const stop = useCallback(() => {
     if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+    if (pollId.current !== null) window.clearInterval(pollId.current);
     watchId.current = null;
+    pollId.current = null;
     setState((current) => ({ ...current, permission: "not_requested", fix: null, error: null }));
   }, []);
 
@@ -110,6 +144,7 @@ export function useGeolocation() {
   useEffect(
     () => () => {
       if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+      if (pollId.current !== null) window.clearInterval(pollId.current);
     },
     [],
   );

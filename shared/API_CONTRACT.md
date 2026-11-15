@@ -1,7 +1,9 @@
 # Vesta API contract — backend, voice, GPIO and safety
 
-Version: `v4` (UniHack 2026 prototype). v4: phone pairing with the code printed on the device,
-emergency contacts invited from the phone, Web Push, dispatcher location during an active alert.
+Version: `v5` (UniHack 2026 prototype). v5: open access without codes (demo), the GPS on the
+Vesta device, the voice assistant in the earbuds (Gemini + ElevenLabs), the conversation recording
+and false alarms. v4: phone pairing with the code printed on the device, emergency contacts invited
+from the phone, Web Push, dispatcher location during an active alert.
 v3 added check-in delivery semantics by channel, `viewed_at`, Pi power and the served web app.
 
 This file defines only the interfaces owned by Agent 2. Vesta is a controlled demonstration,
@@ -294,6 +296,64 @@ fields) for sessions whose alert is ACTIVE; a new location during an active aler
 `location.updated` (no coordinates in the event). The dashboard offers a presentation mode that
 hides coordinates on a projected screen.
 
+## v5: device GPS, voice assistant, recording, false alarm
+
+**Open access (demo).** With `VESTA_OPEN_ACCESS=true` (refused outside development/test),
+`POST /api/v1/access/open {"scope": "companion" | "contact"}` returns the same grant as the code
+flows, without any code. The phone and the trusted contact pages use it automatically; otherwise
+`404`.
+
+**Device GPS.** `POST /api/v1/device/location` (`X-Device-Key`) `{event_id, device_id, latitude,
+longitude, captured_at, accuracy_meters?, satellites?}` → `{session_id, accepted_as_latest}`. The fix
+is attached to the device's unfinished session (source `device_gps`); without a session it is
+kept as the last fix and attached to the next activation. While a device fix is younger than
+15 s, `POST /sessions/{id}/location` from the phone answers `accepted_as_latest: false` (the phone is
+only a backup). Location fixes in status, contact and dispatcher views carry `source`.
+
+**Flow.** `VESTA_FIRST_CHECKIN_DELAY_SECONDS` makes the first check-in come right after the
+activation: the assistant asks whether the press was a mistake. No answer to two delivered
+check-ins → ALERT (`MISSED_CHECK_INS`), as before.
+
+**Assistant.** `GET /api/v1/status` has `assistant: {understanding, voice}`.
+
+- `POST /sessions/{id}/assistant/prompt {event_id, line: checkin|alert|false_alarm|confirm_safe}` →
+  `{text, audio_base64, mime_type, turn_id}`. `checkin` becomes the greeting ("a fost din greșeală?")
+  on the first attempt and a reprompt on the second. Audio (mp3) only with ElevenLabs; otherwise the
+  phone speaks the text. The same `event_id` returns the same line.
+- `POST /sessions/{id}/assistant/reply {event_id, audio_base64, mime_type: audio/wav}` → `{transcript,
+  action, applied, reply, session}`. Gemini returns one intent; the API applies it only through the
+  normal commands: `FALSE_ALARM` (only with a non-empty transcript) → cancel `FALSE_ALARM`;
+  `ESCALATE` → SOS (`source: voice_agent`); `CONFIRM_SAFE` → confirms the open check-in; `NONE` →
+  nothing. Without `GEMINI_API_KEY`: `503 ASSISTANT_UNAVAILABLE`.
+
+**Recording.** `POST /sessions/{id}/recording/chunks?seq=N` (control token, raw `audio/webm`
+body, ≤ 2 MB): chunk 0, 1, 2…; a repeated chunk is ignored, a gap is `409 RECORDING_GAP`. Dispatcher
+(dashboard key), only once the session has an alert that is not a false alarm, otherwise `404`:
+`GET /sessions/{id}/recording` streams the webm from its first byte and follows it live;
+`GET /sessions/{id}/conversation` → `{session_id, turns[], recording}`. Event
+`conversation.updated` (no text) tells the dashboard to refetch.
+
+**False alarm.** `cancel` with `reason: FALSE_ALARM` works in ACTIVE, CHECK_IN, UNCONFIRMED and
+also in ALERT (resolved with `resolution_action: FALSE_ALARM`). The backend then deletes the
+recording, the transcript and the session's positions (memory and Tiger Data) and publishes
+`session.data_deleted`. Before an alert nobody was notified.
+
+## v6: dispatcher takes the call, recordings in the database
+
+- `POST /sessions/{id}/takeover` (dashboard key, only with an ACTIVE alert) → `{session_id,
+  operator_connected_at}`; event `call.taken_over`. `SessionView.operator_connected_at` is set; from
+  then on `assistant/reply` and the `nudge` line answer `409 OPERATOR_CONNECTED` (the phone says the
+  `operator` line once and stays quiet).
+- `POST /sessions/{id}/operator/messages` (dashboard key, raw `audio/webm` ≤ 2 MB, after takeover)
+  → `{id, at}`; event `operator.message`. `GET /sessions/{id}/operator/messages?after=<id>` (control
+  token) → `[{id, at, mime_type, audio_base64}]`: the phone plays them in her earbuds.
+- `assistant/prompt` line `nudge`: a rotating question every ~15 s of silence (ACTIVE or ALERT).
+- Recordings, transcripts and operator messages live in a local SQLite database
+  (`VESTA_STATE_DIR/vesta.db`, or `VESTA_DATABASE_PATH`): they survive restarts. `GET
+  /api/v1/recordings` (dashboard key) lists every alert's recording (never false alarms) with its
+  alert facts; `GET /sessions/{id}/recording` and `/conversation` work for archived sessions too.
+- The phone's GPS is the location source; a coarse fix does not replace a recent precise one.
+
 ## Alert model
 
 Exactly one active alert exists per session. Concurrent SOS and automatic timeout converge on
@@ -395,7 +455,8 @@ Important event types include:
   `safety.check_in_unconfirmed`, `safety.check_in_confirmed`, `safety.check_in_deferred`
 - `safety.alerted`, `alert.notification_requested`, `safety.alert_resolved`, `alert.resolved`
 - `technical.issue_reported`, `technical.issue_resolved`, `voice.status_changed`,
-  `client.status_changed`, `technical.power`, `alert.viewed`, `location.updated`
+  `client.status_changed`, `technical.power`, `alert.viewed`, `location.updated`,
+  `conversation.updated`, `session.data_deleted`
 - `system.snapshot`, `system.heartbeat`, `stream.resync_required`
 
 Each effective update includes the server-side session `version`. A client must not infer the

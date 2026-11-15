@@ -361,9 +361,13 @@ export function useCompanionSession(live: LiveConnection) {
     if (credential && interrupted) unpair("session_gone");
   }, [credential, interrupted, unpair]);
 
+  /** A session returned by another call (e.g. the assistant's reply) updates the shared state. */
+  const applySession = useCallback((next: SessionView) => applyCommand({ duplicate: false, session: next }), [applyCommand]);
+
   return {
     credential,
     session,
+    applySession,
     pairing,
     pairingProblem,
     pair,

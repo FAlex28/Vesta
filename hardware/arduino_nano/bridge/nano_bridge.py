@@ -39,6 +39,10 @@ BAUD = 115200
 PING_INTERVAL_S = 3.0  # Nano-ul declară legătura pierdută după 10 s fără comenzi.
 STATUS_POLL_S = 5.0  # Recitire periodică, în plus față de evenimentele WebSocket.
 BOOT_GRACE_S = 2.5  # Nano clasic se resetează la deschiderea portului (bootloader ~2 s).
+# Backend repornit sau pornit după bridge: abia după atâtea secunde fără răspuns aprindem
+# eroarea SERVER OFFLINE, ca placa să nu sune la fiecare restart scurt.
+BACKEND_GRACE_S = 15.0
+RESTART_DELAY_S = 3.0  # --keep-running: pauza înainte de repornirea bridge-ului după o eroare
 NANO_ALERT_ID_MAX = 39  # char activeAlertId[40]
 NANO_REASON_MAX = 23  # char alertReason[24] / technicalReason[24]
 NANO_LINE_MAX = 118  # SERIAL_BUFFER_SIZE 120, fără '\n'
@@ -329,6 +333,7 @@ class SimulatedNano:
         self.technical = False
         self.technical_text = ""
         self.resolved_banner = False
+        self.linked = False  # ca pcLinked din sketch: True după prima comandă, False după BYE
         self._callback: LinkCallback = lambda kind, text: None
         self._last_panel = ""
         self.started = time.monotonic()
@@ -349,6 +354,8 @@ class SimulatedNano:
         if self.technical:
             text = self.technical_text or "EROARE TEHNICA"
             return f"LED ALBASTRU + buzzer D8 | LCD: ALBASTRU 04 ERR / {text[:16]}"
+        if not self.linked and self.safety == "STANDBY":
+            return "LED ALB (pauza scurta la 2 s) | LCD: ALB 00 STANDBY / Astept PC"
         if self.resolved_banner:
             return "LED ALB | LCD: ALB 00 STANDBY / Alerta rezolvata"
         return {
@@ -372,6 +379,14 @@ class SimulatedNano:
         command, args = parts[0], parts[1:]
         if not command:
             return None
+        if command == "BYE":
+            self.linked = False
+            if not self.alert_id:
+                self.safety = "STANDBY"
+            self.technical = False
+            self.technical_text = ""
+            return "OK|BYE"
+        self.linked = True
         if command == "HELLO":
             return "HELLO|VESTA_NANO|1"
         if command == "PING":
@@ -379,7 +394,7 @@ class SimulatedNano:
         if command == "STATUS":
             return (
                 f"STATUS|PC=1|STATE={'ALERT' if self.alert_id else self.safety}"
-                f"|ALERT={int(bool(self.alert_id))}|TECH={int(self.technical)}|ID={self.alert_id}"
+                f"|ALERT={int(bool(self.alert_id))}|TECH={int(self.technical)}|LCD=1|ID={self.alert_id}"
             )
         if command == "READY":
             self.technical = False
@@ -437,6 +452,15 @@ class SimulatedNano:
             self.resolved_banner = False
             return "OK|CLEAR"
         return "ERR|UNKNOWN_COMMAND"
+
+
+def say_goodbye(link: SerialLink | SimulatedNano) -> None:
+    """Oprire voită: placa trece în „Astept PC”, fără eroare (o alertă activă continuă)."""
+
+    if link.connected:
+        link.send("BYE")
+        time.sleep(0.1)
+    link.close()
 
 
 def resolve_port(requested: str | None) -> str:
@@ -541,6 +565,7 @@ class Bridge:
         self.verbose = verbose
         self.status: dict[str, Any] | None = None
         self.backend_ok: bool | None = None  # None = încă nu am încercat
+        self.backend_down_since: float | None = None
         self.target: NanoView | None = None
         self.shown: NanoView | None = None  # None = placa trebuie resincronizată complet
         self.ready_at = 0.0
@@ -583,12 +608,13 @@ class Bridge:
             except BackendError as exc:
                 if self.backend_ok is not False:
                     _log(f"Backend indisponibil: {exc}")
-                self.backend_ok = False
+                self._backend_down()
             else:
                 if not self.backend_ok:
                     _log(f"Backend conectat ({self.backend.base_url})")
                 self.status = status
                 self.backend_ok = True
+                self.backend_down_since = None
         self._wake.set()
 
     async def watch_events(self) -> None:
@@ -624,10 +650,24 @@ class Bridge:
                 if "1008" in text or "Authentication" in text:
                     text += "  (verifică --dashboard-key / VESTA_DASHBOARD_API_KEY)"
                 _log(f"WebSocket: {text}; reîncerc în {backoff:.0f} s")
-                self.backend_ok = False
+                self._backend_down()
                 self._wake.set()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 10.0)
+
+    def _backend_down(self) -> None:
+        if self.backend_down_since is None:
+            self.backend_down_since = time.monotonic()
+        self.backend_ok = False
+
+    def backend_in_grace(self) -> bool:
+        """Backendul tocmai a căzut (sau încă pornește): placa rămâne cum era, primește doar PING."""
+
+        return (
+            self.backend_ok is False
+            and self.backend_down_since is not None
+            and time.monotonic() - self.backend_down_since < BACKEND_GRACE_S
+        )
 
     async def poll_status(self) -> None:
         while True:
@@ -651,8 +691,8 @@ class Bridge:
         if now - self.last_ping >= PING_INTERVAL_S:
             self.last_ping = now
             self._send("PING")
-        if self.backend_ok is None:
-            return  # așteptăm primul răspuns al backendului
+        if self.backend_ok is None or self.backend_in_grace():
+            return  # PING-ul ține placa ocupată; starea vine după răspunsul backendului
 
         target, resolved = derive_target(
             self.status,
@@ -702,7 +742,7 @@ class Bridge:
         try:
             await asyncio.gather(self.sync_loop(), self.watch_events(), self.poll_status())
         finally:
-            self.link.close()
+            say_goodbye(self.link)
 
 
 # --------------------------------------------------------------------------------------
@@ -780,16 +820,25 @@ def run_demo(link: SerialLink | SimulatedNano, *, include_timeout: bool) -> None
             time.sleep(0.15)
         _wait_with_pings(link, seconds)
     if include_timeout:
-        print("\n[timeout] Nu mai trimit nimic 12 s: după 10 s placa trebuie să arate "
-              "ALBASTRU + 'CONEXIUNE PC'.", flush=True)  # fmt: skip
+        print("\n[timeout repaus] Nu mai trimit nimic 12 s, fără sesiune: placa NU dă eroare, "
+              "arată ALB + 'Astept PC'.", flush=True)  # fmt: skip
         time.sleep(12)
-        _log("-> PING (legătura revine, placa iese din eroare)")
+        _log("-> PING (legătura revine: 'Fara sesiune')")
         link.send("PING")
+        time.sleep(2)
+        _log("-> STATE|ACTIVE")
+        link.send("STATE|ACTIVE")
+        print("\n[timeout în sesiune] Tac 12 s cu sesiunea activă: după 10 s placa arată "
+              "ALBASTRU + 'CONEXIUNE PC' + D8 (informația ar putea fi veche).", flush=True)  # fmt: skip
+        time.sleep(12)
+        _log("-> PING + STATE|STANDBY (legătura revine)")
+        link.send("PING")
+        link.send("STATE|STANDBY")
         time.sleep(1)
     link.send("STATUS")
     time.sleep(0.5)
-    _log("Demo terminat.")
-    link.close()
+    _log("Demo terminat (BYE: placa rămâne în 'Astept PC', fără eroare).")
+    say_goodbye(link)
 
 
 def run_manual(link: SerialLink | SimulatedNano) -> None:
@@ -808,7 +857,7 @@ def run_manual(link: SerialLink | SimulatedNano) -> None:
     print(
         "Consolă manuală. Exemple: STATE|ACTIVE  STATE|CHECK  ALERT_RAISED|a1|SOS_EXPLICIT\n"
         "  ALERT_RESOLVED|a1  TECHNICAL_ERROR|MICROPHONE_DENIED  TECHNICAL_RESOLVED  STATUS\n"
-        "Comenzi locale: /ping off (testezi timeout-ul de 10 s), /ping on, /quit\n"
+        "Comenzi locale: /ping off (testezi timeout-ul de 10 s), /ping on, /quit (trimite BYE)\n"
         "PING se trimite automat la 3 s.",
         flush=True,
     )
@@ -827,7 +876,7 @@ def run_manual(link: SerialLink | SimulatedNano) -> None:
             time.sleep(0.2)
     except (EOFError, KeyboardInterrupt):
         pass
-    link.close()
+    say_goodbye(link)
 
 
 # --------------------------------------------------------------------------------------
@@ -1001,6 +1050,8 @@ def build_parser() -> argparse.ArgumentParser:
     bridge.add_argument("--all-devices", action="store_true",
                         help="nu filtra sesiunile după --device-id")  # fmt: skip
     bridge.add_argument("-v", "--verbose", action="store_true")
+    bridge.add_argument("--keep-running", action="store_true",
+                        help="repornește singur după o eroare neprevăzută (Ctrl+C oprește)")  # fmt: skip
 
     simulate = sub.add_parser("simulate", help="controlează o sesiune în backend")
     add_backend(simulate)
@@ -1033,16 +1084,24 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     backend = Backend(args.backend, dashboard_key=args.dashboard_key, device_key=None)
-    bridge = Bridge(
-        make_link(args.port),
-        backend,
-        device_id=None if args.all_devices else args.device_id,
-        verbose=args.verbose,
-    )
-    try:
-        asyncio.run(bridge.run())
-    except KeyboardInterrupt:
-        _log("Oprit.")
+    while True:
+        bridge = Bridge(
+            make_link(args.port),
+            backend,
+            device_id=None if args.all_devices else args.device_id,
+            verbose=args.verbose,
+        )
+        try:
+            asyncio.run(bridge.run())
+            return
+        except KeyboardInterrupt:
+            _log("Oprit.")
+            return
+        except Exception as exc:  # noqa: BLE001 - --keep-running ține placa ocupată cu PING
+            if not args.keep_running:
+                raise
+            _log(f"Bridge oprit de o eroare: {exc!r}; repornesc în {RESTART_DELAY_S:.0f} s")
+            time.sleep(RESTART_DELAY_S)
 
 
 if __name__ == "__main__":

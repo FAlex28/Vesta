@@ -1,16 +1,19 @@
 import { Eye, EyeOff } from "lucide-react";
 import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
 import { configuredDeviceId } from "./api/config";
+import { isUnfinished } from "./api/contract";
 import { AlertList } from "./components/AlertList";
 import { BrandLockup } from "./components/BrandLockup";
 import { EventLog } from "./components/EventLog";
+import { CameraFeeds } from "./components/CameraFeeds";
 import { LinkBadge } from "./components/LinkBadge";
+import { LiveCall } from "./components/LiveCall";
+import { RecordingsArchive } from "./components/RecordingsArchive";
 import { SectionHead } from "./components/SectionHead";
-import { SourceTag } from "./components/SourceTag";
 import { StateLadder } from "./components/StateLadder";
 import { StatusOrb } from "./components/StatusOrb";
 import { WatchChain } from "./components/WatchChain";
-import { TEST_POINT_LABEL, TIMISOARA_TEST_POINT } from "./data/dashboardData";
+import { TIMISOARA_TEST_POINT } from "./data/dashboardData";
 import { useNow } from "./services/session";
 import { primarySession, sortedAlerts, unfinishedCount } from "./state/liveState";
 import {
@@ -35,8 +38,10 @@ const CityMap = lazy(() => import("./components/CityMap").then((module) => ({ de
 // Same order as the sections on the page, so the highlighted item follows scrolling.
 const navItems = [
   { id: "session", label: "Stare" },
+  { id: "cameras", label: "Camere" },
   { id: "alerts", label: "Alerte" },
   { id: "location", label: "Locație" },
+  { id: "recordings", label: "Înregistrări" },
   { id: "events", label: "Jurnal" },
 ];
 
@@ -125,7 +130,15 @@ function App() {
   const phone = phoneSignal(session, now);
   const clock = new Date(now).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
   const today = new Date(now).toLocaleDateString("ro-RO", { weekday: "long", day: "numeric", month: "long" });
-  const [testLat, testLng] = TIMISOARA_TEST_POINT;
+
+  // During an alert the person's position moves: read it again every 5 s, besides the events.
+  const alerting = session?.state === "ALERT";
+  const { refreshStatus } = live;
+  useEffect(() => {
+    if (!alerting) return;
+    const timer = window.setInterval(() => void refreshStatus(), 5000);
+    return () => window.clearInterval(timer);
+  }, [alerting, refreshStatus]);
 
   let deadline: { label: string; value: string } = { label: "Următoarea verificare", value: "—" };
   if (session?.response_deadline) deadline = { label: "Termen de răspuns", value: formatClock(session.response_deadline) };
@@ -170,7 +183,7 @@ function App() {
             }}
           >
             <label htmlFor="dashboard-key"><strong>Autentifică panoul</strong></label>
-            <p>Introdu cheia de acces emisă pentru acest dispecerat. Cheia rămâne doar în memoria filei.</p>
+            <p>Introdu cheia de acces a dispeceratului.</p>
             <input
               id="dashboard-key"
               type="password"
@@ -201,25 +214,21 @@ function App() {
                 {known && <span className="state-code num">{sessionState}</span>}
               </h2>
               <p className="watch-detail">
-                {known
-                  ? copy.detail
-                  : "Panoul nu afișează nicio stare până nu răspunde serverul Vesta. Nu presupunem că sistemul este pregătit."}
+                {known ? copy.detail : "Se conectează la server…"}
               </p>
             </div>
           </div>
 
           {stale && (
             <p className="stale-banner" role="alert" data-testid="stale-banner">
-              <strong>Ultima stare cunoscută, primită la {formatClock(state.snapshotAt)}.</strong> Fluxul de la server este{" "}
-              {link.state === "DISCONNECTED" ? "întrerupt" : "în reconectare"}; starea reală poate fi diferită.
+              <strong>Legătura cu serverul s-a întrerupt</strong> ({formatClock(state.snapshotAt)}). Datele de mai jos pot fi
+              vechi.
             </p>
           )}
           {state.restartDetected && (
             <p className="stale-banner stale-banner--info" role="status" data-testid="restart-banner">
               <strong>Serverul a repornit.</strong>{" "}
-              {Object.keys(state.interrupted).length > 0
-                ? "Sesiunea care rula a fost întreruptă și nu mai există pe server. Pentru o sesiune nouă, joystickul trebuie ținut apăsat 5 secunde."
-                : "Starea afișată a fost reîncărcată de la server."}{" "}
+              {Object.keys(state.interrupted).length > 0 ? "Sesiunea în curs a fost întreruptă." : ""}{" "}
               <button type="button" className="text-button" onClick={live.acknowledgeRestart}>
                 Am înțeles
               </button>
@@ -255,9 +264,9 @@ function App() {
 
           <dl className="signals">
             <SignalCell name="Telefon" signal={phone} testId="signal-phone" />
-            <SignalCell name="Voce · ElevenLabs" signal={voiceSignal(session, state.voiceMode)} testId="signal-voice" />
-            <SignalCell name="GPS pe telefon" signal={gpsSignal(session)} testId="signal-gps" />
-            <SignalCell name="Alimentare Raspberry Pi" signal={powerSignal(session, state.systemPower)} testId="signal-power" />
+            <SignalCell name="Asistent în căști" signal={voiceSignal(session)} testId="signal-voice" />
+            <SignalCell name="GPS telefon" signal={gpsSignal(session)} testId="signal-gps" />
+            <SignalCell name="Alimentare dispozitiv" signal={powerSignal(session, state.systemPower)} testId="signal-power" />
           </dl>
           {otherIssues.length > 0 && (
             <ul className="issue-list" aria-label="Alte avertizări tehnice">
@@ -268,26 +277,38 @@ function App() {
           )}
         </section>
 
+        {session && isUnfinished(session.state) && (
+          <LiveCall
+            session={session}
+            dashboardKey={live.dashboardKey}
+            conversationTick={state.conversationTicks[session.id] ?? 0}
+            presentation={presentation}
+          />
+        )}
+        <CameraFeeds dashboardKey={live.dashboardKey} />
+
+        {session?.cancellation_reason === "FALSE_ALARM" && (
+          <p className="notice false-alarm-notice" role="status" data-testid="false-alarm-notice">
+            <strong>Alarmă falsă</strong> la {formatClock(session.updated_at)}. Înregistrarea și locația au fost șterse.
+          </p>
+        )}
+
         <div className="board">
           <div className="board-col board-col--main">
             <section className="panel area-alerts" id="alerts" aria-labelledby="alerts-head">
               <SectionHead title="Alerte" id="alerts-head">
-                <span className="panel-meta">{activeAlerts === 0 ? "Nicio alertă activă" : activeAlerts === 1 ? "1 alertă activă" : `${activeAlerts} alerte active`}</span>
+                <span className="panel-meta">{activeAlerts === 0 ? "Nicio alertă activă" : activeAlerts === 1 ? "1 activă" : `${activeAlerts} active`}</span>
               </SectionHead>
               <AlertList
                 alerts={alerts}
-                emptyText={known ? "Nicio alertă de la ultima pornire a serverului." : "Se așteaptă serverul."}
+                emptyText={known ? "Nicio alertă." : "Se conectează…"}
               />
-              <p className="panel-note">
-                O alertă închisă nu dispare: rămâne în listă ca RESOLVED, cu ora închiderii. Vesta nu apelează 112; contactele
-                de urgență primesc notificarea pe telefon.
-              </p>
             </section>
 
             <section className="panel area-events" id="events" aria-labelledby="events-head">
               <SectionHead title="Jurnal" id="events-head">
                 <span className="panel-meta">
-                  {link.lastMessageAt ? `Ultimul mesaj ${formatAge(now - link.lastMessageAt)}` : "Fără mesaje încă"}
+                  {link.lastMessageAt ? `Actualizat ${formatAge(now - link.lastMessageAt)}` : ""}
                 </span>
               </SectionHead>
               <EventLog log={state.log} />
@@ -303,7 +324,7 @@ function App() {
                   aria-pressed={presentation}
                   onClick={togglePresentation}
                   data-testid="presentation-toggle"
-                  title="Ascunde coordonatele reale când ecranul este proiectat"
+                  title="Ascunde coordonatele și transcrierea pe un ecran proiectat"
                 >
                   {presentation ? <EyeOff size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}
                   Mod prezentare
@@ -315,66 +336,72 @@ function App() {
                   {showReal ? (
                     <>
                       <span className="live-dot" aria-hidden="true" />
-                      Locație reală · alertă activă
+                      Locația persoanei · în direct
                     </>
+                  ) : realLocation && presentation ? (
+                    "Ascunsă în modul prezentare"
                   ) : (
-                    <>
-                      <span className="src-mark" aria-hidden="true" />
-                      Punct de referință simulat, nu este locația unei persoane
-                    </>
+                    "Locația apare la declanșarea unei alerte"
                   )}
                 </p>
                 <Suspense fallback={<div className="map-loading">Se încarcă harta…</div>}>
                   {showReal && realLocation ? (
                     <CityMap point={[realLocation.latitude, realLocation.longitude]} state="ALERT" kind="device" accuracy={realLocation.accuracy_meters} />
                   ) : (
-                    <CityMap point={TIMISOARA_TEST_POINT} state={known ? sessionState : null} kind="simulated" />
+                    <CityMap point={TIMISOARA_TEST_POINT} state={null} kind="area" />
                   )}
                 </Suspense>
               </div>
 
               {showReal && realLocation ? (
+                <>
                 <dl className="loc-facts" data-testid="dashboard-location-real">
                   <div>
                     <dt>Coordonate</dt>
                     <dd className="num">{realLocation.latitude.toFixed(5)}, {realLocation.longitude.toFixed(5)}</dd>
                   </div>
                   <div>
-                    <dt>Captată</dt>
+                    <dt>Actualizată</dt>
                     <dd className="num">
-                      {formatClock(realLocation.captured_at)} · {formatAge(now - Date.parse(realLocation.captured_at))}
-                      {realLocation.is_stale && <span className="fresh fresh--stale">STALE</span>}
+                      {formatAge(now - Date.parse(realLocation.captured_at))}
+                      {realLocation.is_stale && <span className="fresh fresh--stale">VECHE</span>}
                     </dd>
                   </div>
                   <div>
                     <dt>Precizie</dt>
-                    <dd className="num">{realLocation.accuracy_meters != null ? `± ${Math.round(realLocation.accuracy_meters)} m` : "neraportată"}</dd>
+                    <dd className="num">{realLocation.accuracy_meters != null ? `± ${Math.round(realLocation.accuracy_meters)} m` : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Sursă</dt>
+                    <dd data-testid="location-source">{realLocation.source === "device_gps" ? "GPS dispozitiv" : "GPS telefon"}</dd>
                   </div>
                 </dl>
+                {realLocation.accuracy_meters != null && realLocation.accuracy_meters > 100 && (
+                  <p className="notice notice--warning" role="status" data-testid="dashboard-location-imprecise">
+                    Poziție imprecisă (± {Math.round(realLocation.accuracy_meters)} m).
+                  </p>
+                )}
+                </>
               ) : (
-                <dl className="loc-facts">
-                  <div><dt>Loc</dt><dd>{TEST_POINT_LABEL} <SourceTag source="simulated" label="Simulat" /></dd></div>
-                  <div>
-                    <dt>Coordonate</dt>
-                    <dd><span className="num sample">{testLat.toFixed(4)}, {testLng.toFixed(4)}</span></dd>
-                  </div>
-                  <div>
-                    <dt>Locația persoanei</dt>
-                    <dd data-testid="alert-location">
-                      {realLocation && presentation
-                        ? "Ascunsă în modul prezentare"
-                        : notice && session?.state === "ALERT"
-                          ? notice.locationAvailable
-                            ? `Atașată alertei · captată la ${formatClock(notice.capturedAt)}${notice.isStale ? " · veche" : ""}`
-                            : "Nicio locație autorizată la emiterea alertei"
-                          : "Apare aici doar în timpul unei alerte active"}
-                    </dd>
-                  </div>
-                </dl>
+                <p className="panel-note" data-testid="alert-location">
+                  {realLocation && presentation
+                    ? "Coordonatele sunt ascunse în modul prezentare."
+                    : notice && session?.state === "ALERT"
+                      ? notice.locationAvailable
+                        ? `Locație primită la ${formatClock(notice.capturedAt)}${notice.isStale ? " (veche)" : ""}.`
+                        : "Telefonul nu a trimis încă locația."
+                      : "Nicio alertă activă."}
+                </p>
               )}
             </section>
           </div>
         </div>
+
+        <RecordingsArchive
+          dashboardKey={live.dashboardKey}
+          presentation={presentation}
+          refreshKey={`${session?.id ?? ""}:${session?.state ?? ""}`}
+        />
       </main>
     </div>
   );

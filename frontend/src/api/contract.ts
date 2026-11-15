@@ -1,4 +1,4 @@
-/* Types mirrored from shared/API_CONTRACT.md v2 and backend/app/schemas.py. */
+/* Types mirrored from shared/API_CONTRACT.md v5 and backend/app/schemas.py. */
 
 export const SESSION_STATES = ["IDLE", "ACTIVE", "CHECK_IN", "UNCONFIRMED", "ALERT", "CANCELLED"] as const;
 export type SessionState = (typeof SESSION_STATES)[number];
@@ -64,6 +64,8 @@ export type SessionView = {
   active_technical_issues: string[];
   alert_reason: string | null;
   alert: AlertView | null;
+  /** The dispatcher took over the call: the assistant in the earbuds is silent. */
+  operator_connected_at?: string | null;
 };
 
 export type SystemStatus = {
@@ -77,6 +79,23 @@ export type SystemStatus = {
   power?: { state: string; detail: string; checked_at: string } | null;
   /** Dispatcher only: last authorized location of sessions whose alert is ACTIVE. */
   alert_locations?: AlertLocation[];
+  /** Voice assistant: Gemini understands the person, ElevenLabs gives the voice. */
+  assistant?: { understanding?: boolean; voice?: boolean };
+};
+
+export type CameraFeedStatus = {
+  connected: boolean;
+  device?: string | null;
+  mode?: string | null;
+  fps?: number;
+  error?: string | null;
+};
+
+export type CamerasStatus = {
+  configured: boolean;
+  reachable: boolean;
+  thermal: CameraFeedStatus;
+  rgb: CameraFeedStatus;
 };
 
 export type LocationFix = {
@@ -86,6 +105,8 @@ export type LocationFix = {
   age_seconds: number;
   is_stale: boolean;
   accuracy_meters: number | null;
+  /** "device_gps": the GPS on the Vesta device; "android": the phone's browser. */
+  source?: string | null;
 };
 
 export type AlertLocation = LocationFix & { session_id: string };
@@ -164,13 +185,18 @@ export const EVENT_TYPES = [
   "system.recovered",
   "client.status_changed",
   "voice.status_changed",
+  "conversation.updated",
+  "location.updated",
+  "session.data_deleted",
+  "call.taken_over",
+  "operator.message",
   "system.snapshot",
   "system.heartbeat",
   "stream.resync_required",
 ] as const;
 
 /** CancelRequest.reason in backend/app/schemas.py; any other value is rejected with 422. */
-export type CancelReason = "ACCIDENTAL_ACTIVATION" | "USER_CANCELLED" | "SESSION_ENDED";
+export type CancelReason = "ACCIDENTAL_ACTIVATION" | "USER_CANCELLED" | "SESSION_ENDED" | "FALSE_ALARM";
 
 /** VoiceStatusRequest.status for POST /voice/status. */
 export type VoiceStatus =
@@ -234,6 +260,70 @@ export type VoiceAccessResponse = {
     session_id?: string;
   };
 };
+
+/** What Vesta says in the earbuds: text, plus ElevenLabs audio (mp3) when configured. */
+export type AssistantSpeech = {
+  text: string;
+  audio_base64: string | null;
+  mime_type: string | null;
+  turn_id: string | null;
+};
+
+export type AssistantAction = "NONE" | "FALSE_ALARM" | "ESCALATE" | "CONFIRM_SAFE";
+
+export type AssistantReply = {
+  transcript: string;
+  action: AssistantAction;
+  applied: boolean;
+  reply: AssistantSpeech;
+  session: SessionView;
+};
+
+export type AssistantLine = "checkin" | "alert" | "false_alarm" | "confirm_safe" | "nudge" | "operator";
+
+export type OperatorMessage = { id: string; at: string; mime_type: string; audio_base64: string };
+
+export type ArchivedRecording = {
+  session_id: string;
+  device_id: string | null;
+  started_at: string;
+  updated_at: string;
+  size_bytes: number;
+  chunks: number;
+  finalized: boolean;
+  alert_id: string | null;
+  alert_reason: string | null;
+  alert_at: string | null;
+  resolution: string | null;
+  resolved_at: string | null;
+  operator_at: string | null;
+  turns: number;
+};
+
+export type ConversationTurn = {
+  id: string;
+  role: "person" | "assistant" | "operator";
+  text: string;
+  at: string;
+  action: string | null;
+};
+
+export type RecordingInfo = {
+  mime_type: string;
+  size_bytes: number;
+  chunks: number;
+  started_at: string;
+  updated_at: string;
+  finalized: boolean;
+};
+
+export type ConversationResponse = {
+  session_id: string;
+  turns: ConversationTurn[];
+  recording: RecordingInfo | null;
+};
+
+export const FALSE_ALARM = "FALSE_ALARM";
 
 export type ApiErrorBody = {
   error: { code: string; message: string; details?: Record<string, unknown> };

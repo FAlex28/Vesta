@@ -157,6 +157,14 @@ class InMemoryAuthorizedLocationStore:
         async with self._lock:
             return copy.deepcopy(self._latest.get(session_id))
 
+    async def forget(self, session_id: str) -> None:
+        """False alarm: the session's positions are deleted, not just hidden."""
+
+        async with self._lock:
+            self._latest.pop(session_id, None)
+            for event_id in [e for e, (_, sid) in self._processed.items() if sid == session_id]:
+                del self._processed[event_id]
+
 
 def _fingerprint(*parts: str) -> str:
     digest = hashlib.sha256()

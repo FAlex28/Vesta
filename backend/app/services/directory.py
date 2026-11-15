@@ -291,6 +291,50 @@ class DeviceDirectory:
             return None
         return self.contact_view(contact["id"])
 
+    # ------------------------------------------------------------------ open access (demo)
+
+    OPEN_PHONE_ID = "ph-open"
+    OPEN_CONTACT_ID = "ct-open"
+
+    def register_open_phone(self, token_id: str, *, now: datetime | None = None) -> dict:
+        """VESTA_OPEN_ACCESS: the person's phone, without any pairing code."""
+
+        instant = _iso(_now(now))
+        phone = self._state["phones"].get(self.OPEN_PHONE_ID)
+        if phone is None:
+            phone = self._state["phones"][self.OPEN_PHONE_ID] = {
+                "id": self.OPEN_PHONE_ID,
+                "label": "Telefonul persoanei",
+                "created_at": instant,
+                "last_seen_at": instant,
+                "revoked_at": None,
+            }
+        phone["revoked_at"] = None
+        phone["last_seen_at"] = instant
+        self._state["grants"][token_id] = {"kind": "phone", "owner": self.OPEN_PHONE_ID}
+        self._save()
+        return copy.deepcopy(phone)
+
+    def register_open_contact(self, token_id: str, *, now: datetime | None = None) -> dict:
+        """VESTA_OPEN_ACCESS: the trusted contact's page, without any invitation code."""
+
+        instant = _iso(_now(now))
+        contact = self._state["contacts"].get(self.OPEN_CONTACT_ID)
+        if contact is None:
+            contact = self._state["contacts"][self.OPEN_CONTACT_ID] = {
+                "id": self.OPEN_CONTACT_ID,
+                "name": "Persoana de încredere",
+                "phone": "",
+                "created_at": instant,
+                "accepted_at": instant,
+                "revoked_at": None,
+                "subscriptions": {},
+            }
+        contact["revoked_at"] = None
+        self._state["grants"][token_id] = {"kind": "contact", "owner": self.OPEN_CONTACT_ID}
+        self._save()
+        return self.contact_view(self.OPEN_CONTACT_ID)
+
     # ------------------------------------------------------------------ push
 
     def add_subscription(self, contact_id: str, subscription: dict, *, now: datetime | None = None) -> None:

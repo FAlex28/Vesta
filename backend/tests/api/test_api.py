@@ -81,6 +81,40 @@ def test_health_and_empty_status(client: TestClient) -> None:
     assert payload["sessions"] == []
 
 
+def test_camera_status_is_explicitly_unconfigured_by_default(client: TestClient) -> None:
+    response = client.get("/api/v1/cameras/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "configured": False,
+        "reachable": False,
+        "thermal": {"connected": False, "device": None, "mode": None, "fps": 0, "error": None},
+        "rgb": {"connected": False, "device": None, "mode": None, "fps": 0, "error": None},
+    }
+
+
+def test_camera_routes_are_dashboard_scoped_and_do_not_expose_thermal_stats() -> None:
+    app = create_app(
+        make_settings(
+            dashboard_api_key="test-dashboard-key",
+            camera_base_url="http://127.0.0.1:1",
+            camera_api_key="test-camera-key",
+        )
+    )
+    with TestClient(app) as camera_client:
+        denied = camera_client.get("/api/v1/cameras/status")
+        assert denied.status_code == 401
+
+        headers = {"X-Dashboard-Key": "test-dashboard-key"}
+        unavailable = camera_client.get("/api/v1/cameras/status", headers=headers)
+        assert unavailable.status_code == 200
+        assert unavailable.json()["configured"] is True
+        assert unavailable.json()["reachable"] is False
+
+        missing_camera = camera_client.get("/api/v1/cameras/not-a-camera/stream", headers=headers)
+        assert missing_camera.status_code == 404
+
+
 def test_device_key_is_required_when_configured(client: TestClient) -> None:
     payload = {
         "event_id": "activate-unauthorized",
@@ -520,6 +554,8 @@ def test_openapi_does_not_contain_permanent_secrets(client: TestClient) -> None:
     assert set(response.json()["paths"]) == {
         "/health",
         "/api/v1/status",
+        "/api/v1/cameras/status",
+        "/api/v1/cameras/{camera}/stream",
         "/api/v1/device/events",
         "/api/v1/sessions/{session_id}/checkins",
         "/api/v1/sessions/{session_id}/checkins/{checkin_id}/delivery",
@@ -546,6 +582,17 @@ def test_openapi_does_not_contain_permanent_secrets(client: TestClient) -> None:
         "/api/v1/contact/push/key",
         "/api/v1/contact/push/subscribe",
         "/api/v1/contact/push/unsubscribe",
+        "/api/v1/access/open",
+        "/api/v1/simulator/press",
+        "/api/v1/recordings",
+        "/api/v1/sessions/{session_id}/takeover",
+        "/api/v1/sessions/{session_id}/operator/messages",
+        "/api/v1/device/location",
+        "/api/v1/sessions/{session_id}/assistant/prompt",
+        "/api/v1/sessions/{session_id}/assistant/reply",
+        "/api/v1/sessions/{session_id}/recording/chunks",
+        "/api/v1/sessions/{session_id}/recording",
+        "/api/v1/sessions/{session_id}/conversation",
     }
 
 

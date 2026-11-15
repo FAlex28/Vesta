@@ -1,7 +1,9 @@
-import { expect, test, type Page } from "playwright/test";
+import { expect, test } from "playwright/test";
 import { CONTACT_TOKEN, makeSession, MockBackend, SESSION_ID } from "./mockBackend";
 
-const alertOf = (status: "ACTIVE" | "RESOLVED") => {
+/* The trusted contact (v5): no invitation code, dashboard-like screen, live location in an alert. */
+
+const alertOf = (status: "ACTIVE" | "RESOLVED", resolution: string | null = null) => {
   const now = new Date().toISOString();
   return {
     id: "alert-9",
@@ -11,82 +13,65 @@ const alertOf = (status: "ACTIVE" | "RESOLVED") => {
     updated_at: now,
     notification_requested_at: now,
     resolved_at: status === "RESOLVED" ? now : null,
-    resolution_action: status === "RESOLVED" ? "USER_CONFIRMED_SAFE" : null,
+    resolution_action: status === "RESOLVED" ? resolution ?? "USER_CONFIRMED_SAFE" : null,
     version: 1,
     viewed_at: null,
   };
 };
 
-async function openWithCode(page: Page, backend: MockBackend) {
-  await backend.install();
-  await page.goto("/contact");
-  await page.getByLabel("Codul din SMS").fill(backend.inviteContact());
-  await page.getByRole("button", { name: "Deschide alertele" }).click();
-}
-
 test.describe("trusted contact", () => {
-  test("without a valid code nothing is shown; a phone code is refused", async ({ page }) => {
+  test("opens without any code and shows the calm state", async ({ page }) => {
     const backend = new MockBackend(page);
-    backend.sessions = [makeSession({ state: "ALERT", alert_reason: "SOS_EXPLICIT", alert: alertOf("ACTIVE") })];
     await backend.install();
     await page.goto("/contact");
-    await expect(page.getByTestId("contact-state")).toHaveCount(0);
-    await page.getByLabel("Codul din SMS").fill("WRONG234");
-    await page.getByRole("button", { name: "Deschide alertele" }).click();
-    await expect(page.getByTestId("contact-problem")).toContainText("nu este validă");
-    // The device code printed for the phone is not a contact invite.
-    await page.getByLabel("Codul din SMS").fill(backend.deviceCode);
-    await page.getByRole("button", { name: "Deschide alertele" }).click();
-    await expect(page.getByTestId("contact-problem")).toContainText("nu este validă");
-    expect(backend.calls("/api/v1/contact/status")).toHaveLength(0);
+    await expect(page.getByTestId("contact-state")).toContainText("Nicio alertă activă");
+    expect(backend.calls("/api/v1/access/open")[0].body).toEqual({ scope: "contact" });
+    expect(backend.calls("/api/v1/contact/status").every((call) => call.auth === `Bearer ${CONTACT_TOKEN}`)).toBe(true);
+    await expect(page.getByLabel("Codul din SMS")).toHaveCount(0);
+    await expect(page.getByTestId("call-112")).toHaveCount(0);
   });
 
-  test("the SMS link opens the alerts directly, once, and offers notifications", async ({ page }) => {
+  test("active alert: live location from the device GPS, 112, marked as viewed once", async ({ page }) => {
     const backend = new MockBackend(page);
     backend.ownerName = "Ana";
-    const code = backend.inviteContact();
+    backend.sessions = [makeSession({ state: "ALERT", alert_reason: "SOS_EXPLICIT", alert: alertOf("ACTIVE") })];
+    backend.locations.set(SESSION_ID, { latitude: 45.74891, longitude: 21.20872, captured_at: new Date().toISOString(), accuracy_meters: 5, source: "device_gps" });
     await backend.install();
-    await page.goto(`/contact#cod=${code}`);
-    await expect(page.getByTestId("contact-state")).toHaveText(/Nicio alertă activă/);
+    await page.goto("/contact");
+    await expect(page.getByTestId("contact-state")).toContainText("Alertă activă");
     await expect(page.getByText("Ana", { exact: true })).toBeVisible();
-    expect(page.url()).not.toContain(code);
-    await expect(page.getByTestId("push-state")).toBeVisible();
-    // The same link does not work a second time.
-    await page.evaluate(() => window.localStorage.clear());
-    await page.goto("/");
-    await page.goto(`/contact#cod=${code}`);
-    await expect(page.getByTestId("contact-problem")).toContainText("nu este validă");
-  });
-
-  test("active alert with location, marked as viewed once; resolved alert keeps no location", async ({ page }) => {
-    const backend = new MockBackend(page);
-    const session = makeSession({ state: "ALERT", alert_reason: "MISSED_CHECK_INS", alert: alertOf("ACTIVE") });
-    backend.sessions = [session];
-    backend.locations.set(SESSION_ID, { latitude: 45.761234, longitude: 21.229876, captured_at: new Date().toISOString(), accuracy_meters: 15 });
-    await openWithCode(page, backend);
-
-    await expect(page.getByTestId("contact-state")).toHaveText(/Alertă activă/);
-    await expect(page.getByTestId("alert-row")).toContainText("Verificări fără răspuns");
-    await expect(page.getByTestId("contact-coordinates")).toHaveText("45.76123, 21.22988");
+    await expect(page.getByTestId("contact-coordinates")).toHaveText("45.74891, 21.20872");
     await expect(page.getByTestId("contact-location-status")).toHaveText("CURRENT");
-    await expect.poll(() => backend.calls(/\/contact\/alerts\/alert-9\/viewed$/).length).toBe(1);
-    expect(backend.calls("/api/v1/contact/status").every((call) => call.auth === `Bearer ${CONTACT_TOKEN}`)).toBe(true);
-    expect(page.url()).not.toContain(CONTACT_TOKEN);
+    await expect(page.getByTestId("call-112")).toHaveAttribute("href", "tel:112");
+    await expect.poll(() => backend.calls(/\/viewed$/).length).toBe(1);
 
-    session.state = "CANCELLED";
-    session.alert = { ...alertOf("RESOLVED"), viewed_at: session.alert!.viewed_at };
-    await expect(page.getByTestId("contact-state")).toHaveText(/Nicio alertă activă/, { timeout: 10_000 });
-    await expect(page.getByTestId("alert-row")).toContainText("RESOLVED");
+    // The position moves: the page follows it.
+    backend.locations.set(SESSION_ID, { latitude: 45.75, longitude: 21.21, captured_at: new Date().toISOString(), accuracy_meters: 5, source: "device_gps" });
+    await expect(page.getByTestId("contact-coordinates")).toHaveText("45.75000, 21.21000", { timeout: 6000 });
+
+    // Resolved: history only, no location.
+    backend.sessions[0].alert = alertOf("RESOLVED");
+    backend.sessions[0].state = "CANCELLED";
+    await expect(page.getByTestId("contact-state")).toContainText("Nicio alertă activă", { timeout: 8000 });
     await expect(page.getByTestId("contact-coordinates")).toHaveCount(0);
-    expect(backend.calls(/\/viewed$/)).toHaveLength(1);
   });
 
-  test("an alert without an authorized location is still shown", async ({ page }) => {
+  test("an alert without a location is still shown", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.sessions = [makeSession({ state: "ALERT", alert_reason: "MISSED_CHECK_INS", alert: alertOf("ACTIVE") })];
+    await backend.install();
+    await page.goto("/contact");
+    await expect(page.getByTestId("contact-state")).toContainText("Alertă activă");
+    await expect(page.getByTestId("contact-location-status")).toHaveText("UNAVAILABLE");
+    await expect(page.getByText("Telefonul ei nu a trimis încă locația")).toBeVisible();
+  });
+
+  test("marks a location with low accuracy as imprecise", async ({ page }) => {
     const backend = new MockBackend(page);
     backend.sessions = [makeSession({ state: "ALERT", alert_reason: "SOS_EXPLICIT", alert: alertOf("ACTIVE") })];
-    await openWithCode(page, backend);
-    await expect(page.getByTestId("contact-state")).toHaveText(/Alertă activă/);
-    await expect(page.getByTestId("contact-location-status")).toHaveText("UNAVAILABLE");
-    await expect(page.getByText("Alerta este valabilă și fără locație.")).toBeVisible();
+    backend.locations.set(SESSION_ID, { latitude: 45.74891, longitude: 21.20872, captured_at: new Date().toISOString(), accuracy_meters: 2000, source: "device_gps" });
+    await backend.install();
+    await page.goto("/contact");
+    await expect(page.getByTestId("contact-location-imprecise")).toContainText("Poziție imprecisă (± 2000 m).");
   });
 });

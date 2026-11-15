@@ -15,6 +15,13 @@ import type {
   ClientStatusUpdate,
   SystemStatus,
   VoiceAccessResponse,
+  CamerasStatus,
+  AssistantLine,
+  AssistantReply,
+  AssistantSpeech,
+  ConversationResponse,
+  ArchivedRecording,
+  OperatorMessage,
 } from "./contract";
 
 /*
@@ -68,10 +75,13 @@ function kindForStatus(status: number): ApiFailureKind {
   return "server";
 }
 
-async function request<T>(path: string, init: RequestInit & { token?: string; dashboardKey?: string } = {}): Promise<T> {
-  const { token, dashboardKey, headers, ...rest } = init;
+async function request<T>(
+  path: string,
+  init: RequestInit & { token?: string; dashboardKey?: string; timeoutMs?: number } = {},
+): Promise<T> {
+  const { token, dashboardKey, headers, timeoutMs, ...rest } = init;
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs ?? REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {
@@ -80,7 +90,7 @@ async function request<T>(path: string, init: RequestInit & { token?: string; da
       cache: "no-store",
       headers: {
         Accept: "application/json",
-        ...(rest.body ? { "Content-Type": "application/json" } : {}),
+        ...(typeof rest.body === "string" ? { "Content-Type": "application/json" } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(dashboardKey ? { "X-Dashboard-Key": dashboardKey } : {}),
         ...headers,
@@ -124,6 +134,9 @@ const sessionPath = (sessionId: string, action: string) =>
 
 export const api = {
   status: (dashboardKey?: string) => request<SystemStatus>("/api/v1/status", { dashboardKey }),
+
+  camerasStatus: (dashboardKey?: string) =>
+    request<CamerasStatus>("/api/v1/cameras/status", { dashboardKey }),
 
   session: (sessionId: string, token: string) =>
     request<import("./contract").SessionView>(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, { token }),
@@ -224,6 +237,68 @@ export const api = {
 
   contactViewed: (alertId: string, accessToken: string) =>
     request<AlertView>(`/api/v1/contact/alerts/${encodeURIComponent(alertId)}/viewed`, { method: "POST", token: accessToken }),
+
+  /** VESTA_OPEN_ACCESS (demo): phone or trusted contact without any pairing code. */
+  openAccess: (scope: "companion" | "contact") =>
+    request<AccessGrantResponse>("/api/v1/access/open", { method: "POST", body: JSON.stringify({ scope }) }),
+
+  /** Demo: the /buton page held for 5 s, instead of the joystick on the Pi. */
+  simulatorPress: (eventId: string) =>
+    request<{ outcome: "ACTIVATED" | "DUPLICATE" | "ALREADY_ACTIVE"; session_id: string; state: string }>(
+      "/api/v1/simulator/press",
+      { method: "POST", body: JSON.stringify({ event_id: eventId }) },
+    ),
+
+  /** What Vesta says now (text + optional ElevenLabs audio). The same eventId returns the same line. */
+  assistantPrompt: (sessionId: string, token: string, eventId: string, line: AssistantLine) =>
+    post<AssistantSpeech>(sessionPath(sessionId, "assistant/prompt"), { event_id: eventId, line }, token),
+
+  /** One spoken phrase (WAV, base64): Gemini interprets it, the server applies the intent. */
+  assistantReply: (sessionId: string, token: string, eventId: string, audioBase64: string) =>
+    request<AssistantReply>(sessionPath(sessionId, "assistant/reply"), {
+      method: "POST",
+      body: JSON.stringify({ event_id: eventId, audio_base64: audioBase64, mime_type: "audio/wav" }),
+      token,
+      timeoutMs: 25_000,
+    }),
+
+  /** Chunk `seq` of the continuous conversation recording (audio/webm). */
+  recordingChunk: (sessionId: string, token: string, seq: number, chunk: Blob) =>
+    request<{ chunks: number; size_bytes: number }>(`${sessionPath(sessionId, "recording/chunks")}?seq=${seq}`, {
+      method: "POST",
+      body: chunk,
+      token,
+      headers: { "Content-Type": chunk.type || "audio/webm" },
+      timeoutMs: 20_000,
+    }),
+
+  /** Dispatcher: every alert's recording kept in the database. */
+  recordingsArchive: (dashboardKey?: string) => request<ArchivedRecording[]>("/api/v1/recordings", { dashboardKey }),
+
+  /** Dispatcher takes the call: the assistant in her earbuds stops. */
+  takeover: (sessionId: string, dashboardKey?: string) =>
+    request<{ session_id: string; operator_connected_at: string }>(sessionPath(sessionId, "takeover"), { method: "POST", dashboardKey }),
+
+  /** Dispatcher's recorded phrase (push to talk), played in her earbuds. */
+  sendOperatorMessage: (sessionId: string, audio: Blob, dashboardKey?: string) =>
+    request<{ id: string; at: string }>(sessionPath(sessionId, "operator/messages"), {
+      method: "POST",
+      body: audio,
+      dashboardKey,
+      headers: { "Content-Type": audio.type || "audio/webm" },
+      timeoutMs: 20_000,
+    }),
+
+  /** Her phone fetches the dispatcher's phrases. */
+  operatorMessages: (sessionId: string, token: string, after: string | null) =>
+    request<OperatorMessage[]>(
+      `${sessionPath(sessionId, "operator/messages")}${after ? `?after=${encodeURIComponent(after)}` : ""}`,
+      { token },
+    ),
+
+  /** Dispatcher: transcript and recording info, only once an alert exists. */
+  conversation: (sessionId: string, dashboardKey?: string) =>
+    request<ConversationResponse>(sessionPath(sessionId, "conversation"), { dashboardKey }),
 
   voiceAccess: (sessionId: string, token: string) =>
     post<VoiceAccessResponse>(sessionPath(sessionId, "voice/access"), { transport: "webrtc" }, token),

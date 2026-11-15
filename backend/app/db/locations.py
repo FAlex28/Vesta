@@ -44,6 +44,7 @@ class LocationsRepo:
         accuracy_m: float | None = None,
         occurred_at: datetime | None = None,
         simulated: bool = False,
+        source: str | None = None,
     ) -> dict:
         try:
             lat, lon = float(lat), float(lon)
@@ -73,7 +74,7 @@ class LocationsRepo:
                     lat,
                     lon,
                     accuracy_m,
-                    "DEMO" if simulated else "COMPANION_GPS",
+                    "DEMO" if simulated else (source or "COMPANION_GPS"),
                     simulated,
                 ),
             )
@@ -88,6 +89,14 @@ class LocationsRepo:
             )
             now = at or tx.one("SELECT now() AS n")["n"]
         return location_status(row, now, self._s)
+
+    def delete_for_session(self, session_id) -> int:
+        """Alarmă falsă: pozițiile sesiunii se șterg, nu doar se ascund."""
+        with self._pool.autocommit() as tx:
+            rows = tx.all(
+                "DELETE FROM locations WHERE session_id = %s RETURNING 1", (as_uuid(session_id),)
+            )
+        return len(rows)
 
     def set_retention(self, days: float) -> None:
         with self._pool.autocommit() as tx:

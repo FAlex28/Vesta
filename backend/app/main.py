@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.api.routes import router
+from app.api.routes import purge_session_media, router
 from app.config import Settings
 from app.container import AppServices, build_services
 from app.errors import AppError
@@ -49,6 +49,77 @@ async def _watch_power(services: AppServices, stop_event: asyncio.Event) -> None
             await asyncio.wait_for(
                 stop_event.wait(), timeout=services.settings.power_poll_seconds
             )
+
+
+RECORDING_TAIL_SECONDS = 5.0
+
+
+async def _annotate_recording(services: AppServices, event) -> None:
+    """Alert facts stored next to the recording: the archive stays complete after restarts."""
+
+    store = services.recordings
+    if store is None:
+        return
+    if event.type == "alert.notification_requested":
+        session = await services.sessions.get(event.session_id)
+        await store.annotate(
+            event.session_id,
+            device_id=event.device_id,
+            alert_id=event.data.get("alert_id"),
+            alert_reason=session.alert_reason.value if session.alert_reason else None,
+            alert_at=event.occurred_at,
+        )
+    elif event.type == "alert.resolved":
+        await store.annotate(
+            event.session_id,
+            resolution=event.data.get("resolution_action"),
+            resolved_at=event.occurred_at,
+        )
+
+
+async def _media_janitor(services: AppServices, stop_event: asyncio.Event) -> None:
+    """A finished session closes its recording; a false alarm deletes voice, transcript and GPS."""
+
+    pending: set[asyncio.Task[None]] = set()
+
+    async def finalize_later(session_id: str) -> None:
+        # The phone's last chunks are still on their way when the session ends.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=RECORDING_TAIL_SECONDS)
+        if services.recordings is not None:
+            await services.recordings.finalize(session_id)
+
+    async with services.broker.subscribe() as queue:
+        while not stop_event.is_set():
+            getter = asyncio.create_task(queue.get())
+            stopper = asyncio.create_task(stop_event.wait())
+            done, _ = await asyncio.wait({getter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            for task in (getter, stopper):
+                if not task.done():
+                    task.cancel()
+            if getter not in done:
+                break
+            event = getter.result()
+            if not event.session_id:
+                continue
+            try:
+                await _annotate_recording(services, event)
+            except Exception:
+                LOGGER.exception("recording annotation failed for %s", event.session_id)
+            if event.type not in {"session.cancelled", "safety.alert_resolved"}:
+                continue
+            services.takeovers.pop(event.session_id, None)
+            try:
+                if event.data.get("reason") == "FALSE_ALARM":
+                    await purge_session_media(services, event.session_id)
+                else:
+                    task = asyncio.create_task(finalize_later(event.session_id))
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
+            except Exception:
+                LOGGER.exception("session media cleanup failed for %s", event.session_id)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _push_notifier(services: AppServices):
@@ -108,6 +179,7 @@ def create_app(
         hardware_task: asyncio.Task[None] | None = None
         power_task: asyncio.Task[None] | None = None
         push_task: asyncio.Task[None] | None = None
+        media_task: asyncio.Task[None] | None = None
         try:
             await resolved_services.sessions.recover_unfinished()
             if resolved_services.hardware_monitor is not None:
@@ -123,6 +195,9 @@ def create_app(
             push_task = asyncio.create_task(
                 _push_notifier(resolved_services).run(resolved_services.broker, stop_event),
                 name="vesta-push",
+            )
+            media_task = asyncio.create_task(
+                _media_janitor(resolved_services, stop_event), name="vesta-session-media"
             )
             if resolved_settings.environment in {"development", "test"} and not resolved_settings.device_pairing_code:
                 code = resolved_services.directory.device_code(None)
@@ -146,7 +221,9 @@ def create_app(
             if resolved_services.hardware_monitor is not None:
                 resolved_services.hardware_monitor.stop()
             tasks = [
-                task for task in (scheduler, hardware_task, power_task, push_task) if task is not None
+                task
+                for task in (scheduler, hardware_task, power_task, push_task, media_task)
+                if task is not None
             ]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)

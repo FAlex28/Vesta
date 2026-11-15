@@ -11,7 +11,9 @@ backend  --WebSocket /ws/events-->  bridge  --GET /api/v1/status-->  stare
 ```
 
 Evenimentele WebSocket doar declanșează o recitire a `/api/v1/status`; starea afișată vine
-mereu din status (plus o recitire la 5 s). Bridge-ul trimite `PING` la 3 s.
+mereu din status (plus o recitire la 5 s). Bridge-ul trimite `PING` la 3 s, chiar și când
+backendul nu răspunde, așa că placa nu ajunge la eroarea `CONEXIUNE PC` cât timp bridge-ul
+rulează. La oprire (Ctrl+C) trimite `BYE`.
 
 ## Instalare
 
@@ -23,9 +25,21 @@ python -m pip install -r requirements.txt
 ```
 
 Încarcă întâi `vesta_dispatcher.ino` pe placă din Arduino IDE (biblioteca
-*LiquidCrystal I2C*, placa *Arduino Nano*; la clone CH340 poate fi nevoie de
-*ATmega328P (Old Bootloader)*). **Închide Serial Monitor** înainte să pornești bridge-ul:
+*LiquidCrystal I2C* de Frank de Brabander, placa *Arduino Nano*). Placa Vesta (clonă CH340)
+cere **Processor: ATmega328P (Old Bootloader)**; cu varianta nouă uploadul dă
+`not in sync: resp=0x00`. **Închide Serial Monitor** înainte să pornești bridge-ul:
 portul poate fi deschis de un singur program.
+
+## Pornire rapidă pe Windows
+
+```powershell
+cd hardware\arduino_nano\bridge
+powershell -ExecutionPolicy Bypass -File .\start-bridge.ps1 -Port COM7
+```
+
+La prima rulare creează `.venv` și instalează dependențele. Pornește `bridge` cu
+`--keep-running`: după o eroare neprevăzută se repornește singur în 3 s, deci placa primește
+`PING` în continuu. Ctrl+C trimite `BYE`, iar placa rămâne liniștită în „Astept PC”.
 
 ## Testare, pas cu pas
 
@@ -77,7 +91,7 @@ sau `VESTA_BACKEND_URL` (implicit `http://127.0.0.1:8000`). Doar sesiunile dispo
 | alertă `ACTIVE` | `ALERT_RAISED\|<alert_id>\|<motiv>` (roșu + D7) |
 | alerta devine `RESOLVED` | `ALERT_RESOLVED\|<alert_id>` |
 | problemă tehnică a sesiunii (rețea, microfon, audio, voce, alimentare, repornire) sau alimentarea Pi-ului | `TECHNICAL_ERROR\|<cod>` (albastru + D8) |
-| backend inaccesibil | `TECHNICAL_ERROR\|SERVER OFFLINE` |
+| backend inaccesibil mai mult de 15 s | `TECHNICAL_ERROR\|SERVER OFFLINE` |
 
 GPS-ul și pagina ascunsă nu aprind LED-ul albastru: nu sunt defecte ale lanțului de siguranță.
 
@@ -87,6 +101,7 @@ Reguli de siguranță:
   doar când backendul raportează alerta `RESOLVED`. Dacă alerta dispare fără să fi fost
   închisă (de exemplu backendul a repornit fără persistență), alarma continuă și bridge-ul
   afișează în consolă comanda de oprire manuală.
-- **Backend căzut:** placa păstrează ultima stare, iar alerta continuă să sune.
+- **Backend căzut:** placa păstrează ultima stare, iar alerta continuă să sune. Un restart
+  scurt al backendului (sub 15 s) nu aprinde eroarea.
 - **Resincronizare:** la `BOOT` (placa s-a resetat) sau la reconectarea USB, starea completă
   se retrimite.

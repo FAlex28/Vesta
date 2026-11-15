@@ -116,7 +116,7 @@ test.describe("dashboard", () => {
     backend.sessions = [makeSession()];
     await backend.install();
     await page.goto("/");
-    await expect(page.getByText("Punct de referință simulat, nu este locația unei persoane")).toBeVisible();
+    await expect(page.getByText("Locația apare la declanșarea unei alerte")).toBeVisible();
     await expect(page.getByTestId("signal-gps")).toContainText("Indisponibil");
     // Read-only: no session controls on the dashboard.
     await expect(page.getByRole("button", { name: /SOS|Sunt bine|Anulează|Pornește/ })).toHaveCount(0);
@@ -141,15 +141,15 @@ test.describe("dashboard", () => {
       });
     }
     await expect(page.getByTestId("signal-gps")).toContainText("Disponibil");
-    await expect(page.getByTestId("signal-voice")).toContainText("Audio conectat");
+    await expect(page.getByTestId("signal-voice")).toContainText("Activ");
     backend.publish("client.status_changed", {
       page_visibility: "HIDDEN", connectivity_status: "CONNECTED", audio_status: "CONNECTED", gps_status: "GPS_STALE",
       power_status: "POWER_STATUS_UNKNOWN", health_status: "DEGRADED", state: "ACTIVE", version: 9, source: "android",
     });
     await expect(page.getByTestId("signal-gps")).toContainText("Poziție veche");
-    await expect(page.getByTestId("signal-phone")).toContainText("pagină în fundal");
-    // Routine heartbeats are applied but not logged; the explicit change is.
-    await expect(page.getByTestId("log-row")).toHaveCount(1);
+    await expect(page.getByTestId("signal-phone")).toContainText("ecran în fundal");
+    // Phone status changes update the signals; the plain-language journal does not list them.
+    await expect(page.getByTestId("log-row")).toHaveCount(0);
     await page.waitForTimeout(600);
     expect(backend.calls("/api/v1/status").length).toBe(statusCalls);
   });
@@ -159,9 +159,9 @@ test.describe("dashboard", () => {
     backend.sessions = [makeSession()];
     await backend.install();
     await page.goto("/");
-    await expect(page.getByTestId("signal-power")).toContainText("Neraportată");
+    await expect(page.getByTestId("signal-power")).toContainText("Necunoscută");
     backend.publish("technical.power", { state: "POWER_UNSTABLE", detail: "undervoltage flag" }, null);
-    await expect(page.getByTestId("signal-power")).toContainText("POWER_UNSTABLE");
+    await expect(page.getByTestId("signal-power")).toContainText("Instabilă");
     await expect(page.getByTestId("signal-power")).not.toContainText("%");
   });
 
@@ -182,8 +182,8 @@ test.describe("dashboard", () => {
       alert_id: "alert-7", incident_type: "MISSED_CHECK_INS", gps_status: "GPS_STALE", location_available: true,
       location: { latitude: 45.761234, longitude: 21.229876, captured_at: now, age_seconds: 60, is_stale: true, accuracy_meters: 18, source: "android" },
     });
-    await expect(page.getByTestId("alert-row")).toContainText("Verificări fără răspuns");
-    await expect(page.getByTestId("alert-location")).toContainText("Atașată alertei");
+    await expect(page.getByTestId("alert-row")).toContainText("Nu a răspuns");
+    await expect(page.getByTestId("alert-location")).toContainText("Locație primită");
     await expect(page.getByTestId("alert-location")).toContainText("veche");
     await expect(page.getByText(/45\.7612|21\.2298/)).toHaveCount(0);
   });
@@ -193,7 +193,7 @@ test.describe("dashboard", () => {
     const now = new Date().toISOString();
     const session = makeSession();
     backend.sessions = [session];
-    backend.locations.set(SESSION_ID, { latitude: 45.761234, longitude: 21.229876, captured_at: now, accuracy_meters: 15 });
+    backend.locations.set(SESSION_ID, { latitude: 45.761234, longitude: 21.229876, captured_at: now, accuracy_meters: 2000 });
     await backend.install();
     await page.goto("/");
     await expect(page.getByTestId("session-title")).toHaveAttribute("data-state", "ACTIVE");
@@ -206,17 +206,127 @@ test.describe("dashboard", () => {
     session.alert = { id: "alert-5", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 };
     backend.publish("safety.alerted", { from_state: "ACTIVE", state: "ALERT", reason: "SOS_EXPLICIT" });
     await expect(page.getByTestId("dashboard-location-real")).toContainText("45.76123, 21.22988");
-    await expect(page.getByText("Locație reală · alertă activă")).toBeVisible();
+    await expect(page.getByTestId("dashboard-location-imprecise")).toContainText("Poziție imprecisă (± 2000 m).");
+    await expect(page.getByText("Locația persoanei · în direct")).toBeVisible();
 
     // Presentation mode hides the coordinates on a projected screen.
     await page.getByTestId("presentation-toggle").click();
     await expect(page.getByTestId("dashboard-location-real")).toHaveCount(0);
-    await expect(page.getByTestId("alert-location")).toHaveText("Ascunsă în modul prezentare");
+    await expect(page.getByTestId("alert-location")).toHaveText("Coordonatele sunt ascunse în modul prezentare.");
     await page.getByTestId("presentation-toggle").click();
 
     session.state = "CANCELLED";
     session.alert = { ...session.alert, status: "RESOLVED", resolved_at: now, resolution_action: "USER_CONFIRMED_SAFE" };
     backend.publish("safety.alert_resolved", { from_state: "ALERT", state: "CANCELLED", alert_id: "alert-5" });
     await expect(page.getByTestId("dashboard-location-real")).toHaveCount(0);
+  });
+  test("dispatcher can take over a live session before an alert", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.sessions = [makeSession()];
+    await backend.install();
+    await page.goto("/");
+    await expect(page.getByTestId("live-call")).toContainText("Sesiune în curs");
+    await page.getByTestId("take-call").click();
+    await expect(page.getByTestId("live-call")).toContainText("Apel preluat");
+    await expect(page.getByTestId("ptt-button")).toBeVisible();
+    expect(backend.calls(/\/takeover$/)).toHaveLength(1);
+    backend.addTurn(SESSION_ID, "operator", "Mesaj vocal — transcriere indisponibilă.");
+    await expect(page.getByTestId("call-transcript")).toContainText("Dispecer");
+    await expect(page.getByTestId("call-transcript").locator("time")).toHaveCount(1);
+  });
+
+  test("an alert arrives as an emergency call: ringing, transcript, location from the device GPS", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.sessions = [makeSession()];
+    await backend.install();
+    await page.goto("/");
+    await expect(page.getByTestId("session-title")).toHaveAttribute("data-state", "ACTIVE");
+    await expect(page.getByTestId("live-call")).toContainText("Sesiune în curs");
+    const session = backend.session()!;
+    const now = new Date().toISOString();
+    session.alert_reason = "SOS_EXPLICIT";
+    session.alert = { id: "alert-7", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 };
+    backend.locations.set(SESSION_ID, { latitude: 45.74891, longitude: 21.20872, captured_at: now, accuracy_meters: 4, source: "device_gps" });
+    backend.addTurn(SESSION_ID, "assistant", "Bună, sunt Vesta. A fost o apăsare din greșeală?");
+    backend.addTurn(SESSION_ID, "person", "Nu, am nevoie de ajutor!", "ESCALATE");
+    backend.transition(session, "ALERT", "safety.alerted", { reason: "SOS_EXPLICIT", source: "voice_agent" });
+
+    await expect(page.getByTestId("live-call")).toContainText("Apel de urgență");
+    await expect(page.getByTestId("call-transcript")).toContainText("Nu, am nevoie de ajutor!");
+    await expect(page.getByTestId("call-transcript")).toContainText("Vesta");
+    await expect(page.getByTestId("call-transcript")).toContainText("Persoana");
+    await expect(page.getByTestId("call-transcript").locator("time")).toHaveCount(2);
+    await expect(page.getByTestId("location-source")).toHaveText("GPS dispozitiv");
+    await page.getByTestId("take-call").click();
+    await expect(page.getByTestId("take-call")).toHaveCount(0);
+    await expect(page.getByTestId("live-call")).toContainText("Apel preluat");
+    await expect(page.getByTestId("ptt-button")).toBeVisible();
+    expect(backend.calls(/\/takeover$/)).toHaveLength(1);
+    await expect(page.getByTestId("call-audio-status")).toHaveAttribute("data-status", /unavailable|connecting|error/);
+
+    // Presentation mode hides the transcript as well as the coordinates.
+    await page.getByTestId("presentation-toggle").click();
+    await expect(page.getByTestId("call-transcript")).toContainText("Ascunsă în modul prezentare");
+    await expect(page.getByTestId("call-transcript")).not.toContainText("am nevoie de ajutor");
+  });
+
+  test("a false alarm leaves no call, no transcript and no location", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.sessions = [makeSession({ state: "CANCELLED", cancellation_reason: "FALSE_ALARM" })];
+    await backend.install();
+    await page.goto("/");
+    await expect(page.getByTestId("false-alarm-notice")).toContainText("Alarmă falsă");
+    await expect(page.getByTestId("live-call")).toHaveCount(0);
+    expect(backend.calls(/\/conversation$/)).toHaveLength(0);
+  });
+
+  test("the journal speaks plainly: what happened, not technical states", async ({ page }) => {
+    const backend = new MockBackend(page);
+    backend.sessions = [makeSession()];
+    await backend.install();
+    await page.goto("/");
+    await expect(page.getByTestId("session-title")).toHaveAttribute("data-state", "ACTIVE");
+    const session = backend.session()!;
+    backend.publish("safety.check_in_requested", { from_state: "ACTIVE", state: "CHECK_IN", attempt: 1 }, session.id);
+    backend.publish("location.updated", { alert_id: "a" }, session.id);
+    backend.publish("conversation.updated", { role: "assistant", action: null }, session.id);
+    backend.publish("conversation.updated", { role: "person", action: "ESCALATE" }, session.id);
+    backend.publish("safety.alerted", { from_state: "CHECK_IN", state: "ALERT", reason: "SOS_EXPLICIT", source: "voice_agent" }, session.id);
+    const log = page.locator("#events");
+    await expect(log).toContainText("ALERTĂ: a cerut ajutor vocal");
+    await expect(log).toContainText("Ea i-a răspuns lui Vesta");
+    await expect(log).toContainText("Vesta o întreabă dacă e bine");
+    await expect(log).not.toContainText("conversation.updated");
+    await expect(log).not.toContainText("CHECK_IN →");
+    await expect(page.getByTestId("log-row")).toHaveCount(3);
+  });
+
+  test("recordings of past alerts are listed with their transcript", async ({ page }) => {
+    const backend = new MockBackend(page);
+    const now = new Date().toISOString();
+    backend.sessions = [
+      makeSession({
+        state: "CANCELLED",
+        alert_reason: "MISSED_CHECK_INS",
+        alert: { id: "alert-old", incident_type: "MISSED_CHECK_INS", status: "RESOLVED", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: now, resolution_action: "USER_CONFIRMED_SAFE", version: 2 },
+      }),
+    ];
+    backend.chunks.set(SESSION_ID, [0, 1, 2]);
+    backend.turns.set(SESSION_ID, [
+      { id: "t1", role: "assistant", text: "Ești bine?", at: now, action: null },
+      { id: "t2", role: "person", text: "Da.", at: now, action: null },
+      { id: "t3", role: "operator", text: "Mesaj vocal — transcriere indisponibilă.", at: now, action: null },
+    ]);
+    await backend.install();
+    await page.goto("/");
+    const row = page.getByTestId("rec-row");
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText("Nu a răspuns");
+    await row.getByRole("button", { name: /Transcriere/ }).click();
+    await expect(row).toContainText("Ești bine?");
+    await expect(row).toContainText("Vesta");
+    await expect(row).toContainText("Persoana");
+    await expect(row).toContainText("Dispecer");
+    await expect(row.locator("time")).toHaveCount(3);
   });
 });

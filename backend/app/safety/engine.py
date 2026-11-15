@@ -59,7 +59,9 @@ class SafetyEngine:
         session.state = SessionState.ACTIVE
         session.created_at = session.created_at or now
         session.activated_at = now
-        session.next_check_in_at = now + self.policy.check_in_interval
+        session.next_check_in_at = now + (
+            self.policy.first_check_in_delay or self.policy.check_in_interval
+        )
         session.response_deadline = None
         session.retry_at = None
         session.quick_cancel_until = now + self.policy.quick_cancel_window

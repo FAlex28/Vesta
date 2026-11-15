@@ -123,6 +123,8 @@ class CancellationReason(StrEnum):
     QUICK_CANCEL = "ACCIDENTAL_ACTIVATION"
     SESSION_ENDED = "SESSION_ENDED"
     ALERT_RESOLVED = "ALERT_RESOLVED"
+    # The person told the assistant (or pressed the button) that the activation was a mistake.
+    FALSE_ALARM = "FALSE_ALARM"
 
 
 class AlertReason(StrEnum):
@@ -161,6 +163,8 @@ class SafetyPolicy:
     technical_issue_retry_delay: timedelta = timedelta(seconds=5)
     quick_cancel_window: timedelta = timedelta(seconds=5)
     max_attempts: int = 2
+    # None: the first check-in comes after a full interval (original behaviour).
+    first_check_in_delay: timedelta | None = None
 
     def __post_init__(self) -> None:
         positive_durations = {
@@ -174,6 +178,8 @@ class SafetyPolicy:
                 raise ValueError(f"{name} must be greater than zero")
         if self.quick_cancel_window.total_seconds() < 0:
             raise ValueError("quick_cancel_window must not be negative")
+        if self.first_check_in_delay is not None and self.first_check_in_delay.total_seconds() <= 0:
+            raise ValueError("first_check_in_delay must be greater than zero")
         if self.max_attempts < 2:
             raise ValueError("max_attempts must be at least two so a retry is always allowed")
 
