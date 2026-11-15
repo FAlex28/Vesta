@@ -350,3 +350,48 @@ export const MISSING_CONTRACT = {
   pressProgress: "Evenimente de început/progres pentru apăsarea de 5 secunde",
   externalNotification: "Livrarea notificării în afara paginii contactului (SMS/push)",
 } as const;
+
+/** Live metrics from Tiger Data (continuous aggregates + compression). No coordinates. */
+export type AnalyticsSnapshot =
+  | { enabled: false }
+  | {
+      enabled: true;
+      live: {
+        open_sessions: number;
+        active_alerts: number;
+        notifications_pending: number;
+        phones_connected: number;
+        phones_degraded: number;
+        last_gps_fix_at: string | null;
+        server_time: string;
+      };
+      alert_response: {
+        notifications: number;
+        delivered: number;
+        viewed: number;
+        gave_up: number;
+        p50_delivered_s: number | null;
+        p95_delivered_s: number | null;
+        p50_viewed_s: number | null;
+      };
+      daily: { day: string; event_type: string; events: number; sessions: number }[];
+      device_health: { bucket: string; component: string; event_type: string; events: number; clients: number }[];
+      gps_quality: {
+        bucket: string;
+        source: string;
+        fixes: number;
+        avg_accuracy_m: number | null;
+        worst_accuracy_m: number | null;
+        imprecise_fixes: number;
+        avg_delay_s: number | null;
+      }[];
+      storage: {
+        name: string;
+        chunks: number;
+        total_bytes: number;
+        compressible_chunks: number | null;
+        compressed_chunks: number | null;
+        before_bytes: number | null;
+        after_bytes: number | null;
+      }[];
+    };

@@ -1,5 +1,6 @@
 import { apiBaseUrl } from "./config";
 import type {
+  AnalyticsSnapshot,
   AlertView,
   ApiErrorBody,
   CancelReason,
@@ -273,6 +274,9 @@ export const api = {
       headers: { "Content-Type": chunk.type || "audio/webm" },
       timeoutMs: 20_000,
     }),
+
+  /** Dispatcher: live metrics from Tiger Data (aggregates, response times, compression). */
+  analytics: (dashboardKey?: string) => request<AnalyticsSnapshot>("/api/v1/analytics", { dashboardKey }),
 
   /** Dispatcher: every alert's recording kept in the database. */
   recordingsArchive: (dashboardKey?: string) => request<ArchivedRecording[]>("/api/v1/recordings", { dashboardKey }),

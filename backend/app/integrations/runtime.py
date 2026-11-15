@@ -195,6 +195,9 @@ class TigerPersistence:
     async def conversation_turns(self, session_id: str) -> list[dict]:
         return await asyncio.to_thread(self.db.conversations.for_session, session_id)
 
+    async def analytics(self, *, days: int, hours: int) -> dict:
+        return await asyncio.to_thread(self.db.analytics.snapshot, days=days, hours=hours)
+
     def record_power(self, status: PowerStatus) -> None:
         self._background(
             self.db.events.log_technical_event,

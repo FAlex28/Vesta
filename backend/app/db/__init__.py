@@ -9,6 +9,7 @@ r = db.sessions.activate("owner-1", event_id)
 from __future__ import annotations
 
 from .alerts import AlertsRepo
+from .analytics import AnalyticsRepo
 from .checkins import CheckinsRepo
 from .companions import CompanionsRepo
 from .config import DbSettings
@@ -47,6 +48,7 @@ class Database:
         self.recordings = RecordingsRepo(self.pool, s)
         self.tokens = TokensRepo(self.pool, s)
         self.events = EventsRepo(self.pool)
+        self.analytics = AnalyticsRepo(self.pool, s)
 
     def migrate(self) -> list[str]:
         return _migrate(self.pool)

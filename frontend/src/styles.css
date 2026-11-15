@@ -1045,3 +1045,23 @@ h1, h2, h3, p, dl, dd, ol, ul, figure, blockquote { margin: 0; }
 .loud-toggle input { width: 18px; height: 18px; }
 .chat-line--operator { justify-self: start; background: var(--danger-tint); }
 .chat-line--operator .chat-who { color: var(--danger); }
+
+/* ---- Live analytics (Tiger Data) ---------------------------------------- */
+.an-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.an-tile { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid var(--rule); border-radius: var(--radius-sm); background: var(--surface-2); }
+.an-tile--danger { border-color: var(--danger); background: var(--danger-tint); }
+.an-tile--warn { border-color: var(--warn); background: var(--warn-tint); }
+.an-tile--safe { border-color: var(--safe); background: var(--safe-tint); }
+.an-value { color: var(--ink); font-family: var(--font-num); font-size: 22px; font-weight: 700; line-height: 1.1; }
+.an-label { color: var(--muted); font-size: var(--t-small); line-height: 1.3; }
+.an-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-top: 20px; }
+.an-sub { margin: 0 0 8px; color: var(--ink-2); font-size: var(--t-body); font-weight: 700; }
+.an-sub:not(:first-child) { margin-top: 18px; }
+.an-table { width: 100%; border-collapse: collapse; font-size: var(--t-small); }
+.an-table th, .an-table td { padding: 6px 8px; border-bottom: 1px solid var(--rule-soft); text-align: left; overflow-wrap: anywhere; }
+.an-table thead th { color: var(--muted); font-weight: 600; }
+.an-table tbody th { color: var(--ink); font-weight: 600; }
+.an-table td { color: var(--ink-2); }
+.an-dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin: 0; }
+.an-dl dt { color: var(--muted); font-size: var(--t-small); }
+.an-dl dd { margin: 2px 0 0; color: var(--ink); font-weight: 700; }

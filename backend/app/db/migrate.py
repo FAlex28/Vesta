@@ -66,7 +66,7 @@ if __name__ == "__main__":
     try:
         if "--status" in sys.argv:
             for v, ok in status(p).items():
-                print(f"{'✔' if ok else '·'} {v}")
+                print(f"{'[x]' if ok else '[ ]'} {v}")
         else:
             applied = migrate(p)
             print("Aplicate: " + (", ".join(applied) if applied else "nimic nou"))

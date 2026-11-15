@@ -107,6 +107,13 @@ $gemini = if ($env:GROQ_API_KEY) { "Groq" } elseif ($env:GEMINI_API_KEY) { "Gemi
 $eleven = if ($env:ELEVENLABS_API_KEY) { "da" } else { "NU (vocea telefonului)" }
 Write-Host "Asistent: înțelegere $gemini · voce ElevenLabs $eleven"
 # Tiger Data: cu adresa în ai-keys.env, istoricul, transcrierile și înregistrările merg și în Tiger.
+# Altfel se ia din .env-ul de la rădăcina proiectului (cel descărcat din Tiger Cloud).
+$rootEnv = Join-Path (Split-Path $PSScriptRoot -Parent) ".env"
+if (-not $env:TIMESCALE_SERVICE_URL -and (Test-Path $rootEnv)) {
+    foreach ($line in [System.IO.File]::ReadAllLines($rootEnv)) {
+        if ($line -match '^\s*TIMESCALE_SERVICE_URL\s*=\s*(\S+)\s*$') { $env:TIMESCALE_SERVICE_URL = $Matches[1] }
+    }
+}
 if ($env:TIMESCALE_SERVICE_URL) {
     $env:VESTA_PERSISTENCE = "tiger"
     Write-Host "Baza de date: Tiger Data"

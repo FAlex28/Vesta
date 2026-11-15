@@ -555,6 +555,7 @@ def test_openapi_does_not_contain_permanent_secrets(client: TestClient) -> None:
         "/health",
         "/api/v1/status",
         "/api/v1/cameras/status",
+        "/api/v1/analytics",
         "/api/v1/cameras/{camera}/stream",
         "/api/v1/device/events",
         "/api/v1/sessions/{session_id}/checkins",
@@ -624,3 +625,14 @@ def test_invalid_and_extra_payload_fields_are_rejected(client: TestClient) -> No
         },
     )
     assert wrong_event.status_code == 422
+
+
+def test_analytics_is_dashboard_scoped_and_disabled_without_tiger() -> None:
+    app = create_app(make_settings(dashboard_api_key="test-dashboard-key"))
+    with TestClient(app) as dashboard_client:
+        assert dashboard_client.get("/api/v1/analytics").status_code == 401
+        allowed = dashboard_client.get(
+            "/api/v1/analytics", headers={"X-Dashboard-Key": "test-dashboard-key"}
+        )
+        assert allowed.status_code == 200
+        assert allowed.json() == {"enabled": False}

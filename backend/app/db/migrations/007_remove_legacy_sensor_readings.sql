@@ -22,7 +22,12 @@ BEGIN
             CONTINUE;
         END IF;
 
-        IF object_kind = 'm' THEN
+        -- A TimescaleDB continuous aggregate shows up in pg_class as a plain view ('v'),
+        -- but must be dropped with DROP MATERIALIZED VIEW.
+        IF object_kind = 'm' OR EXISTS (
+            SELECT 1 FROM timescaledb_information.continuous_aggregates
+            WHERE view_schema = schema_name AND view_name = object_name
+        ) THEN
             EXECUTE format('DROP MATERIALIZED VIEW %I.%I', schema_name, object_name);
         ELSIF object_kind = 'v' THEN
             EXECUTE format('DROP VIEW %I.%I', schema_name, object_name);

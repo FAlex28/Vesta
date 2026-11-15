@@ -30,7 +30,22 @@ python -m pytest                                  # unit + integrare (schemă te
 | `access_tokens` | tabel | doar SHA-256 al tokenului; roluri USER / CONTACT / OPERATOR / PUBLIC_DEMO |
 | `ingested_events` | tabel | deduplicare globală după `event_id` |
 | `session_events_daily` | agregat continuu | statistici zilnice pe tip de eveniment |
-| `legacy_*` | — | datele vechi cu senzori ESP32, păstrate neatinse |
+| `technical_events_hourly` | agregat continuu | sănătatea dispozitivelor IoT pe oră (telefon, GPS, alimentare, GPIO, audio) |
+| `gps_quality_5m` | agregat continuu | calitatea senzorului GPS la 5 min (poziții, precizie, întârziere), fără coordonate |
+| `conversation_turns`, `session_recordings`, `recording_chunks`, `operator_messages` | tabele | transcrierea și înregistrările unei alerte |
+| `legacy_*` | — | date vechi ESP32; `legacy_sensor_readings` a fost scos de migrarea 007 |
+
+## Compresie și analize live (migrarea 010)
+
+- Columnstore pe toate cele trei hypertable-uri: `session_events` după 7 zile (segment `event_type`),
+  `technical_events` după 2 zile (segment `component`), `locations` după 1 zi (segment `source`).
+  Măsurat pe 3 zile de evenimente tehnice: 29,2 MB → 2,8 MB (90,4% economisit), interogabile cu SQL simplu.
+- Agregatele continue au `materialized_only = false`: un eveniment nou apare imediat în dashboard.
+- `GET /api/v1/analytics` (cheia dashboard) întoarce: starea live, timpii alertă → contact (p50/p95),
+  statistici zilnice, sănătatea dispozitivelor, calitatea GPS și mărimea/compresia fiecărui hypertable.
+  Panoul „Analize live” din dashboard îl citește la 10 s. Fără `VESTA_PERSISTENCE=tiger` panoul nu apare.
+- `backend/start-lan.ps1` pornește în modul `tiger` dacă `TIMESCALE_SERVICE_URL` e în `.state/ai-keys.env`
+  sau în `.env`-ul de la rădăcină.
 
 ## Garanții oferite de baza de date
 

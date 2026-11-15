@@ -1722,6 +1722,29 @@ def _archived(info) -> ArchivedRecordingView:
     )
 
 
+@router.get("/api/v1/analytics", tags=["analytics"])
+async def live_analytics(
+    request: Request,
+    response: Response,
+    days: Annotated[int, Query(ge=1, le=90)] = 7,
+    hours: Annotated[int, Query(ge=1, le=168)] = 24,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Live metrics from Tiger Data: continuous aggregates, alert response times, compression.
+    Without VESTA_PERSISTENCE=tiger there is no history, so the dashboard hides the panel."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    response.headers["Cache-Control"] = "no-store"
+    if services.persistence is None:
+        return {"enabled": False}
+    try:
+        snapshot = await services.persistence.analytics(days=days, hours=hours)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Tiger Data unavailable") from exc
+    return {"enabled": True, **snapshot}
+
+
 @router.get("/api/v1/recordings", response_model=list[ArchivedRecordingView], tags=["recording"])
 async def recordings_archive(
     request: Request,

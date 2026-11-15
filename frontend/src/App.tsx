@@ -9,6 +9,7 @@ import { CameraFeeds } from "./components/CameraFeeds";
 import { LinkBadge } from "./components/LinkBadge";
 import { LiveCall } from "./components/LiveCall";
 import { LocationHistoryPanel, useLocationHistory } from "./components/LocationHistory";
+import { LiveAnalytics } from "./components/LiveAnalytics";
 import { RecordingsArchive } from "./components/RecordingsArchive";
 import { SectionHead } from "./components/SectionHead";
 import { StateLadder } from "./components/StateLadder";
@@ -423,6 +424,8 @@ function App() {
             {route && <LocationHistoryPanel points={route} live={session?.state === "ALERT"} presentation={presentation} />}
           </div>
         </div>
+
+        <LiveAnalytics dashboardKey={live.dashboardKey} refreshKey={`${session?.id ?? ""}:${session?.state ?? ""}`} />
 
         <RecordingsArchive
           dashboardKey={live.dashboardKey}
