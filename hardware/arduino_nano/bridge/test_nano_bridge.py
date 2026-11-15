@@ -207,3 +207,38 @@ def test_ids_and_reasons_are_sanitized_for_the_board():
     st = status(session("CANCELLED", alert={"id": long_id, "status": "RESOLVED"}))
     commands, _ = plan_commands(shown, *target_of(st))
     assert commands == [f"ALERT_RESOLVED|{'x' * 39}"]
+
+
+# -- legătura cu PC-ul: repaus fără eroare, BYE, toleranța la backend repornit -----------
+
+
+def test_idle_board_waits_for_pc_without_error():
+    nano = SimulatedNano(show_panel=False)
+    assert "Astept PC" in nano.panel() and "ALBASTRU" not in nano.panel()
+    apply(nano, ["PING"])
+    assert "Fara sesiune" in nano.panel()
+
+
+def test_bye_returns_to_waiting_and_clears_technical():
+    nano = SimulatedNano(show_panel=False)
+    replies = apply(nano, ["HELLO", "STATE|ACTIVE", "TECHNICAL_ERROR|SERVER OFFLINE", "BYE"])
+    assert replies[-1] == "OK|BYE"
+    assert nano.safety == "STANDBY" and not nano.technical
+    assert "Astept PC" in nano.panel()
+
+
+def test_bye_never_stops_an_active_alert():
+    nano = SimulatedNano(show_panel=False)
+    apply(nano, ["ALERT_RAISED|a1|SOS_EXPLICIT", "BYE"])
+    assert nano.alert_id == "a1" and "ROSU" in nano.panel()
+
+
+def test_backend_grace_period():
+    import nano_bridge
+
+    bridge = nano_bridge.Bridge(SimulatedNano(show_panel=False), None, device_id=DEVICE,
+                                verbose=False)  # fmt: skip
+    bridge._backend_down()
+    assert bridge.backend_in_grace()
+    bridge.backend_down_since -= nano_bridge.BACKEND_GRACE_S + 1
+    assert not bridge.backend_in_grace()

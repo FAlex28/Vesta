@@ -75,6 +75,10 @@ export type LiveState = {
   alertNotices: Record<string, AlertLocationNotice>;
   systemPower: SystemPower | null;
   voiceMode: SystemStatus["voice_mode"] | null;
+  /** Gemini understands the person / ElevenLabs gives the voice (from the server snapshot). */
+  assistant: { understanding: boolean; voice: boolean };
+  /** Bumped on conversation.updated / session.data_deleted: the dispatcher refetches the transcript. */
+  conversationTicks: Record<string, number>;
   systemHealth: SystemStatus["system_health"] | null;
   /** generated_at of the last applied snapshot. Null until the server has answered once. */
   snapshotAt: string | null;
@@ -111,6 +115,8 @@ export const initialLiveState: LiveState = {
   alertNotices: {},
   systemPower: null,
   voiceMode: null,
+  assistant: { understanding: false, voice: false },
+  conversationTicks: {},
   systemHealth: null,
   snapshotAt: null,
   lastSequence: 0,
@@ -218,6 +224,7 @@ function applySnapshot(state: LiveState, status: SystemStatus, source: "http" | 
     ...state,
     sessions: {},
     voiceMode: status.voice_mode,
+    assistant: { understanding: Boolean(status.assistant?.understanding), voice: Boolean(status.assistant?.voice) },
     systemHealth: status.system_health,
     alertLocations: Object.fromEntries((status.alert_locations ?? []).map((item) => [item.session_id, item])),
     systemPower: status.power
@@ -387,6 +394,11 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
     }
   }
 
+  if ((event.type === "conversation.updated" || event.type === "session.data_deleted") && sessionId) {
+    next.conversationTicks = { ...next.conversationTicks, [sessionId]: (next.conversationTicks[sessionId] ?? 0) + 1 };
+    return next;
+  }
+
   // Informational events: logged above, no session field changes.
   if (
     event.type === "alert.notification_requested" ||
@@ -408,6 +420,9 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
   if (typeof data.version === "number") updated.version = Math.max(updated.version, data.version);
 
   switch (event.type) {
+    case "call.taken_over":
+      updated.operator_connected_at = typeof data.operator_connected_at === "string" ? data.operator_connected_at : event.occurred_at;
+      break;
     case "safety.check_in_requested":
       if (typeof data.checkin_id === "string") updated.checkin_id = data.checkin_id;
       updated.checkin_attempt = typeof data.attempt === "number" ? data.attempt : updated.checkin_attempt;
@@ -457,6 +472,9 @@ function applyEvent(state: LiveState, event: EventEnvelope): LiveState {
       updated.next_checkin_at = null;
       updated.response_deadline = null;
       updated.retry_at = null;
+      // Why it ended (e.g. FALSE_ALARM) travels with the event; the screen must not depend on
+      // which arrives first, the event or the command's answer.
+      if (typeof data.reason === "string") updated.cancellation_reason = data.reason;
       break;
     case "technical.issue_reported":
       if (typeof data.issue === "string" && !updated.active_technical_issues.includes(data.issue)) {

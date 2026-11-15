@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from app.assistant import AssistantService, ElevenLabsSpeech, GeminiUnderstanding
 from app.config import Settings
 from app.hardware import (
     GpioZeroJoystickMonitor,
@@ -23,6 +24,7 @@ from app.services.location import (
     AuthorizedLocationStore,
     InMemoryAuthorizedLocationStore,
 )
+from app.services.recordings import RecordingStore
 from app.services.recovery import NoopSessionRecoveryProvider, SessionRecoveryProvider
 from app.services.session_manager import SessionManager
 from app.voice import (
@@ -53,6 +55,13 @@ class AppServices:
     power: dict[str, Any] | None = None
     # Web Push transport; tests replace it. None = real pywebpush with the device's VAPID key.
     push_sender: Any | None = None
+    # Voice assistant (Gemini + ElevenLabs) and the conversation recordings.
+    assistant: AssistantService | None = None
+    recordings: RecordingStore | None = None
+    # Latest fix of the device's own GPS (Raspberry Pi), also when no session runs.
+    device_fix: dict[str, Any] | None = None
+    # Sessions whose call the dispatcher took over (the assistant in the earbuds stops).
+    takeovers: dict[str, Any] = field(default_factory=dict)
 
 
 def build_services(
@@ -70,6 +79,11 @@ def build_services(
         technical_issue_retry_delay=timedelta(seconds=settings.checkin_retry_delay_seconds),
         quick_cancel_window=timedelta(seconds=settings.quick_cancel_seconds),
         max_attempts=settings.checkin_max_attempts,
+        first_check_in_delay=(
+            timedelta(seconds=settings.first_checkin_delay_seconds)
+            if settings.first_checkin_delay_seconds
+            else None
+        ),
     )
     engine = SafetyEngine(policy)
     persistence = None
@@ -117,6 +131,40 @@ def build_services(
         if selected_monitor is not None
         else None
     )
+    timeout = settings.assistant_timeout_seconds
+    assistant = AssistantService(
+        broker,
+        understanding=(
+            GeminiUnderstanding(settings.gemini_api_key, settings.gemini_model, timeout_seconds=timeout)
+            if settings.gemini_api_key
+            else None
+        ),
+        speech=(
+            ElevenLabsSpeech(
+                settings.elevenlabs_api_key,
+                settings.elevenlabs_voice_id,
+                settings.elevenlabs_tts_model,
+                timeout_seconds=timeout,
+            )
+            if settings.elevenlabs_api_key
+            else None
+        ),
+    )
+    if settings.database_path:
+        database: Path | None = Path(settings.database_path)
+    elif settings.state_dir:
+        database = Path(settings.state_dir) / "vesta.db"
+    else:
+        database = None
+    recordings = RecordingStore(database, max_bytes=settings.max_recording_bytes)
+
+    def keep_turn(session_id: str, turn) -> None:
+        # Every line of the conversation goes to the local database (and to Tiger Data if used).
+        recordings.add_turn(session_id, turn)
+        if persistence is not None:
+            persistence.record_conversation_turn(session_id, turn)
+
+    assistant._recorder = keep_turn
     return AppServices(
         settings=settings,
         broker=broker,
@@ -134,6 +182,8 @@ def build_services(
             max_phones=settings.max_paired_phones,
         ),
         persistence=persistence,
+        assistant=assistant,
+        recordings=recordings,
     )
 
 

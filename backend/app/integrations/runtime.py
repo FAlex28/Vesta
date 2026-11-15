@@ -126,6 +126,46 @@ class TigerPersistence:
 
         self._background(mark)
 
+    def record_location(
+        self,
+        *,
+        session_id: str,
+        latitude: float,
+        longitude: float,
+        captured_at,
+        accuracy_meters: float | None,
+        source: str,
+    ) -> None:
+        self._background(
+            self.db.locations.record,
+            lat=latitude,
+            lon=longitude,
+            session_id=session_id,
+            accuracy_m=accuracy_meters,
+            occurred_at=captured_at,
+            source="DEVICE_GPS" if source == "device_gps" else "COMPANION_GPS",
+        )
+
+    def record_conversation_turn(self, session_id: str, turn) -> None:
+        self._background(
+            self.db.conversations.add_turn,
+            turn_id=turn.id,
+            session_id=session_id,
+            occurred_at=turn.at,
+            role=turn.role,
+            text=turn.text,
+            action=turn.action,
+        )
+
+    def purge_session_media(self, session_id: str) -> None:
+        """Alarmă falsă: pozițiile și conversația sesiunii se șterg din istoric."""
+
+        def purge() -> None:
+            self.db.locations.delete_for_session(session_id)
+            self.db.conversations.delete_for_session(session_id)
+
+        self._background(purge)
+
     def record_power(self, status: PowerStatus) -> None:
         self._background(
             self.db.events.log_technical_event,

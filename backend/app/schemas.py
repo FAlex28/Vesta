@@ -74,6 +74,8 @@ class SessionView(StrictModel):
     active_technical_issues: list[str]
     alert_reason: str | None
     alert: AlertView | None
+    # The dispatcher took over the call: the assistant in the earbuds is silent from then on.
+    operator_connected_at: datetime | None = None
 
 
 class ActivationResponse(StrictModel):
@@ -112,6 +114,7 @@ class CancelRequest(StrictModel):
         "ACCIDENTAL_ACTIVATION",
         "USER_CANCELLED",
         "SESSION_ENDED",
+        "FALSE_ALARM",
     ] = "USER_CANCELLED"
 
 
@@ -254,6 +257,8 @@ class SystemStatusResponse(StrictModel):
     power: PowerView | None = None
     # Dispatcher only: last authorized location of sessions whose alert is ACTIVE.
     alert_locations: list[AlertLocationView] = Field(default_factory=list)
+    # Voice assistant: Gemini understands the person, ElevenLabs gives the voice.
+    assistant: dict[str, bool] = Field(default_factory=dict)
 
 
 Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=32)]
@@ -351,6 +356,8 @@ class LocationFix(StrictModel):
     age_seconds: float
     is_stale: bool
     accuracy_meters: float | None
+    # "device_gps" (the GPS on the Vesta device) or "android" (the phone's browser).
+    source: str | None = None
 
 
 class ContactLocationView(LocationFix):
@@ -392,6 +399,126 @@ class ErrorBody(StrictModel):
 
 class ErrorResponse(StrictModel):
     error: ErrorBody
+
+
+class OpenAccessRequest(StrictModel):
+    scope: Literal["companion", "contact"]
+
+
+class SimulatorPressRequest(StrictModel):
+    event_id: Identifier
+
+
+class SimulatorPressResponse(StrictModel):
+    outcome: Literal["ACTIVATED", "DUPLICATE", "ALREADY_ACTIVE"]
+    session_id: str
+    state: str
+
+
+class DeviceLocationRequest(StrictModel):
+    """A fix from the GPS module wired to the Vesta device (Raspberry Pi UART)."""
+
+    event_id: Identifier
+    device_id: Identifier
+    latitude: Annotated[float, Field(ge=-90, le=90)]
+    longitude: Annotated[float, Field(ge=-180, le=180)]
+    captured_at: AwareDatetime
+    accuracy_meters: Annotated[float | None, Field(ge=0)] = None
+    satellites: Annotated[int | None, Field(ge=0, le=99)] = None
+
+
+class DeviceLocationResponse(StrictModel):
+    session_id: str | None
+    accepted_as_latest: bool
+
+
+class AssistantPromptRequest(StrictModel):
+    event_id: Identifier
+    line: Literal["checkin", "alert", "false_alarm", "confirm_safe", "nudge", "operator"] = "checkin"
+
+
+class AssistantSpeechView(StrictModel):
+    text: str
+    audio_base64: str | None
+    mime_type: str | None
+    turn_id: str | None
+
+
+class AssistantReplyRequest(StrictModel):
+    event_id: Identifier
+    # One spoken phrase as WAV (16 kHz mono), at most ~30 s.
+    audio_base64: Annotated[str, StringConstraints(min_length=16, max_length=1_500_000)]
+    mime_type: Literal["audio/wav", "audio/webm", "audio/ogg", "audio/mpeg"] = "audio/wav"
+
+
+class AssistantReplyResponse(StrictModel):
+    transcript: str
+    action: Literal["NONE", "FALSE_ALARM", "ESCALATE", "CONFIRM_SAFE"]
+    applied: bool
+    reply: AssistantSpeechView
+    session: SessionView
+
+
+class ConversationTurnView(StrictModel):
+    id: str
+    role: Literal["person", "assistant", "operator"]
+    text: str
+    at: datetime
+    action: str | None = None
+
+
+class RecordingView(StrictModel):
+    mime_type: str
+    size_bytes: int
+    chunks: int
+    started_at: datetime
+    updated_at: datetime
+    finalized: bool
+
+
+class ConversationResponse(StrictModel):
+    session_id: str
+    turns: list[ConversationTurnView]
+    recording: RecordingView | None
+
+
+class TakeoverResponse(StrictModel):
+    session_id: str
+    operator_connected_at: datetime
+
+
+class OperatorMessageView(StrictModel):
+    id: str
+    at: datetime
+    mime_type: str
+    audio_base64: str
+
+
+class OperatorMessageAck(StrictModel):
+    id: str
+    at: datetime
+
+
+class ArchivedRecordingView(StrictModel):
+    session_id: str
+    device_id: str | None
+    started_at: datetime
+    updated_at: datetime
+    size_bytes: int
+    chunks: int
+    finalized: bool
+    alert_id: str | None
+    alert_reason: str | None
+    alert_at: datetime | None
+    resolution: str | None
+    resolved_at: datetime | None
+    operator_at: datetime | None
+    turns: int
+
+
+class RecordingChunkResponse(StrictModel):
+    chunks: int
+    size_bytes: int
 
 
 SystemStatusResponse.model_rebuild()

@@ -1,441 +1,215 @@
 import { expect, test, type Page } from "playwright/test";
 import { bodyProblem, COMPANION_TOKEN, installDeviceFakes, makeSession, MockBackend, SESSION_ID, TOKEN } from "./mockBackend";
 
-async function openPaired(page: Page, backend: MockBackend) {
+/* The person's phone (v5): no pairing code, Vesta in the earbuds, recording, false alarm. */
+
+const checkIn = (overrides = {}) =>
+  makeSession({
+    state: "CHECK_IN",
+    checkin_id: "chk-1",
+    checkin_status: "REQUESTED",
+    checkin_attempt: 1,
+    response_deadline: new Date(Date.now() + 20_000).toISOString(),
+    ...overrides,
+  });
+
+async function open(page: Page, backend: MockBackend) {
   await backend.install();
   await page.goto("/companion");
-  await expect(page.getByTestId("c-state")).not.toHaveAttribute("data-state", "UNKNOWN");
-  await page.getByLabel("Cod de control al sesiunii").fill(TOKEN);
-  await page.getByRole("button", { name: "Asociază telefonul" }).click();
-  await expect(page.getByText("Sesiunea ta")).toBeVisible();
+}
+
+async function arm(page: Page) {
+  await page.getByTestId("arm").click();
+  await expect(page.getByTestId("assistant-phase")).not.toHaveAttribute("data-phase", "off");
 }
 
 test.describe("companion", () => {
-  test("pairing with the code printed on the device: the phone waits, then takes over the joystick session by itself", async ({ page }) => {
+  test("opens without any code and takes over the joystick session by itself", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
-    await backend.install();
-    await page.goto("/companion");
-    await page.getByLabel("Codul de pe dispozitivul Vesta").fill("vesta-23456");
-    await page.getByRole("button", { name: "Asociază cu codul" }).click();
-    await expect(page.getByTestId("pair-waiting")).toContainText("vesta-01");
-    await expect(page.getByTestId("sos")).toBeDisabled();
+    await open(page, backend);
+    await expect(page.getByText("Ține butonul apăsat 5 secunde")).toBeVisible();
+    await expect(page.getByLabel("Codul de pe dispozitivul Vesta")).toHaveCount(0);
+    expect(backend.calls("/api/v1/access/open")[0].body).toEqual({ scope: "companion" });
+    // nothing is requested from the browser on load
+    expect(await page.evaluate(() => (window as unknown as { __micRequests?: number }).__micRequests ?? 0)).toBe(0);
 
-    // The joystick is held for 5 s and the backend confirms a session.
     backend.sessions = [makeSession()];
     await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
     await expect(page.getByTestId("sos")).toBeEnabled();
     expect(backend.calls("/api/v1/companion/session").every((call) => call.auth === `Bearer ${COMPANION_TOKEN}`)).toBe(true);
-    expect(backend.calls(/\/heartbeat$/).every((call) => call.auth === `Bearer ${TOKEN}`)).toBe(true);
     expect(backend.requests.some((request) => request.url.includes(COMPANION_TOKEN) || request.url.includes(TOKEN))).toBe(false);
-    expect(backend.requests.some((request) => request.path.includes("device/events"))).toBe(false);
 
-    // The grant survives a reload (the control token does not: it is fetched again).
+    // The grant survives a reload; the control token is fetched again, never stored.
     await page.reload();
     await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
     expect(await page.evaluate(() => JSON.stringify(window.localStorage))).not.toContain(TOKEN);
+    expect(backend.calls("/api/v1/access/open")).toHaveLength(1);
   });
 
-  test("a wrong or reused code is refused and nothing is stored", async ({ page }) => {
+  test("a server without open access says so", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
-    await backend.install();
-    await page.goto("/companion");
-    await page.getByLabel("Codul de pe dispozitivul Vesta").fill("ZZZZ999999");
-    await page.getByRole("button", { name: "Asociază cu codul" }).click();
-    await expect(page.getByTestId("claim-problem")).toContainText("nu se potrivește");
-    expect(await page.evaluate(() => window.localStorage.length)).toBe(0);
+    backend.openAccess = false;
+    await open(page, backend);
+    await expect(page.getByTestId("access-problem")).toContainText("nu se poate conecta");
   });
 
-  test("scanning the QR on the device pairs at once and the code leaves the address bar", async ({ page }) => {
+  test("the question is spoken in the earbuds and reported as delivered by voice", async ({ page }) => {
     await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    await backend.install();
-    await page.goto("/companion#pair=VESTA-23456");
-    await expect(page.getByTestId("pair-waiting")).toBeVisible();
-    expect(page.url()).not.toContain("VESTA");
-    expect(backend.calls("/api/v1/pairing/device")[0].body).toMatchObject({ code: "VESTA-23456" });
-  });
-
-  test("the person adds an emergency contact and sends the invite by SMS from her phone", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    await backend.install();
-    await page.goto("/companion#pair=VESTA23456");
-    await expect(page.getByTestId("emergency-contacts")).toBeVisible();
-    await page.getByTestId("owner-name").fill("Ana");
-    await page.getByTestId("contact-name").fill("Mama");
-    await page.getByTestId("contact-phone").fill("+40 722 123 456");
-    await page.getByRole("button", { name: /Adaugă și pregătește invitația/ }).click();
-    await expect(page.getByTestId("invite-card")).toContainText("Mama");
-    const href = decodeURIComponent((await page.getByTestId("invite-sms").getAttribute("href")) ?? "");
-    expect(href).toMatch(/^sms:\+40722123456\?body=Ana te-a adăugat/);
-    expect(href).toMatch(/\/contact#cod=INV/);
-    await expect(page.getByTestId("contact-item")).toContainText("Invitație în așteptare");
-    expect(backend.ownerName).toBe("Ana");
-    // No dispatcher key or dispatcher code is involved.
-    expect(backend.requests.some((request) => request.path.includes("pairing-codes"))).toBe(false);
-  });
-
-  test("a check-in shown on the open phone page is reported as delivered once", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    const session = makeSession();
-    backend.sessions = [session];
-    await openPaired(page, backend);
-    session.state = "CHECK_IN";
-    session.checkin_id = "chk-77";
-    session.checkin_status = "REQUESTED";
-    session.response_deadline = new Date(Date.now() + 15_000).toISOString();
-    backend.publish("safety.check_in_requested", { from_state: "ACTIVE", state: "CHECK_IN", attempt: 1, checkin_id: "chk-77", response_deadline: session.response_deadline });
-    await expect(page.getByTestId("checkin-prompt")).toBeVisible();
-    await expect.poll(() => backend.calls(/\/checkins\/chk-77\/delivery$/).map((call) => call.body?.channel)).toEqual(["android"]);
-    await page.waitForTimeout(500);
-    expect(backend.calls(/\/delivery$/)).toHaveLength(1);
-  });
-
-  test("no permission is requested on load; controls wait for pairing", async ({ page }) => {
-    await installDeviceFakes(page);
-    await page.addInitScript(() => {
-      const w = window as unknown as Record<string, number>;
-      w.__permissionCalls = 0;
-      const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getUserMedia = (constraints) => {
-        w.__permissionCalls += 1;
-        return original(constraints);
-      };
-    });
     const backend = new MockBackend(page);
     backend.sessions = [makeSession()];
-    await backend.install();
-    await page.goto("/companion");
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ACTIVE");
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await arm(page);
+
+    const session = backend.session()!;
+    Object.assign(session, checkIn());
+    backend.publish("safety.check_in_requested", { from_state: "ACTIVE", state: "CHECK_IN", checkin_id: "chk-1", attempt: 1 });
+    await expect(page.getByTestId("chat")).toContainText("A fost o apăsare din greșeală?");
+    await expect.poll(() => backend.calls(/\/delivery$/).length).toBe(1);
+    expect(backend.calls(/\/delivery$/)[0].body).toMatchObject({ status: "DELIVERED", channel: "voice" });
+    expect(backend.calls(/\/assistant\/prompt$/)[0].body).toMatchObject({ line: "checkin" });
+    expect(await page.evaluate(() => (window as unknown as { __spoken?: string[] }).__spoken ?? [])).toContain(
+      "Bună, sunt Vesta. A fost o apăsare din greșeală?",
+    );
+    await expect(page.getByTestId("no-understanding")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Sunt bine, continuă" })).toHaveCount(0);
     await expect(page.getByTestId("sos")).toBeVisible();
-    await expect(page.getByTestId("sos")).toBeDisabled();
-    expect(await page.evaluate(() => (window as unknown as Record<string, number>).__permissionCalls)).toBe(0);
-    await expect(page.getByTestId("gps-freshness")).toHaveText("UNAVAILABLE");
+    await expect(page.getByTestId("false-alarm")).toBeVisible();
+    await page.evaluate(() => (window as unknown as { __speak: (on: boolean) => void }).__speak(true));
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => (window as unknown as { __speak: (on: boolean) => void }).__speak(false));
+    await expect.poll(() => backend.calls(/\/assistant\/reply$/).length, { timeout: 10_000 }).toBe(1);
+    await expect(page.getByTestId("chat")).toContainText("Mesajul nu a putut fi transcris.");
+    await expect(page.getByTestId("chat")).toContainText("Nu am putut transcrie ce ai spus.");
   });
 
-  test("unauthorized token is rejected; token never appears in a URL", async ({ page }) => {
+  test("without the earbuds prepared, the question on the open screen counts as delivered", async ({ page }) => {
+    await installDeviceFakes(page);
+    const backend = new MockBackend(page);
+    backend.sessions = [checkIn()];
+    await open(page, backend);
+    await expect.poll(() => backend.calls(/\/delivery$/).length, { timeout: 10_000 }).toBe(1);
+    expect(backend.calls(/\/delivery$/)[0].body).toMatchObject({ channel: "android" });
+  });
+
+  test("the whole conversation is recorded from the start and uploaded in order", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
     backend.sessions = [makeSession()];
-    await backend.install();
-    await page.goto("/companion");
-    await page.getByLabel("Cod de control al sesiunii").fill("v1.wrong.token");
-    await page.getByRole("button", { name: "Asociază telefonul" }).click();
-    await expect(page.getByTestId("pairing-problem")).toContainText("respins");
-    await expect(page.getByTestId("sos")).toBeDisabled();
-    expect(backend.requests.some((request) => request.url.includes("v1.wrong.token"))).toBe(false);
-    expect(page.url()).not.toContain("token");
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await arm(page);
+    await expect.poll(() => backend.calls(/\/recording\/chunks$/).length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    const uploads = backend.calls(/\/recording\/chunks$/);
+    expect(uploads.map((call) => Number(new URL(call.url).searchParams.get("seq"))).slice(0, 2)).toEqual([0, 1]);
+    expect(uploads.every((call) => call.auth === `Bearer ${TOKEN}`)).toBe(true);
+    await expect(page.getByTestId("recording-status")).toContainText(/\d+ s/);
   });
 
-  test("manual session-ID pairing validates through the token-scoped v2 endpoint", async ({ page }) => {
+  test("Gemini hears 'it was a mistake': false alarm, Vesta stops", async ({ page }) => {
+    await installDeviceFakes(page);
+    const backend = new MockBackend(page);
+    backend.assistant = { understanding: true, voice: false };
+    backend.sessions = [checkIn()];
+    backend.nextReply = { transcript: "Da, a fost din greșeală.", reply: "Am înțeles, a fost o alarmă falsă.", action: "FALSE_ALARM" };
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await arm(page);
+    await expect(page.getByTestId("assistant-phase")).toHaveAttribute("data-phase", "listening", { timeout: 10_000 });
+
+    // She speaks for a second, then stops: one phrase is detected and sent as WAV.
+    await page.evaluate(() => (window as unknown as { __speak: (on: boolean) => void }).__speak(true));
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => (window as unknown as { __speak: (on: boolean) => void }).__speak(false));
+    await expect.poll(() => backend.calls(/\/assistant\/reply$/).length, { timeout: 10_000 }).toBe(1);
+    const sent = backend.calls(/\/assistant\/reply$/)[0].body!;
+    expect(sent.mime_type).toBe("audio/wav");
+    expect(atob(String(sent.audio_base64)).slice(0, 4)).toBe("RIFF");
+
+    await expect(page.getByTestId("c-state")).toContainText("Alarmă falsă", { timeout: 10_000 });
+    await expect(page.getByTestId("chat")).toContainText("Da, a fost din greșeală.");
+  });
+
+  test("the false-alarm button asks once, then stops Vesta (also during an alert)", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
     backend.sessions = [makeSession()];
-    await backend.install();
-    await page.goto("/companion");
-    await page.getByLabel("Identificatorul sesiunii").fill(SESSION_ID);
-    await page.getByLabel("Cod de control al sesiunii").fill(TOKEN);
-    await page.getByRole("button", { name: "Asociază telefonul" }).click();
-    await expect(page.getByText("Sesiunea ta")).toBeVisible();
-    const sessionRead = backend.calls(new RegExp(`/api/v1/sessions/${SESSION_ID}$`));
-    expect(sessionRead.length).toBeGreaterThanOrEqual(1);
-    expect(sessionRead.every((request) => request.auth === `Bearer ${TOKEN}`)).toBe(true);
-    expect(page.url()).not.toContain(TOKEN);
-  });
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("sos").click();
+    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ALERT");
 
-  test("quick cancel ends an accidental activation through the backend", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-    expect(backend.calls(/\/heartbeat$/).every((request) => request.auth === `Bearer ${TOKEN}`)).toBe(true);
-
-    await page.getByTestId("quick-cancel").click();
-    await expect(page.getByText(/Serverul a încheiat sesiunea la/)).toBeVisible();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "CANCELLED");
+    await page.getByTestId("false-alarm").click();
+    await expect(page.getByText("Oprești alerta?")).toBeVisible();
+    await page.getByTestId("false-alarm-confirm").click();
+    await expect(page.getByTestId("c-state")).toContainText("Alarmă falsă");
     const cancel = backend.calls(/\/cancel$/);
     expect(cancel).toHaveLength(1);
-    expect(String(cancel[0].body?.event_id)).toMatch(/^cancel-/);
-    expect(cancel[0].body?.reason).toBe("ACCIDENTAL_ACTIVATION");
+    expect(cancel[0].body).toMatchObject({ reason: "FALSE_ALARM" });
+    expect(backend.session(SESSION_ID)?.alert).toMatchObject({ status: "RESOLVED", resolution_action: "FALSE_ALARM" });
   });
 
-  test("ending a session after the quick-cancel window sends USER_CANCELLED", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession({ quick_cancel_until: new Date(Date.now() - 1_000).toISOString() })];
-    await openPaired(page, backend);
-    await expect(page.getByTestId("quick-cancel")).toHaveCount(0);
-    await page.getByTestId("end").click();
-    await page.getByTestId("end-confirm").click();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "CANCELLED");
-    expect(backend.calls(/\/cancel$/).map((call) => call.body?.reason)).toEqual(["USER_CANCELLED"]);
-  });
-
-  test("check-in prompt and 'Sunt bine' confirm only after the server answers", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    const session = makeSession();
-    backend.sessions = [session];
-    await openPaired(page, backend);
-
-    session.state = "CHECK_IN";
-    session.checkin_attempt = 1;
-    session.checkin_id = "checkin-2026-01";
-    session.checkin_status = "REQUESTED";
-    session.response_deadline = new Date(Date.now() + 15_000).toISOString();
-    backend.publish("safety.check_in_requested", {
-      from_state: "ACTIVE",
-      state: "CHECK_IN",
-      attempt: 1,
-      checkin_id: session.checkin_id,
-      response_deadline: session.response_deadline,
-    });
-    await expect(page.getByTestId("checkin-prompt")).toBeVisible();
-
-    await page.getByTestId("checkin-prompt").getByRole("button", { name: "Sunt bine" }).click();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ACTIVE");
-    // The prompt closes with the server's answer; the confirmation itself stays visible.
-    await expect(page.getByTestId("checkin-prompt")).toHaveCount(0);
-    await expect(page.getByText(/Serverul a primit confirmarea la/)).toBeVisible();
-    expect(backend.calls(/\/checkins$/)).toHaveLength(1);
-    expect(backend.calls(/\/checkins$/)[0].body).toMatchObject({
-      checkin_id: "checkin-2026-01",
-      confirmation: "safe",
-      source: "android",
-    });
-  });
-
-  test("SOS succeeds only on the server's answer, and a failed SOS says so and retries with the same event_id", async ({ page }) => {
+  test("SOS succeeds only on the server's answer, and a failed SOS says so", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
     backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-
-    let failSos = true;
-    backend.responders.push((request) => (request.path.endsWith("/sos") && failSos ? "abort" : undefined));
+    let fail = true;
+    backend.responders.push((request) => (request.path.endsWith("/sos") && fail ? "abort" : undefined));
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
     await page.getByTestId("sos").click();
-    await expect(page.getByText("Alerta NU a fost confirmată ca transmisă.")).toBeVisible();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ACTIVE");
-    await expect(page.getByTestId("sos")).toHaveText("Reîncearcă SOS");
-
-    failSos = false;
-    await page.getByTestId("sos").click();
-    await expect(page.getByText(/Serverul a confirmat SOS-ul la/)).toBeVisible();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ALERT");
-    const sosCalls = backend.calls(/\/sos$/);
-    expect(sosCalls).toHaveLength(2);
-    expect(sosCalls[0].body?.event_id).toBe(sosCalls[1].body?.event_id);
-  });
-
-  test("SOS works while the voice service is unavailable", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    backend.responders.push((request) =>
-      request.path.endsWith("/voice/access")
-        ? { status: 503, body: { error: { code: "VOICE_PROVIDER_UNAVAILABLE", message: "unavailable" } } }
-        : undefined,
-    );
-    await openPaired(page, backend);
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "unavailable");
-    await expect(page.getByText("Conversația vocală este momentan indisponibilă.")).toBeVisible();
-    await expect(page.getByTestId("sos")).toBeEnabled();
+    await expect(page.getByText("Alerta nu a plecat.")).toBeVisible();
+    fail = false;
     await page.getByTestId("sos").click();
     await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ALERT");
+    const ids = backend.calls(/\/sos$/).map((call) => call.body?.event_id);
+    expect(ids[0]).toBe(ids[1]);
   });
 
-  test("voice: one conversation, check-in context, audio disconnect is shown and reported", async ({ page }) => {
-    await installDeviceFakes(page, { mic: "grant" });
-    const backend = new MockBackend(page);
-    const session = makeSession();
-    backend.sessions = [session];
-    await openPaired(page, backend);
-
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "connected");
-    expect(backend.calls(/\/voice\/access$/)).toHaveLength(1);
-    await expect(page.getByTestId("voice-start")).toHaveCount(0); // no second conversation can start
-
-    session.state = "CHECK_IN";
-    backend.publish("safety.check_in_requested", { from_state: "ACTIVE", state: "CHECK_IN", attempt: 1 });
-    await expect(page.getByTestId("checkin-prompt")).toBeVisible();
-    await expect.poll(() => page.evaluate(() => (window as unknown as { __voiceLog: string[] }).__voiceLog)).toContain("context:safety_check_requested");
-
-    // An agent message is shown as sent, not as heard.
-    await page.evaluate(() => (window as unknown as { __voiceOptions: { onMessage: (m: unknown) => void } }).__voiceOptions.onMessage({ message: "Ești în regulă?", role: "agent" }));
-    await expect(page.getByText("Textul nu confirmă că mesajul a fost auzit.", { exact: false })).toBeVisible();
-
-    await expect.poll(() => backend.calls(/\/voice\/status$/).map((call) => `${call.body?.status}:${call.body?.conversation_id}`)).toEqual(["CONNECTED:conv_123"]);
-
-    await page.evaluate(() =>
-      (window as unknown as { __voiceOptions: { onDisconnect: (d: unknown) => void } }).__voiceOptions.onDisconnect({ reason: "error", message: "ice failed" }),
-    );
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "disconnected");
-    await expect(page.getByTestId("voice-status")).toHaveText(/Audio deconectat/);
-    await expect.poll(() => backend.calls(/\/voice\/status$/).map((call) => call.body?.status)).toEqual(["CONNECTED", "DISCONNECTED"]);
-
-    // The reservation was released, so the server accepts a new conversation.
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "connected");
-    expect(backend.calls(/\/voice\/access$/)).toHaveLength(2);
-  });
-
-  test("ending a conversation releases the server reservation; a new one can start", async ({ page }) => {
-    await installDeviceFakes(page, { mic: "grant" });
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "connected");
-    await page.getByRole("button", { name: "Încheie conversația" }).click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "ended");
-    // Exactly one DISCONNECTED, although both stop() and onDisconnect ran.
-    await expect.poll(() => backend.calls(/\/voice\/status$/).map((call) => call.body?.status)).toEqual(["CONNECTED", "DISCONNECTED"]);
-
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "connected");
-    expect(backend.calls(/\/voice\/access$/)).toHaveLength(2);
-  });
-
-  test("a conversation already open elsewhere is explained, not shown as a generic failure", async ({ page }) => {
-    await installDeviceFakes(page, { mic: "grant" });
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    backend.voiceReserved = true;
-    await openPaired(page, backend);
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByText(/deja o conversație deschisă/)).toBeVisible();
-    await expect(page.getByTestId("sos")).toBeEnabled();
-  });
-
-  test("microphone refused: shown as a microphone error and reported, session not blocked", async ({ page }) => {
+  test("microphone refused: explained, the buttons keep working", async ({ page }) => {
     await installDeviceFakes(page, { mic: "deny" });
     const backend = new MockBackend(page);
     backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveText(/Eroare microfon/);
-    await expect.poll(() => backend.calls(/\/voice\/status$/).map((call) => call.body?.status)).toContain("MICROPHONE_ERROR");
-    expect(backend.calls(/\/voice\/access$/)).toHaveLength(0);
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("arm").click();
+    await expect(page.getByText("Microfonul nu a fost permis")).toBeVisible();
     await expect(page.getByTestId("sos")).toBeEnabled();
   });
 
-  test("GPS refused shows UNAVAILABLE; a stale fix is marked STALE, never current", async ({ page }) => {
-    await installDeviceFakes(page, { gps: "deny" });
-    const backend = new MockBackend(page);
-    await backend.install();
-    await page.goto("/companion");
-    await page.getByRole("button", { name: "Permite locația" }).click();
-    await expect(page.getByText("Accesul la locație a fost refuzat.")).toBeVisible();
-    await expect(page.getByTestId("gps-freshness")).toHaveText("UNAVAILABLE");
-
-    await page.getByRole("button", { name: "Arată coordonate simulate" }).click();
-    await expect(page.getByText("Simulate", { exact: true })).toBeVisible();
-  });
-
-  test("stale GPS fix", async ({ page }) => {
-    await installDeviceFakes(page, { gps: "stale" });
-    const backend = new MockBackend(page);
-    await backend.install();
-    await page.goto("/companion");
-    await page.getByRole("button", { name: "Permite locația" }).click();
-    await expect(page.getByTestId("gps-freshness")).toHaveText("STALE");
-    await expect(page.getByText("Aceasta este ultima poziție cunoscută, nu poziția actuală.")).toBeVisible();
-  });
-
-  test("GPS sharing is off by default and uploads only after explicit consent", async ({ page }) => {
+  test("every request the phone sends matches the backend schema (no 422)", async ({ page }) => {
     await installDeviceFakes(page, { gps: "grant" });
     const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-    await page.getByRole("button", { name: "Permite locația" }).click();
-    await expect(page.getByTestId("gps-freshness")).toHaveText("CURRENT");
-
-    const share = page.getByTestId("location-share");
-    await expect(share).toBeEnabled();
-    await expect(share).not.toBeChecked();
-    expect(backend.calls(/\/location$/)).toHaveLength(0);
-
-    await share.check();
-    await expect(page.getByTestId("location-upload-status")).toHaveText("Poziția a fost primită de server.");
-    const sent = backend.calls(/\/location$/);
-    expect(sent).toHaveLength(1);
-    // Turning GPS on reports only its availability; coordinates went out once, after consent.
-    expect(backend.calls(/\/client-status$/).map((call) => call.body?.gps_status)).toContain("GPS_AVAILABLE");
-    expect(backend.calls(/\/client-status$/).every((call) => !("latitude" in (call.body ?? {})))).toBe(true);
-    expect(sent[0].auth).toBe(`Bearer ${TOKEN}`);
-    expect(sent[0].body).toMatchObject({ latitude: 45.75, longitude: 21.23, source: "android" });
-    expect(String(sent[0].body?.event_id)).toMatch(/^location-/);
+    backend.sessions = [checkIn()];
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await arm(page);
+    await expect.poll(() => backend.calls(/\/delivery$/).length).toBe(1);
+    await page.getByTestId("sos").click();
+    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ALERT");
+    await page.getByTestId("false-alarm").click();
+    await page.getByTestId("false-alarm-confirm").click();
+    await expect(page.getByTestId("c-state")).toContainText("Alarmă falsă");
+    const posts = backend.requests.filter((request) => request.method === "POST" && request.path.startsWith("/api/v1/sessions/"));
+    expect(posts.length).toBeGreaterThan(4);
+    for (const post of posts) {
+      const action = post.path.replace(/^\/api\/v1\/sessions\/[^/]+\//, "").replace(/^alerts\/[^/]+\/resolve$/, "resolve").replace(/^checkins\/[^/]+\/delivery$/, "delivery");
+      expect(bodyProblem(action, post.body), `${post.path} ${JSON.stringify(post.body)}`).toBeNull();
+    }
   });
 
-  test("phone loses the server: heartbeats fail -> DISCONNECTED; recovery -> CONNECTED without a new session", async ({ page }) => {
-    await page.clock.install();
-    await installDeviceFakes(page);
+  test("coarse GPS asks the person to enable precise location in Android", async ({ page }) => {
+    await installDeviceFakes(page, { gps: "coarse" });
     const backend = new MockBackend(page);
     backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-
-    let offline = true;
-    backend.responders.push((request) => (offline && request.path.endsWith("/heartbeat") ? "abort" : undefined));
-    await page.clock.fastForward(15_100);
-    await expect(page.getByTestId("link-badge")).toHaveAttribute("data-state", "RECONNECTING");
-    await page.clock.fastForward(15_100);
-    await page.clock.fastForward(15_100);
-    await expect(page.getByTestId("link-badge")).toHaveAttribute("data-state", "DISCONNECTED");
-
-    offline = false;
-    await page.clock.fastForward(15_100);
-    await expect(page.getByTestId("link-badge")).toHaveAttribute("data-state", "CONNECTED");
-    expect(backend.sessions).toHaveLength(1);
-    expect(backend.requests.some((request) => request.path.includes("device/events"))).toBe(false);
+    await open(page, backend);
+    await expect(page.getByTestId("phone-location-warning")).toContainText("Locație precisă", { timeout: 10_000 });
+    await expect(page.getByTestId("phone-location")).toContainText("± 2000 m");
   });
 
-  test("hidden page and return: resync with the server and tell the user", async ({ page }) => {
-    await page.clock.install();
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-    const sessionRead = new RegExp(`/api/v1/sessions/${SESSION_ID}$`);
-    const before = backend.calls(sessionRead).length;
-
-    await page.evaluate(() => {
-      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
-      document.dispatchEvent(new Event("visibilitychange"));
-    });
-    await page.clock.fastForward(12_000);
-    await page.evaluate(() => {
-      Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
-      document.dispatchEvent(new Event("visibilitychange"));
-    });
-    await expect(page.getByTestId("away-notice")).toBeVisible();
-    await expect.poll(() => backend.calls(sessionRead).length).toBeGreaterThan(before);
-    await expect
-      .poll(() => backend.calls(/\/client-status$/).map((call) => call.body?.page_visibility).filter(Boolean))
-      .toEqual(["VISIBLE", "HIDDEN", "VISIBLE"]);
-  });
-
-  test("backend restart: the companion reports the interrupted session and asks to pair again", async ({ page }) => {
-    await installDeviceFakes(page);
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    backend.sequence = 4;
-    await openPaired(page, backend);
-
-    backend.sessions = [];
-    backend.sequence = 0;
-    await backend.dropSockets();
-    await expect(page.getByTestId("pairing-problem")).toContainText("întreruptă", { timeout: 15_000 });
-    await expect(page.getByTestId("sos")).toBeDisabled();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "IDLE");
-  });
-
-  test("closing an alert uses the explicit resolve endpoint and keeps the alert as RESOLVED", async ({ page }) => {
+  test("the dispatcher takes the call: the assistant stops and the dispatcher's voice plays", async ({ page }) => {
     await installDeviceFakes(page);
     const backend = new MockBackend(page);
     const now = new Date().toISOString();
@@ -443,42 +217,20 @@ test.describe("companion", () => {
       makeSession({
         state: "ALERT",
         alert_reason: "SOS_EXPLICIT",
-        quick_cancel_until: new Date(Date.now() - 60_000).toISOString(),
-        alert: { id: "alert-42", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 },
+        alert: { id: "alert-1", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 },
       }),
     ];
-    await openPaired(page, backend);
-    await page.getByTestId("end").click();
-    await expect(page.getByText("Alerta deja emisă rămâne în istoric ca rezolvată.", { exact: false })).toBeVisible();
-    await page.getByTestId("end-confirm").click();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "CANCELLED");
-    await expect(page.getByText(/Serverul a închis alerta la/)).toBeVisible();
-    expect(backend.calls(/\/cancel$/)).toHaveLength(0);
-    const resolve = backend.calls(/\/alerts\/alert-42\/resolve$/);
-    expect(resolve).toHaveLength(1);
-    expect(resolve[0].body).toMatchObject({ action: "USER_CONFIRMED_SAFE" });
-    expect(backend.session(SESSION_ID)?.alert).toMatchObject({ status: "RESOLVED", resolution_action: "USER_CONFIRMED_SAFE" });
-  });
-
-  test("every request the phone sends matches the backend schema (no 422)", async ({ page }) => {
-    await installDeviceFakes(page, { mic: "grant", gps: "grant" });
-    const backend = new MockBackend(page);
-    backend.sessions = [makeSession()];
-    await openPaired(page, backend);
-    await page.getByRole("button", { name: "Permite locația" }).click();
-    await page.getByTestId("location-share").check();
-    await page.getByTestId("voice-start").click();
-    await expect(page.getByTestId("voice-status")).toHaveAttribute("data-phase", "connected");
-    await page.getByTestId("sos").click();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "ALERT");
-    await page.getByTestId("end").click();
-    await page.getByTestId("end-confirm").click();
-    await expect(page.getByTestId("c-state")).toHaveAttribute("data-state", "CANCELLED");
-    const posts = backend.requests.filter((request) => request.method === "POST");
-    expect(posts.length).toBeGreaterThan(5);
-    for (const post of posts) {
-      const action = post.path.replace(/^\/api\/v1\/sessions\/[^/]+\//, "").replace(/^alerts\/[^/]+\/resolve$/, "resolve");
-      expect(bodyProblem(action, post.body), `${post.path} ${JSON.stringify(post.body)}`).toBeNull();
-    }
+    await open(page, backend);
+    await expect(page.getByText("Sesiunea ta")).toBeVisible({ timeout: 10_000 });
+    await arm(page);
+    const session = backend.session()!;
+    session.operator_connected_at = new Date().toISOString();
+    backend.publish("call.taken_over", { operator_connected_at: session.operator_connected_at }, session.id);
+    await expect(page.getByText("Un operator de la dispecerat vorbește cu tine.")).toBeVisible();
+    await expect.poll(() => backend.calls(/\/assistant\/prompt$/).some((call) => call.body?.line === "operator")).toBe(true);
+    backend.operatorMessages.set(session.id, [{ id: "op-1", at: new Date().toISOString(), mime_type: "audio/webm", audio_base64: "AAAA" }]);
+    await expect(page.getByTestId("chat")).toContainText("Mesaj vocal de la dispecer", { timeout: 8000 });
+    await page.waitForTimeout(16_000);
+    expect(backend.calls(/\/assistant\/prompt$/).filter((call) => call.body?.line === "nudge")).toHaveLength(0);
   });
 });

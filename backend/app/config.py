@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 
 class ConfigurationError(ValueError):
@@ -47,6 +48,8 @@ class Settings:
     )
 
     checkin_interval_seconds: float = 60.0
+    # First check-in after activation: the assistant asks "was it a mistake?" right away.
+    first_checkin_delay_seconds: float | None = None
     checkin_response_timeout_seconds: float = 15.0
     checkin_retry_delay_seconds: float = 5.0
     checkin_max_attempts: int = 2
@@ -98,9 +101,25 @@ class Settings:
     vapid_subject: str = "mailto:vesta@example.invalid"
     # Stable public HTTPS address, used in the QR code and documentation only.
     public_url: str | None = None
+    # Raspberry Pi camera service; credentials remain server-side and are never sent to browsers.
+    camera_base_url: str | None = None
+    camera_api_key: str | None = field(default=None, repr=False)
     # Built web app (frontend/dist) served by this process, so the phone needs one address.
     frontend_dist: str | None = None
     power_poll_seconds: float = 30.0
+    # Hackathon/demo: the person's phone and the trusted contact open their pages without any
+    # pairing code. Refused outside development/test.
+    open_access: bool = False
+    # Voice assistant: Gemini understands the person (audio in, decision out), ElevenLabs speaks.
+    gemini_api_key: str | None = field(default=None, repr=False)
+    gemini_model: str = "gemini-2.5-flash"
+    elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
+    elevenlabs_tts_model: str = "eleven_flash_v2_5"
+    assistant_timeout_seconds: float = 15.0
+    # Local database (SQLite) with recordings, transcripts and the dispatcher's voice messages.
+    # Default: VESTA_STATE_DIR/vesta.db; without a state dir it lives in memory (tests).
+    database_path: str | None = None
+    max_recording_bytes: int = 64 * 1024 * 1024
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -170,6 +189,23 @@ class Settings:
         if not gpio_lock_path:
             raise ConfigurationError("VESTA_GPIO_LOCK_PATH must not be empty")
 
+        camera_base_url = (os.getenv("VESTA_CAMERA_BASE_URL") or "").strip().rstrip("/") or None
+        camera_api_key = (os.getenv("VESTA_CAMERA_API_KEY") or "").strip() or None
+        if camera_base_url:
+            parsed_camera_url = urlsplit(camera_base_url)
+            if parsed_camera_url.scheme not in {"http", "https"} or not parsed_camera_url.netloc:
+                raise ConfigurationError("VESTA_CAMERA_BASE_URL must be an HTTP(S) URL")
+            if parsed_camera_url.hostname not in {"127.0.0.1", "localhost", "::1"} and not camera_api_key:
+                raise ConfigurationError("VESTA_CAMERA_API_KEY is required for a remote camera server")
+
+        open_access = _get_bool("VESTA_OPEN_ACCESS", False)
+        if open_access and environment not in {"development", "test"}:
+            raise ConfigurationError("VESTA_OPEN_ACCESS is only allowed in development/test")
+        first_delay_raw = (os.getenv("VESTA_FIRST_CHECKIN_DELAY_SECONDS") or "").strip()
+        first_checkin_delay = float(first_delay_raw) if first_delay_raw else None
+        if first_checkin_delay is not None and first_checkin_delay <= 0:
+            raise ConfigurationError("VESTA_FIRST_CHECKIN_DELAY_SECONDS must be greater than 0")
+
         return cls(
             app_name=os.getenv("VESTA_APP_NAME", "Vesta Safety Backend"),
             environment=environment,
@@ -218,6 +254,17 @@ class Settings:
             vapid_public_key=(os.getenv("VESTA_VAPID_PUBLIC_KEY") or "").strip() or None,
             vapid_subject=os.getenv("VESTA_VAPID_SUBJECT", "mailto:vesta@example.invalid").strip(),
             public_url=(os.getenv("VESTA_PUBLIC_URL") or "").strip().rstrip("/") or None,
+            camera_base_url=camera_base_url,
+            camera_api_key=camera_api_key,
             frontend_dist=(os.getenv("VESTA_FRONTEND_DIST") or "").strip() or None,
             power_poll_seconds=_get_float("VESTA_POWER_POLL_SECONDS", 30.0),
+            first_checkin_delay_seconds=first_checkin_delay,
+            open_access=open_access,
+            gemini_api_key=(os.getenv("GEMINI_API_KEY") or "").strip() or None,
+            gemini_model=(os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip(),
+            elevenlabs_voice_id=(os.getenv("ELEVENLABS_VOICE_ID") or "JBFqnCBsd6RMkjVDRZzb").strip(),
+            elevenlabs_tts_model=(os.getenv("ELEVENLABS_TTS_MODEL") or "eleven_flash_v2_5").strip(),
+            assistant_timeout_seconds=_get_float("VESTA_ASSISTANT_TIMEOUT_SECONDS", 15.0),
+            database_path=(os.getenv("VESTA_DATABASE_PATH") or "").strip() or None,
+            max_recording_bytes=_get_int("VESTA_MAX_RECORDING_BYTES", 64 * 1024 * 1024),
         )

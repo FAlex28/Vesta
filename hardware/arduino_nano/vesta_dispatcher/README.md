@@ -1,6 +1,6 @@
 # Vesta physical dispatcher — Arduino Nano
 
-Sketch-ul presupune un Arduino Nano clasic conectat prin USB la PC. PC-ul gestionează Wi-Fi,
+Sketch-ul funcționează pe Arduino Uno R3 sau Arduino Nano clasic (ATmega328P), conectat prin USB la PC. PC-ul gestionează Wi-Fi,
 WebSocket-ul Vesta și autentificarea; placa primește numai comenzi seriale și controlează
 LED-urile, buzzerele și LCD-ul. Nano nu are joystick, senzori sau conexiune Wi-Fi directă.
 
@@ -28,6 +28,7 @@ LCD-ul este configurat la adresa `0x27`, cu 16 coloane și 2 rânduri. Serial ru
 | Comandă | Efect |
 | --- | --- |
 | `HELLO` | Negociere; răspuns `HELLO\|VESTA_NANO\|1`. |
+| `BYE` | PC-ul se oprește voit: placa trece în „Astept PC”, fără eroare. O alertă activă continuă să sune. |
 | `PING` | Menține legătura; răspuns `PONG\|<millis>`. Se trimite la 2–5 secunde. |
 | `STATUS` | Returnează starea conexiunii, starea vizuală și alerta curentă. |
 | `READY` | Confirmă legătura cu PC-ul și șterge eroarea tehnică explicită, fără să închidă o alertă. |
@@ -58,12 +59,23 @@ TECHNICAL_RESOLVED
 
 - `BOOT|VESTA_NANO|1`
 - `OK|<comandă>` sau `ERR|<motiv>`
-- răspunsurile `PONG`, `STATUS` și `HELLO`
+- răspunsurile `PONG`, `STATUS` (`...|TECH=0|LCD=1|ID=`) și `HELLO`
+- `LINK|LOST|IDLE` (PC tăcut 10 s în repaus: doar așteptare) sau `LINK|LOST|SESSION` (PC tăcut în timpul unei sesiuni sau alerte: eroare)
+- `LCD|MISSING` la pornire, `LCD|LOST` / `LCD|OK` când LCD-ul cade sau revine
 
 ## Comportament de siguranță
 
 - Nu există apeluri blocante `delay()`.
-- Dacă PC-ul nu mai trimite comenzi timp de 10 secunde, legătura este indicată ca offline.
+- Placa știe că „are PC” doar din comenzile primite; conectarea USB singură nu se vede.
+  Fără comenzi timp de 10 secunde:
+  - **în repaus** (fără sesiune și fără alertă) placa doar așteaptă: LED alb cu o scurtă
+    pauză la 2 s, LCD `ALB 00 STANDBY / Astept PC`, fără buzzer. Erorile tehnice vechi se șterg;
+  - **în timpul unei sesiuni sau alerte** apare eroarea `ALBASTRU 04 ERR / CONEXIUNE PC` cu
+    buzzerul D8, fiindcă starea afișată poate fi depășită.
+- Dacă placa se resetează în mijlocul unei scrieri pe LCD, modulul I²C poate ține SDA jos.
+  La pornire placa eliberează magistrala (impulsuri pe SCL), iar fiecare tranzacție I²C are
+  timeout de 3 ms: un LCD deconectat nu mai blochează LED-urile, buzzerele sau serialul.
+  LCD-ul se reîncearcă la 5 s.
 - O alertă activă continuă să sune chiar dacă legătura cu PC-ul cade.
 - Un `ALERT_RESOLVED` cu alt `alert_id` nu poate opri alarma curentă.
 - Identificatorul notificării permite deduplicarea în bridge-ul care va rula pe PC.
@@ -75,10 +87,11 @@ TECHNICAL_RESOLVED
 | Situație | Linia 1 | Linia 2 |
 | --- | --- | --- |
 | Standby | `ALB 00 STANDBY` | `Fara sesiune` |
+| PC tăcut, în repaus (sau după `BYE`) | `ALB 00 STANDBY` | `Astept PC` |
 | Activ | `VERDE 01 ACTIV` | `Conversatie OK` |
 | Verificare | `GALBEN 02 CHECK` | `Astept raspuns` |
 | Alertă | `ROSU 03 ALERTA` | motivul alertei |
-| Eroare tehnică | `ALBASTRU 04 ERR` | componenta sau `CONEXIUNE PC` |
+| Eroare tehnică | `ALBASTRU 04 ERR` | componenta sau `CONEXIUNE PC` (doar în sesiune/alertă) |
 | Alertă rezolvată | `ALB 00 STANDBY` | `Alerta rezolvata` |
 
 Motivele backendului sunt adaptate pentru cele 16 caractere ale LCD-ului: `SOS_EXPLICIT`

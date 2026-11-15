@@ -8,8 +8,10 @@ import "./styles.css";
 //   /            dashboard (read-only)
 //   /companion   phone page used during a session
 //   /contact     trusted-contact test view
+//   /buton       button simulator (stands in for the joystick while the Pi is off)
 const CompanionPage = lazy(() => import("./companion/CompanionPage"));
 const ContactPage = lazy(() => import("./contact/ContactPage"));
+const ButtonPage = lazy(() => import("./simulator/ButtonPage"));
 
 const path = window.location.pathname.replace(/\/+$/, "") || "/";
 
@@ -27,6 +29,14 @@ function Root() {
     return (
       <Suspense fallback={<p className="route-loading">Se încarcă…</p>}>
         <ContactPage />
+      </Suspense>
+    );
+  }
+  if (path === "/buton") {
+    document.title = "Vesta — Simulator buton";
+    return (
+      <Suspense fallback={<p className="route-loading">Se încarcă…</p>}>
+        <ButtonPage />
       </Suspense>
     );
   }

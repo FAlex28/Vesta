@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test camere Pi</title>
+<style>
+  :root { --bg:#111418; --card:#1b2027; --line:#2c333d; --text:#e8ecf1; --muted:#9aa4b2; --ok:#3ecf8e; --bad:#ff6b6b; --accent:#ffb347; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding:16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 16px; align-items:baseline; }
+  header h1 { font-size:18px; margin:0; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px; padding:16px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .head { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--line); }
+  .head h2 { margin:0; font-size:15px; }
+  .pill { font-size:12px; padding:2px 8px; border-radius:99px; border:1px solid currentColor; }
+  .on { color:var(--ok); } .off { color:var(--bad); }
+  .view { position:relative; background:#000; }
+  .view img { display:block; width:100%; height:auto; image-rendering:auto; }
+  #thermalImg { cursor:crosshair; }
+  .probe { position:absolute; pointer-events:none; background:rgba(0,0,0,.75); padding:2px 6px; border-radius:4px; font-size:13px; display:none; }
+  .meta { padding:10px 12px; font-size:13px; color:var(--muted); display:grid; gap:4px; }
+  .stats { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; padding:10px 12px; border-top:1px solid var(--line); }
+  .stats div { text-align:center; }
+  .stats b { display:block; font-size:18px; color:var(--text); font-variant-numeric:tabular-nums; }
+  .stats span { font-size:12px; color:var(--muted); }
+  select, a { color:var(--text); }
+  select { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:4px 6px; font:inherit; }
+  select:focus-visible, a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .links { padding:0 16px 24px; color:var(--muted); font-size:13px; }
+  .links a { margin-right:12px; }
+  .err { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Test camere Raspberry Pi</h1>
+  <p>Flux local de pe Pi, fără aplicația producătorului. Valorile termice sunt citite direct din cameră.</p>
+</header>
+<main>
+  <section>
+    <div class="head">
+      <h2>Cameră termică</h2>
+      <label>Paletă
+        <select id="palette">
+          <option value="inferno">inferno</option>
+          <option value="turbo">turbo</option>
+          <option value="jet">jet</option>
+          <option value="hot">hot</option>
+          <option value="gray">gri</option>
+        </select>
+      </label>
+      <span id="thermalPill" class="pill off">deconectată</span>
+    </div>
+    <div class="view">
+      <img id="thermalImg" alt="Imagine termică în timp real" src="/stream/thermal.mjpg?palette=inferno">
+      <div id="probe" class="probe"></div>
+    </div>
+    <div class="stats">
+      <div><b id="sMin">–</b><span>min °C</span></div>
+      <div><b id="sCenter">–</b><span>centru °C</span></div>
+      <div><b id="sAvg">–</b><span>medie °C</span></div>
+      <div><b id="sMax">–</b><span>max °C</span></div>
+    </div>
+    <div class="meta" id="thermalMeta"></div>
+  </section>
+  <section>
+    <div class="head">
+      <h2>Cameră normală</h2>
+      <span id="rgbPill" class="pill off">deconectată</span>
+    </div>
+    <div class="view"><img id="rgbImg" alt="Imagine cameră normală în timp real" src="/stream/rgb.mjpg"></div>
+    <div class="meta" id="rgbMeta"></div>
+  </section>
+</main>
+<div class="links">
+  Date: <a href="/api/status">/api/status</a>
+  <a href="/api/thermal/matrix.json?step=4">/api/thermal/matrix.json</a>
+  <a href="/api/thermal/raw.npy">/api/thermal/raw.npy</a>
+  <a href="/snapshot/thermal.jpg" download>captură termică</a>
+  <a href="/snapshot/rgb.jpg" download>captură normală</a>
+  · Click pe imaginea termică pentru temperatura din punct.
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (v) => (v === null || v === undefined) ? "–" : v.toFixed(1);
+
+$("palette").addEventListener("change", (e) => {
+  $("thermalImg").src = "/stream/thermal.mjpg?palette=" + e.target.value + "&t=" + Date.now();
+});
+
+function meta(el, cam) {
+  const rows = [
+    ["Dispozitiv", cam.device || "–"],
+    ["Mod", cam.mode || "–"],
+    ["Cadre/s", cam.connected ? cam.fps : "–"],
+  ];
+  el.innerHTML = rows.map(([k, v]) => `<div>${k}: <span style="color:var(--text)">${v}</span></div>`).join("")
+    + (cam.error ? `<div class="err">${cam.error}</div>` : "");
+}
+function pill(el, on) { el.textContent = on ? "conectată" : "deconectată"; el.className = "pill " + (on ? "on" : "off"); }
+
+async function poll() {
+  try {
+    const s = await (await fetch("/api/status", { cache: "no-store" })).json();
+    pill($("thermalPill"), s.thermal.connected); pill($("rgbPill"), s.rgb.connected);
+    meta($("thermalMeta"), s.thermal); meta($("rgbMeta"), s.rgb);
+    const st = s.thermal.stats || {};
+    $("sMin").textContent = fmt(st.min); $("sMax").textContent = fmt(st.max);
+    $("sAvg").textContent = fmt(st.avg); $("sCenter").textContent = fmt(st.center);
+  } catch (e) { /* serverul repornește */ }
+  setTimeout(poll, 1000);
+}
+poll();
+
+$("thermalImg").addEventListener("click", async (e) => {
+  const r = e.target.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+  const probe = $("probe");
+  try {
+    const res = await (await fetch(`/api/thermal/point?x=${x}&y=${y}`)).json();
+    probe.textContent = res.temp_c !== undefined ? res.temp_c.toFixed(1) + " °C" : res.error;
+  } catch { probe.textContent = "eroare"; }
+  probe.style.left = (e.clientX - r.left + 10) + "px";
+  probe.style.top = (e.clientY - r.top + 10) + "px";
+  probe.style.display = "block";
+});
+</script>
+</body>
+</html>

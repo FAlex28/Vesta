@@ -71,6 +71,8 @@ cu cheile configurate și originile CORS restrânse. Aplicația nu încarcă aut
 | `VESTA_CONTROL_TOKEN_TTL_SECONDS` | `14400` | Durata tokenului de control. |
 | `VESTA_DEVICE_API_KEY` | neconfigurat | Protejează ruta de integrare `/device/events`; activarea GPIO internă nu o folosește. |
 | `VESTA_DASHBOARD_API_KEY` | neconfigurat | Protejează statusul global și fluxul dashboard unde este configurat. |
+| `VESTA_CAMERA_BASE_URL` | neconfigurat | Adresa serverului video de pe Pi; implicit pe Pi: `http://127.0.0.1:8080`. |
+| `VESTA_CAMERA_API_KEY` | neconfigurat | Cheia server-side pentru proxy-ul securizat către camere. Obligatorie pentru adrese din rețea. |
 | `VESTA_GPIO_MODE` | `mock` în dev/test | `gpio`, `mock` sau `disabled`; în afara dev/test este obligatoriu `gpio`. |
 | `VESTA_GPIO_PIN` | `17` | Pin BCM al butonului. |
 | `VESTA_HOLD_SECONDS` | `5.0` | Durata continuă necesară activării. |

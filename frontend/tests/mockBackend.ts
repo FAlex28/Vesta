@@ -1,5 +1,5 @@
 import type { Page, Route, WebSocketRoute } from "playwright/test";
-import type { EventEnvelope, SessionView, SystemStatus } from "../src/api/contract";
+import type { AssistantAction, ConversationTurn, EventEnvelope, SessionView, SystemStatus } from "../src/api/contract";
 
 /*
  * In-browser mock of the v2 backend (shared/API_CONTRACT.md): GET /api/v1/status,
@@ -25,7 +25,9 @@ const BODY_RULES: Record<string, Record<string, FieldRule>> = {
   heartbeat: { page_visibility: { oneOf: ["VISIBLE", "HIDDEN", "UNKNOWN"] } },
   checkins: { event_id: { required: true, type: "string" }, checkin_id: { required: true, type: "string" }, confirmation: { oneOf: ["safe"] }, source: { oneOf: SOURCES } },
   sos: { event_id: { required: true, type: "string" }, source: { oneOf: SOURCES }, reason: { type: "string" } },
-  cancel: { event_id: { required: true, type: "string" }, reason: { oneOf: ["ACCIDENTAL_ACTIVATION", "USER_CANCELLED", "SESSION_ENDED"] } },
+  cancel: { event_id: { required: true, type: "string" }, reason: { oneOf: ["ACCIDENTAL_ACTIVATION", "USER_CANCELLED", "SESSION_ENDED", "FALSE_ALARM"] } },
+  "assistant/prompt": { event_id: { required: true, type: "string" }, line: { oneOf: ["checkin", "alert", "false_alarm", "confirm_safe", "nudge", "operator"] } },
+  "assistant/reply": { event_id: { required: true, type: "string" }, audio_base64: { required: true, type: "string" }, mime_type: { oneOf: ["audio/wav", "audio/webm", "audio/ogg", "audio/mpeg"] } },
   resolve: { event_id: { required: true, type: "string" }, action: { required: true, type: "string" } },
   "client-status": {
     event_id: { required: true, type: "string" },
@@ -141,7 +143,19 @@ export class MockBackend {
   /** One-time contact invites: code -> contact id. */
   invites = new Map<string, string>();
   /** Last authorized location per session, as the real backend keeps it. */
-  locations = new Map<string, { latitude: number; longitude: number; captured_at: string; accuracy_meters: number | null }>();
+  locations = new Map<string, { latitude: number; longitude: number; captured_at: string; accuracy_meters: number | null; source?: string }>();
+  /** VESTA_OPEN_ACCESS: phone and contact open without codes. */
+  openAccess = true;
+  /** Gemini / ElevenLabs configured on the server. */
+  assistant = { understanding: false, voice: false };
+  /** What the next assistant/reply decides. */
+  nextReply: { transcript: string; reply: string; action: AssistantAction } = { transcript: "", reply: "Nu am înțeles.", action: "NONE" };
+  /** Conversation turns per session (text only). */
+  turns = new Map<string, ConversationTurn[]>();
+  /** Uploaded recording chunk sequence numbers per session. */
+  chunks = new Map<string, number[]>();
+  /** Dispatcher's push-to-talk messages per session. */
+  operatorMessages = new Map<string, Array<{ id: string; at: string; mime_type: string; audio_base64: string }>>();
 
   /** An invite for a new contact, as if the person had added one on her phone. */
   inviteContact(name = "Mama", phone = "+40722123456") {
@@ -169,6 +183,7 @@ export class MockBackend {
       latest_sequence: this.sequence,
       sessions: structuredClone(this.sessions),
       voice_mode: this.voiceMode,
+      assistant: this.assistant,
       alert_locations: this.sessions
         .filter((item) => item.alert?.status === "ACTIVE" && this.locations.has(item.id))
         .map((item) => {
@@ -213,7 +228,7 @@ export class MockBackend {
     const url = new URL(request.url());
     let body: Record<string, unknown> | null = null;
     try {
-      body = request.postDataJSON() as Record<string, unknown>;
+      body = url.pathname.endsWith("/recording/chunks") ? null : (request.postDataJSON() as Record<string, unknown>);
     } catch {
       body = null;
     }
@@ -240,6 +255,41 @@ export class MockBackend {
       route.fulfill({
         json: { scope, device_id: "vesta-01", access_token: scope === "companion" ? COMPANION_TOKEN : CONTACT_TOKEN, expires_at: new Date(Date.now() + 86_400_000).toISOString() },
       });
+    if (recorded.path === "/api/v1/recordings") {
+      return route.fulfill({
+        json: this.sessions
+          .filter((item) => item.alert && item.alert.resolution_action !== "FALSE_ALARM")
+          .map((item) => ({
+            session_id: item.id,
+            device_id: item.device_id,
+            started_at: item.created_at,
+            updated_at: item.updated_at,
+            size_bytes: (this.chunks.get(item.id)?.length ?? 0) * 4000,
+            chunks: this.chunks.get(item.id)?.length ?? 0,
+            finalized: item.state === "CANCELLED",
+            alert_id: item.alert!.id,
+            alert_reason: item.alert_reason,
+            alert_at: item.alert!.created_at,
+            resolution: item.alert!.resolution_action,
+            resolved_at: item.alert!.resolved_at,
+            operator_at: item.operator_connected_at ?? null,
+            turns: this.turns.get(item.id)?.length ?? 0,
+          })),
+      });
+    }
+    if (recorded.path === "/api/v1/access/open" && recorded.method === "POST") {
+      if (!this.openAccess) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Open access is not enabled" } } });
+      return grant(body?.scope === "contact" ? "contact" : "companion");
+    }
+    if (recorded.path === "/api/v1/simulator/press" && recorded.method === "POST") {
+      if (!this.openAccess) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "disabled" } } });
+      const running = this.sessions.find((item) => item.state !== "CANCELLED");
+      if (running) return route.fulfill({ json: { outcome: "ALREADY_ACTIVE", session_id: running.id, state: running.state } });
+      const session = makeSession();
+      this.sessions.push(session);
+      this.publish("session.activated", { from_state: "IDLE", state: "ACTIVE" }, session.id);
+      return route.fulfill({ json: { outcome: "ACTIVATED", session_id: session.id, state: "ACTIVE" } });
+    }
     if (recorded.path === "/api/v1/pairing/device" && recorded.method === "POST") {
       if (normalize(body?.code) !== this.deviceCode) return unauthorized();
       const now = new Date().toISOString();
@@ -340,6 +390,53 @@ export class MockBackend {
 
     const match = recorded.path.match(/^\/api\/v1\/sessions\/([^/]+)\/(.+)$/);
     if (!match) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "not found" } } });
+    // Dispatcher takes the call / talks (dashboard key).
+    if (recorded.method === "POST" && (match[2] === "takeover" || match[2] === "operator/messages")) {
+      const owner = this.session(decodeURIComponent(match[1]));
+      if (!owner) return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Unknown session" } } });
+      if (match[2] === "takeover") {
+        if (!["ACTIVE", "CHECK_IN", "UNCONFIRMED", "ALERT"].includes(owner.state)) {
+          return route.fulfill({ status: 409, json: { error: { code: "SESSION_NOT_ACTIVE", message: "session is not active" } } });
+        }
+        owner.operator_connected_at ??= new Date().toISOString();
+        this.publish("call.taken_over", { operator_connected_at: owner.operator_connected_at }, owner.id);
+        return route.fulfill({ json: { session_id: owner.id, operator_connected_at: owner.operator_connected_at } });
+      }
+      if (!owner.operator_connected_at) return route.fulfill({ status: 409, json: { error: { code: "NOT_TAKEN_OVER", message: "take over first" } } });
+      const list = this.operatorMessages.get(owner.id) ?? [];
+      const message = { id: `op-${list.length + 1}`, at: new Date().toISOString(), mime_type: "audio/webm", audio_base64: "AAAA" };
+      list.push(message);
+      this.operatorMessages.set(owner.id, list);
+      this.addTurn(owner.id, "operator", "Mesaj vocal — transcriere indisponibilă.");
+      this.publish("operator.message", { message_id: message.id }, owner.id);
+      return route.fulfill({ json: { id: message.id, at: message.at } });
+    }
+    if (recorded.method === "GET" && match[2] === "operator/messages") {
+      if (recorded.auth !== `Bearer ${TOKEN}`) return route.fulfill({ status: 401, json: { error: { code: "UNAUTHORIZED", message: "token" } } });
+      const after = new URL(recorded.url).searchParams.get("after");
+      const list = this.operatorMessages.get(decodeURIComponent(match[1])) ?? [];
+      const index = after ? list.findIndex((item) => item.id === after) + 1 : 0;
+      return route.fulfill({ json: list.slice(index) });
+    }
+    // Dispatcher reads (dashboard key, no control token): shared only once an alert exists.
+    if (recorded.method === "GET" && (match[2] === "conversation" || match[2] === "recording")) {
+      const owner = this.session(decodeURIComponent(match[1]));
+      const live = owner && ["ACTIVE", "CHECK_IN", "UNCONFIRMED", "ALERT"].includes(owner.state);
+      if (!owner || (!owner.alert && !live) || owner.alert?.resolution_action === "FALSE_ALARM") {
+        return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "Nothing shared" } } });
+      }
+      if (match[2] === "recording") return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "No recording" } } });
+      const count = this.chunks.get(owner.id)?.length ?? 0;
+      return route.fulfill({
+        json: {
+          session_id: owner.id,
+          turns: this.turns.get(owner.id) ?? [],
+          recording: count
+            ? { mime_type: "audio/webm", size_bytes: count * 4000, chunks: count, started_at: owner.created_at, updated_at: new Date().toISOString(), finalized: false }
+            : null,
+        },
+      });
+    }
     const [, id, rawAction] = match;
     const resolveMatch = rawAction.match(/^alerts\/([^/]+)\/resolve$/);
     const deliveryMatch = rawAction.match(/^checkins\/([^/]+)\/delivery$/);
@@ -397,9 +494,17 @@ export class MockBackend {
         if (reason === "ACCIDENTAL_ACTIVATION" && !(session.quick_cancel_until && Date.parse(session.quick_cancel_until) > Date.now())) {
           return conflict("QUICK_CANCEL_EXPIRED");
         }
-        if (session.state === "ALERT" && reason !== "ACCIDENTAL_ACTIVATION") return conflict("ALERT_REQUIRES_RESOLUTION");
+        if (session.state === "ALERT" && reason !== "ACCIDENTAL_ACTIVATION" && reason !== "FALSE_ALARM") return conflict("ALERT_REQUIRES_RESOLUTION");
+        if (session.state === "ALERT" && session.alert) {
+          session.alert = { ...session.alert, status: "RESOLVED", resolved_at: now, resolution_action: reason, updated_at: now, version: session.alert.version + 1 };
+        }
         session.cancellation_reason = reason;
         this.transition(session, "CANCELLED", "session.cancelled", { reason });
+        if (reason === "FALSE_ALARM") {
+          this.turns.delete(session.id);
+          this.chunks.delete(session.id);
+          this.locations.delete(session.id);
+        }
         return reply();
       }
       case "resolve": {
@@ -466,6 +571,58 @@ export class MockBackend {
             },
           },
         });
+      case "assistant/prompt": {
+        if (session.state === "CANCELLED" && body?.line !== "false_alarm") return conflict("SESSION_CANCELLED");
+        const line = String(body?.line ?? "checkin");
+        const texts: Record<string, string> = {
+          checkin: session.checkin_attempt >= 2 ? "Nu te-am auzit. Ești în siguranță?" : "Bună, sunt Vesta. A fost o apăsare din greșeală?",
+          alert: "Am anunțat dispeceratul și persoana ta de încredere.",
+          false_alarm: "Am înțeles, a fost o alarmă falsă. Am oprit Vesta.",
+          confirm_safe: "Mă bucur că ești bine.",
+        };
+        const text = texts[line];
+        this.addTurn(session.id, "assistant", text);
+        return route.fulfill({ json: { text, audio_base64: null, mime_type: null, turn_id: `turn-${this.eventCounter}` } });
+      }
+      case "assistant/reply": {
+        if (session.state === "CANCELLED") return conflict("SESSION_CANCELLED");
+        const decision = this.assistant.understanding
+          ? this.nextReply
+          : { transcript: "Mesajul nu a putut fi transcris.", reply: "Nu am putut transcrie ce ai spus. Dacă ai nevoie de ajutor, apasă butonul roșu.", action: "NONE" as const };
+        let applied = false;
+        if (decision.transcript) this.addTurn(session.id, "person", decision.transcript, decision.action);
+        this.addTurn(session.id, "assistant", decision.reply);
+        if (decision.action === "FALSE_ALARM" && decision.transcript) {
+          session.cancellation_reason = "FALSE_ALARM";
+          this.transition(session, "CANCELLED", "session.cancelled", { reason: "FALSE_ALARM" });
+          this.turns.delete(session.id);
+          this.chunks.delete(session.id);
+          applied = true;
+        } else if (decision.action === "ESCALATE" && session.state !== "ALERT") {
+          session.alert_reason = "SOS_EXPLICIT";
+          session.alert = { id: `alert-${session.id}`, incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 };
+          this.transition(session, "ALERT", "safety.alerted", { reason: "SOS_EXPLICIT", source: "voice_agent" });
+          applied = true;
+        }
+        return route.fulfill({
+          json: {
+            transcript: decision.transcript,
+            action: decision.action,
+            applied,
+            reply: { text: decision.reply, audio_base64: null, mime_type: null, turn_id: null },
+            session: structuredClone(session),
+          },
+        });
+      }
+      case "recording/chunks": {
+        if (session.cancellation_reason === "FALSE_ALARM") return conflict("SESSION_CANCELLED");
+        const seq = Number(new URL(recorded.url).searchParams.get("seq"));
+        const list = this.chunks.get(session.id) ?? [];
+        if (seq > list.length) return conflict("RECORDING_GAP");
+        if (seq === list.length) list.push(seq);
+        this.chunks.set(session.id, list);
+        return route.fulfill({ json: { chunks: list.length, size_bytes: list.length * 4000 } });
+      }
       case "voice/access":
         if (session.state === "CANCELLED") return conflict("SESSION_CANCELLED");
         if (this.voiceReserved) return conflict("VOICE_ALREADY_ACTIVE");
@@ -479,6 +636,13 @@ export class MockBackend {
       default:
         return route.fulfill({ status: 404, json: { error: { code: "NOT_FOUND", message: "unknown" } } });
     }
+  }
+
+  addTurn(sessionId: string, role: "person" | "assistant" | "operator", text: string, action: string | null = null) {
+    const list = this.turns.get(sessionId) ?? [];
+    list.push({ id: `turn-${++this.eventCounter}`, role, text, at: new Date().toISOString(), action });
+    this.turns.set(sessionId, list);
+    this.publish("conversation.updated", { role, action }, sessionId);
   }
 
   private conflict(route: Route) {
@@ -529,20 +693,42 @@ export class MockBackend {
 /** Replace browser device APIs before the app loads. No real permission prompt is triggered. */
 export async function installDeviceFakes(
   page: Page,
-  options: { mic?: "grant" | "deny"; gps?: "grant" | "deny" | "stale" } = {},
+  options: { mic?: "grant" | "deny"; gps?: "grant" | "deny" | "stale" | "coarse" } = {},
 ) {
   await page.addInitScript(({ mic, gps }) => {
     const w = window as unknown as Record<string, unknown>;
     w.__voiceLog = [] as string[];
     if (navigator.mediaDevices) {
       navigator.mediaDevices.getUserMedia = async () => {
+        (w.__micRequests as number | undefined) ??= 0;
+        w.__micRequests = (w.__micRequests as number) + 1;
         if (mic === "deny") throw new DOMException("denied", "NotAllowedError");
-        return { getTracks: () => [{ stop() {} }] } as unknown as MediaStream;
+        // A real MediaStream: a tone whose loudness the test controls (__speak(true/false)).
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        gain.gain.value = 0;
+        osc.frequency.value = 220;
+        const dest = ctx.createMediaStreamDestination();
+        osc.connect(gain).connect(dest);
+        osc.start();
+        void ctx.resume();
+        w.__speak = (on: boolean) => gain.gain.setValueAtTime(on ? 0.6 : 0, ctx.currentTime);
+        return dest.stream;
+      };
+    }
+    // The browser voice is not needed in tests: finish "speaking" at once.
+    if ("speechSynthesis" in window) {
+      const synth = window.speechSynthesis;
+      synth.speak = (utterance: SpeechSynthesisUtterance) => {
+        (w.__spoken as string[] | undefined) ??= [];
+        (w.__spoken as string[]).push(utterance.text);
+        setTimeout(() => utterance.onend?.(new Event("end") as SpeechSynthesisEvent), 30);
       };
     }
     const position = (ageMs: number) =>
       ({
-        coords: { latitude: 45.75, longitude: 21.23, accuracy: 18, altitude: null, altitudeAccuracy: null, heading: null, speed: null },
+        coords: { latitude: 45.75, longitude: 21.23, accuracy: gps === "coarse" ? 2000 : 18, altitude: null, altitudeAccuracy: null, heading: null, speed: null },
         timestamp: Date.now() - ageMs,
       }) as unknown as GeolocationPosition;
     const deny = (error?: PositionErrorCallback | null) =>

@@ -12,6 +12,7 @@ from .alerts import AlertsRepo
 from .checkins import CheckinsRepo
 from .companions import CompanionsRepo
 from .config import DbSettings
+from .conversations import ConversationsRepo
 from .errors import *  # noqa: F401,F403
 from .events import EventsRepo, derived_event_id
 from .locations import LocationsRepo
@@ -41,6 +42,7 @@ class Database:
         self.notifications = NotificationsRepo(self.pool, s)
         self.locations = LocationsRepo(self.pool, s)
         self.companions = CompanionsRepo(self.pool, s)
+        self.conversations = ConversationsRepo(self.pool, s)
         self.tokens = TokensRepo(self.pool, s)
         self.events = EventsRepo(self.pool)
 

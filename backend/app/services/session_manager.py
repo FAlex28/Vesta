@@ -394,18 +394,20 @@ class SessionManager:
                     "The accidental-activation cancellation window has expired",
                 )
 
+            false_alarm = normalized_reason == CancellationReason.FALSE_ALARM.value
             if session.state is SessionState.ALERT:
-                if not accidental:
+                if not (accidental or false_alarm):
                     raise ConflictError(
                         "ALERT_REQUIRES_RESOLUTION",
                         "A transmitted alert must be resolved explicitly",
                     )
+                # A false alarm stops even a transmitted alert: the person said so explicitly.
                 result = await self._resolve_alert_locked(
                     session,
                     alert_id=None,
                     now=instant,
-                    action=CancellationReason.ACCIDENTAL_ACTIVATION.value,
-                    cancellation_reason=CancellationReason.ACCIDENTAL_ACTIVATION.value,
+                    action=normalized_reason,
+                    cancellation_reason=normalized_reason,
                     command_event_id=event_id,
                 )
                 self._remember(event_id, fingerprint, session_id)
@@ -457,6 +459,11 @@ class SessionManager:
                 alert_id=alert_id,
                 now=instant,
                 action=action,
+                cancellation_reason=(
+                    CancellationReason.FALSE_ALARM.value
+                    if action == CancellationReason.FALSE_ALARM.value
+                    else None
+                ),
                 command_event_id=event_id,
             )
             self._remember(event_id, fingerprint, session_id)
@@ -932,6 +939,26 @@ class SessionManager:
             session = max(unfinished, key=lambda item: item.version)
             token, expires_at = self._issue_control_token(session.session_id, instant)
             return copy.deepcopy(session), token, expires_at
+
+    async def current_for_device(self, device_id: str) -> SafetySession | None:
+        """The device's unfinished session (newest), without issuing any token."""
+
+        async with self._lock:
+            unfinished = [
+                session
+                for session in self._sessions.values()
+                if session.device_id == device_id
+                and session.state
+                in {
+                    SessionState.ACTIVE,
+                    SessionState.CHECK_IN,
+                    SessionState.UNCONFIRMED,
+                    SessionState.ALERT,
+                }
+            ]
+            if not unfinished:
+                return None
+            return copy.deepcopy(max(unfinished, key=lambda item: item.version))
 
     async def mark_alert_viewed(
         self,

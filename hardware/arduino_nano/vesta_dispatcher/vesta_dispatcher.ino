@@ -5,7 +5,13 @@
 // Vesta physical dispatcher for an Arduino Nano (ATmega328P).
 // The PC owns Wi-Fi and sends newline-terminated commands over USB Serial.
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+const uint8_t LCD_ADDRESS = 0x27;
+const uint8_t LCD_SDA_PIN = A4;
+const uint8_t LCD_SCL_PIN = A5;
+const unsigned long LCD_RETRY_MS = 5000UL;
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+bool lcdReady = false;
+unsigned long lastLcdRetryAt = 0;
 
 // Standard vizual Vesta: 00 alb, 01 verde, 02 galben, 03 roșu, 04 albastru.
 const uint8_t LED_STANDBY_WHITE = 2;
@@ -190,8 +196,22 @@ void updateTechnicalSound(unsigned long now) {
   }
 }
 
+// Fără comenzi de la PC, placa nu știe nimic nou. Asta e o eroare doar dacă afișa o sesiune
+// sau o alertă (informația ar putea fi depășită). În repaus doar așteaptă PC-ul, fără alarmă.
+bool sessionShown() {
+  return alertActive || safetyState != STATE_STANDBY;
+}
+
+bool linkLostError() {
+  return !pcLinked && sessionShown();
+}
+
+bool waitingForPc() {
+  return !pcLinked && !sessionShown();
+}
+
 bool technicalStateActive() {
-  return technicalError || !pcLinked;
+  return technicalError || linkLostError();
 }
 
 void updateSound(unsigned long now) {
@@ -251,6 +271,8 @@ void printStatus() {
   Serial.print(alertActive ? 1 : 0);
   Serial.print(F("|TECH="));
   Serial.print(technicalStateActive() ? 1 : 0);
+  Serial.print(F("|LCD="));
+  Serial.print(lcdReady ? 1 : 0);
   Serial.print(F("|ID="));
   Serial.println(activeAlertId);
 }
@@ -268,6 +290,19 @@ void processCommand(char *line, unsigned long now) {
   }
 
   markPcActivity(now);
+
+  if (strcmp(command, "BYE") == 0) {
+    // PC-ul se oprește intenționat: placa trece în așteptare, fără eroare. O alertă activă
+    // continuă să sune până la ALERT_RESOLVED.
+    pcLinked = false;
+    if (!alertActive) {
+      safetyState = STATE_STANDBY;
+    }
+    technicalError = false;
+    technicalReason[0] = '\0';
+    acknowledge(F("BYE"));
+    return;
+  }
 
   if (strcmp(command, "HELLO") == 0) {
     Serial.println(F("HELLO|VESTA_NANO|1"));
@@ -422,6 +457,14 @@ void updateLink(unsigned long now) {
   if (pcLinked && now - lastPcMessageAt > PC_TIMEOUT_MS) {
     pcLinked = false;
     technicalSoundStartedAt = now;
+    if (sessionShown()) {
+      Serial.println(F("LINK|LOST|SESSION"));
+    } else {
+      // Erorile tehnice vechi nu mai sunt sigure fără PC; placa doar așteaptă.
+      technicalError = false;
+      technicalReason[0] = '\0';
+      Serial.println(F("LINK|LOST|IDLE"));
+    }
   }
 }
 
@@ -442,6 +485,9 @@ void updateLeds(unsigned long now) {
     digitalWrite(LED_CHECK_YELLOW, slowBlink);
   } else if (safetyState == STATE_ACTIVE) {
     digitalWrite(LED_ACTIVE_GREEN, HIGH);
+  } else if (waitingForPc()) {
+    // Așteptare: alb cu o scurtă pauză la 2 s, ca să se vadă că placa e pornită.
+    digitalWrite(LED_STANDBY_WHITE, (now % 2000UL) < 1700UL);
   } else {
     digitalWrite(LED_STANDBY_WHITE, HIGH);
   }
@@ -459,18 +505,80 @@ void padLcdLine(char *destination, const char *source) {
   destination[16] = '\0';
 }
 
+// Dacă placa se resetează în mijlocul unei scrieri pe LCD (upload, deschiderea portului USB),
+// modulul I2C al LCD-ului poate rămâne cu SDA ținut jos. Fără eliberarea magistralei,
+// lcd.init() s-ar bloca pentru totdeauna: fără LED-uri, fără alarmă, fără răspuns pe serial.
+void recoverI2cBus() {
+  pinMode(LCD_SDA_PIN, INPUT_PULLUP);
+  pinMode(LCD_SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(10);
+  for (uint8_t pulse = 0; pulse < 16 && digitalRead(LCD_SDA_PIN) == LOW; ++pulse) {
+    pinMode(LCD_SCL_PIN, OUTPUT);
+    digitalWrite(LCD_SCL_PIN, LOW);
+    delayMicroseconds(5);
+    pinMode(LCD_SCL_PIN, INPUT_PULLUP);
+    delayMicroseconds(5);
+  }
+  // Condiție STOP: SDA urcă în timp ce SCL e sus.
+  pinMode(LCD_SDA_PIN, OUTPUT);
+  digitalWrite(LCD_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  pinMode(LCD_SDA_PIN, INPUT_PULLUP);
+  delayMicroseconds(5);
+}
+
+bool startLcd() {
+  recoverI2cBus();
+  Wire.begin();
+  // Orice tranzacție I2C blocată se abandonează după 3 ms, în loc să înghețe placa.
+  Wire.setWireTimeout(3000, true);
+  Wire.clearWireTimeoutFlag();
+  Wire.beginTransmission(LCD_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  lcd.init();
+  Wire.setWireTimeout(3000, true);
+  lcd.backlight();
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    return false;
+  }
+  lastLcdLine1[0] = '\0';
+  lastLcdLine2[0] = '\0';
+  return true;
+}
+
 void writeLcdLine(uint8_t row, const char *text, char *lastText) {
   char padded[17];
   padLcdLine(padded, text);
-  if (strcmp(padded, lastText) == 0) {
+  if (!lcdReady || strcmp(padded, lastText) == 0) {
     return;
   }
   lcd.setCursor(0, row);
   lcd.print(padded);
+  if (Wire.getWireTimeoutFlag()) {
+    // LCD deconectat sau magistrală blocată: LED-urile și buzzerele continuă, LCD-ul se reia.
+    Wire.clearWireTimeoutFlag();
+    lcdReady = false;
+    Serial.println(F("LCD|LOST"));
+    return;
+  }
   copyText(lastText, 17, padded);
 }
 
 void updateLcd(unsigned long now) {
+  if (!lcdReady) {
+    if (now - lastLcdRetryAt < LCD_RETRY_MS) {
+      return;
+    }
+    lastLcdRetryAt = now;
+    lcdReady = startLcd();
+    if (!lcdReady) {
+      return;
+    }
+    Serial.println(F("LCD|OK"));
+  }
   if (now - lastLcdUpdateAt < LCD_INTERVAL_MS) {
     return;
   }
@@ -487,8 +595,11 @@ void updateLcd(unsigned long now) {
     copyText(
       line2,
       sizeof(line2),
-      pcLinked ? (technicalReason[0] == '\0' ? "EROARE TEHNICA" : technicalReason) : "CONEXIUNE PC"
+      linkLostError() ? "CONEXIUNE PC" : (technicalReason[0] == '\0' ? "EROARE TEHNICA" : technicalReason)
     );
+  } else if (waitingForPc()) {
+    copyText(line1, sizeof(line1), "ALB 00 STANDBY");
+    copyText(line2, sizeof(line2), "Astept PC");
   } else if (deadlineActive(now, resolvedDisplayUntil)) {
     copyText(line1, sizeof(line1), "ALB 00 STANDBY");
     copyText(line2, sizeof(line2), "Alerta rezolvata");
@@ -510,9 +621,7 @@ void updateLcd(unsigned long now) {
 void setup() {
   Serial.begin(115200);
 
-  lcd.init();
-  lcd.backlight();
-
+  // LED-urile și buzzerele întâi: funcționează chiar dacă LCD-ul lipsește.
   for (uint8_t i = 0; i < sizeof(LEDS) / sizeof(LEDS[0]); ++i) {
     pinMode(LEDS[i], OUTPUT);
     digitalWrite(LEDS[i], LOW);
@@ -521,9 +630,14 @@ void setup() {
   pinMode(BUZZER_ALERT, OUTPUT);
   pinMode(BUZZER_TECHNICAL, OUTPUT);
 
+  lcdReady = startLcd();
+  lastLcdRetryAt = millis();
   writeLcdLine(0, "VESTA DISP V1", lastLcdLine1);
-  writeLcdLine(1, "Conectare PC", lastLcdLine2);
+  writeLcdLine(1, "Astept PC", lastLcdLine2);
   Serial.println(F("BOOT|VESTA_NANO|1"));
+  if (!lcdReady) {
+    Serial.println(F("LCD|MISSING"));
+  }
 }
 
 void loop() {

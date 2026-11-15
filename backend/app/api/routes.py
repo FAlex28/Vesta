@@ -1,26 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hmac
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import httpx
 from fastapi import (
     APIRouter,
     Header,
+    HTTPException,
+    Query,
     Request,
     Response,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import StreamingResponse
 
+from app.assistant import AssistantAction, AssistantUnavailable
 from app.container import AppServices
-from app.errors import AuthenticationError, ConflictError, ServiceUnavailableError
+from app.errors import (
+    AppError,
+    AuthenticationError,
+    ConflictError,
+    NotFoundError,
+    ServiceUnavailableError,
+)
 from app.safety import (
     AudioStatus,
+    CancellationReason,
     ConnectivityStatus,
     GpsStatus,
     HealthStatus,
@@ -35,6 +49,11 @@ from app.schemas import (
     ActivationResponse,
     AlertLocationView,
     AlertView,
+    ArchivedRecordingView,
+    AssistantPromptRequest,
+    AssistantReplyRequest,
+    AssistantReplyResponse,
+    AssistantSpeechView,
     CancelRequest,
     CheckInDeliveryRequest,
     CheckInRequest,
@@ -48,23 +67,35 @@ from app.schemas import (
     ContactInviteView,
     ContactLocationView,
     ContactStatusResponse,
+    ConversationResponse,
+    ConversationTurnView,
     DeviceEventRequest,
+    DeviceLocationRequest,
+    DeviceLocationResponse,
     DevicePairRequest,
     EmergencyContactView,
     HeartbeatRequest,
     LocationUpdateRequest,
     LocationUpdateResponse,
     LocationView,
+    OpenAccessRequest,
+    OperatorMessageAck,
+    OperatorMessageView,
     PhoneView,
     PowerView,
     ProfileUpdateRequest,
     PushKeyResponse,
     PushSubscribeRequest,
     PushUnsubscribeRequest,
+    RecordingChunkResponse,
+    RecordingView,
     ResolveAlertRequest,
     SessionView,
+    SimulatorPressRequest,
+    SimulatorPressResponse,
     SosRequest,
     SystemStatusResponse,
+    TakeoverResponse,
     TechnicalStatusRequest,
     VoiceAccessRequest,
     VoiceAccessResponse,
@@ -165,6 +196,7 @@ def _session_view(session: SafetySession, services: AppServices) -> SessionView:
         active_technical_issues=sorted(issue.value for issue in session.technical_issues),
         alert_reason=session.alert_reason.value if session.alert_reason else None,
         alert=_alert_view(services.alerts.get_for_session(session.session_id)),
+        operator_connected_at=services.takeovers.get(session.session_id),
     )
 
 
@@ -217,6 +249,7 @@ async def _status(
         voice_mode=services.settings.voice_mode,
         power=PowerView(**services.power) if services.power is not None else None,
         alert_locations=alert_locations,
+        assistant=services.assistant.capabilities if services.assistant is not None else {},
     )
 
 
@@ -248,6 +281,218 @@ async def system_status(
     return await _status(services)
 
 
+def _camera_auth_headers(services: AppServices) -> dict[str, str]:
+    key = services.settings.camera_api_key
+    return {"X-Vesta-Camera-Key": key} if key else {}
+
+
+def _camera_disconnected() -> dict[str, Any]:
+    camera = {"connected": False, "device": None, "mode": None, "fps": 0, "error": None}
+    return {"configured": False, "reachable": False, "thermal": camera, "rgb": camera.copy()}
+
+
+@router.get("/api/v1/cameras/status", tags=["cameras"])
+async def camera_status(
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    base_url = services.settings.camera_base_url
+    if not base_url:
+        return _camera_disconnected()
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.5)) as client:
+            response = await client.get(
+                f"{base_url}/api/status", headers=_camera_auth_headers(services)
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        unavailable = _camera_disconnected()
+        unavailable["configured"] = True
+        return unavailable
+
+    def camera_view(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"connected": False, "device": None, "mode": None, "fps": 0}
+        fps = value.get("fps")
+        return {
+            "connected": bool(value.get("connected")),
+            "device": value.get("device") if isinstance(value.get("device"), str) else None,
+            "mode": value.get("mode") if isinstance(value.get("mode"), str) else None,
+            "fps": fps if isinstance(fps, (int, float)) else 0,
+        }
+
+    return {
+        "configured": True,
+        "reachable": True,
+        "thermal": camera_view(payload.get("thermal")),
+        "rgb": camera_view(payload.get("rgb")),
+    }
+
+
+@router.get("/api/v1/cameras/{camera}/stream", tags=["cameras"])
+async def camera_stream(
+    camera: str,
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> StreamingResponse:
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    if camera not in {"thermal", "rgb"}:
+        raise HTTPException(status_code=404, detail="Fluxul camerei nu există.")
+    base_url = services.settings.camera_base_url
+    if not base_url:
+        raise HTTPException(status_code=503, detail="Serverul camerelor nu este configurat.")
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=5.0))
+    upstream_url = f"{base_url}/stream/{camera}.mjpg"
+    try:
+        upstream = await client.send(
+            client.build_request("GET", upstream_url, headers=_camera_auth_headers(services)),
+            stream=True,
+        )
+        upstream.raise_for_status()
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=503, detail="Fluxul camerei nu este disponibil.") from exc
+
+    async def relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                if await request.is_disconnected():
+                    break
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        relay(),
+        media_type=upstream.headers.get("content-type", "multipart/x-mixed-replace"),
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+def _require_device_key(services: AppServices, supplied: str | None) -> None:
+    expected_key = services.settings.device_api_key
+    if expected_key is not None and (
+        supplied is None or not hmac.compare_digest(expected_key, supplied)
+    ):
+        raise AuthenticationError("Invalid or missing device key")
+
+
+async def _record_location(
+    services: AppServices,
+    session_id: str,
+    *,
+    event_id: str,
+    latitude: float,
+    longitude: float,
+    captured_at: datetime,
+    accuracy_meters: float | None,
+    source: str,
+) -> Any:
+    try:
+        result = await services.locations.record(
+            event_id=event_id,
+            session_id=session_id,
+            latitude=latitude,
+            longitude=longitude,
+            captured_at=captured_at,
+            received_at=datetime.now(UTC),
+            accuracy_meters=accuracy_meters,
+            source=source,
+        )
+    except LocationEventReused as exc:
+        raise ConflictError("EVENT_ID_REUSED", str(exc)) from exc
+    except LocationFromFuture as exc:
+        raise ConflictError("LOCATION_TIMESTAMP_INVALID", str(exc)) from exc
+    location = result.location
+    if result.accepted_as_latest and not result.duplicate:
+        if services.persistence is not None:
+            services.persistence.record_location(
+                session_id=session_id,
+                latitude=location.latitude,
+                longitude=location.longitude,
+                captured_at=location.captured_at,
+                accuracy_meters=location.accuracy_meters,
+                source=source,
+            )
+        alert = services.alerts.get_for_session(session_id)
+        if alert and alert.status is AlertStatus.ACTIVE:
+            await services.broker.publish(
+                "location.updated",
+                session_id=session_id,
+                data={"alert_id": alert.alert_id, "captured_at": location.captured_at.isoformat()},
+            )
+    return result
+
+
+DEVICE_FIX_MAX_AGE = timedelta(seconds=60)
+
+
+async def _attach_device_fix(services: AppServices, session_id: str, event_id: str) -> None:
+    fix = services.device_fix
+    if not fix or datetime.now(UTC) - fix["captured_at"] > DEVICE_FIX_MAX_AGE:
+        return
+    try:
+        await _record_location(
+            services,
+            session_id,
+            event_id=f"{event_id}-device-fix"[:128],
+            latitude=fix["latitude"],
+            longitude=fix["longitude"],
+            captured_at=fix["captured_at"],
+            accuracy_meters=fix["accuracy_meters"],
+            source="device_gps",
+        )
+    except ConflictError:
+        return
+
+
+@router.post("/api/v1/device/location", response_model=DeviceLocationResponse, tags=["device"])
+async def device_location(
+    payload: DeviceLocationRequest,
+    request: Request,
+    response: Response,
+    x_device_key: Annotated[str | None, Header()] = None,
+) -> DeviceLocationResponse:
+    """The GPS on the Vesta device (Raspberry Pi UART) reports its fix every few seconds."""
+
+    services = _services(request)
+    _require_device_key(services, x_device_key)
+    response.headers["Cache-Control"] = "no-store"
+    if payload.device_id != services.settings.gpio_device_id:
+        raise NotFoundError("Unknown device")
+    services.device_fix = {
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "captured_at": payload.captured_at,
+        "accuracy_meters": payload.accuracy_meters,
+        "satellites": payload.satellites,
+        "received_at": datetime.now(UTC),
+    }
+    session = await services.sessions.current_for_device(payload.device_id)
+    if session is None:
+        return DeviceLocationResponse(session_id=None, accepted_as_latest=False)
+    result = await _record_location(
+        services,
+        session.session_id,
+        event_id=payload.event_id,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        captured_at=payload.captured_at,
+        accuracy_meters=payload.accuracy_meters,
+        source="device_gps",
+    )
+    return DeviceLocationResponse(
+        session_id=session.session_id, accepted_as_latest=result.accepted_as_latest
+    )
+
+
 @router.post(
     "/api/v1/device/events",
     response_model=ActivationResponse,
@@ -260,16 +505,15 @@ async def device_event(
     x_device_key: Annotated[str | None, Header()] = None,
 ) -> ActivationResponse:
     services = _services(request)
-    expected_key = services.settings.device_api_key
-    if expected_key is not None and (
-        x_device_key is None or not hmac.compare_digest(expected_key, x_device_key)
-    ):
-        raise AuthenticationError("Invalid or missing device key")
+    _require_device_key(services, x_device_key)
     result = await services.sessions.activate(
         event_id=payload.event_id,
         device_id=payload.device_id,
         now=payload.occurred_at,
     )
+    if result.outcome is ActivationOutcome.ACTIVATED:
+        # Data flows from the first second: the device's latest GPS fix joins the session.
+        await _attach_device_fix(services, result.session.session_id, payload.event_id)
     response.status_code = (
         status.HTTP_201_CREATED
         if result.outcome is ActivationOutcome.ACTIVATED
@@ -517,30 +761,18 @@ async def record_authorized_location(
 ) -> LocationUpdateResponse:
     services = _services(request)
     await services.sessions.authorize(session_id, _bearer(authorization))
-    try:
-        result = await services.locations.record(
-            event_id=payload.event_id,
-            session_id=session_id,
-            latitude=payload.latitude,
-            longitude=payload.longitude,
-            captured_at=payload.captured_at,
-            received_at=datetime.now(UTC),
-            accuracy_meters=payload.accuracy_meters,
-            source=payload.source,
-        )
-    except LocationEventReused as exc:
-        raise ConflictError("EVENT_ID_REUSED", str(exc)) from exc
-    except LocationFromFuture as exc:
-        raise ConflictError("LOCATION_TIMESTAMP_INVALID", str(exc)) from exc
     response.headers["Cache-Control"] = "no-store"
+    result = await _record_location(
+        services,
+        session_id,
+        event_id=payload.event_id,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        captured_at=payload.captured_at,
+        accuracy_meters=payload.accuracy_meters,
+        source=payload.source,
+    )
     location = result.location
-    alert = services.alerts.get_for_session(session_id)
-    if result.accepted_as_latest and not result.duplicate and alert and alert.status is AlertStatus.ACTIVE:
-        await services.broker.publish(
-            "location.updated",
-            session_id=session_id,
-            data={"alert_id": alert.alert_id, "captured_at": location.captured_at.isoformat()},
-        )
     return LocationUpdateResponse(
         duplicate=result.duplicate,
         accepted_as_latest=result.accepted_as_latest,
@@ -778,6 +1010,7 @@ def _location_fix(location: Any, now: datetime, stale_after: float) -> dict[str,
         "age_seconds": round(age, 1),
         "is_stale": age > stale_after,
         "accuracy_meters": location.accuracy_meters,
+        "source": location.source,
     }
 
 
@@ -1082,6 +1315,492 @@ async def contact_push_unsubscribe(
     _contact(services, authorization)
     services.directory.remove_subscription(payload.endpoint)
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Open access (VESTA_OPEN_ACCESS, development only): no pairing codes at all.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/v1/access/open", response_model=AccessGrantResponse, tags=["access"])
+async def open_access(
+    payload: OpenAccessRequest,
+    request: Request,
+    response: Response,
+) -> AccessGrantResponse:
+    """Hackathon mode: the person's phone and the trusted contact open their pages directly."""
+
+    services = _services(request)
+    if not services.settings.open_access:
+        raise NotFoundError("Open access is not enabled on this server")
+    scope = AccessScope.COMPANION if payload.scope == "companion" else AccessScope.CONTACT
+    ttl = (
+        services.settings.companion_token_ttl_seconds
+        if scope is AccessScope.COMPANION
+        else services.settings.contact_token_ttl_seconds
+    )
+    token, expires_at, token_id = services.access_tokens.issue(
+        scope, services.settings.gpio_device_id, ttl=timedelta(seconds=ttl)
+    )
+    if scope is AccessScope.COMPANION:
+        services.directory.register_open_phone(token_id)
+    else:
+        services.directory.register_open_contact(token_id)
+    response.headers["Cache-Control"] = "no-store"
+    return AccessGrantResponse(
+        scope=payload.scope,
+        device_id=services.settings.gpio_device_id,
+        access_token=token,
+        expires_at=expires_at,
+    )
+
+
+@router.post("/api/v1/simulator/press", response_model=SimulatorPressResponse, tags=["access"])
+async def simulator_press(payload: SimulatorPressRequest, request: Request) -> SimulatorPressResponse:
+    """Demo only (VESTA_OPEN_ACCESS): the /buton page held for 5 s, instead of the joystick.
+
+    Same activation as GPIO17 on the Pi, for the configured device; no device key leaves the server.
+    """
+
+    services = _services(request)
+    if not services.settings.open_access:
+        raise NotFoundError("The button simulator is not enabled on this server")
+    result = await services.sessions.activate(
+        event_id=payload.event_id, device_id=services.settings.gpio_device_id
+    )
+    if result.outcome is ActivationOutcome.ACTIVATED:
+        await _attach_device_fix(services, result.session.session_id, payload.event_id)
+    return SimulatorPressResponse(
+        outcome=result.outcome.value,
+        session_id=result.session.session_id,
+        state=result.session.state.value,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Voice assistant in the earbuds, conversation recording.
+# ---------------------------------------------------------------------------
+
+
+def _assistant(services: AppServices):
+    if services.assistant is None:
+        raise ServiceUnavailableError("ASSISTANT_UNAVAILABLE", "The voice assistant is not configured")
+    return services.assistant
+
+
+def _speech_view(spoken: Any) -> AssistantSpeechView:
+    return AssistantSpeechView(
+        text=spoken.text,
+        audio_base64=spoken.audio_base64(),
+        mime_type=spoken.mime_type,
+        turn_id=spoken.turn.id if spoken.turn else None,
+    )
+
+
+@router.post(
+    "/api/v1/sessions/{session_id}/assistant/prompt",
+    response_model=AssistantSpeechView,
+    tags=["assistant"],
+)
+async def assistant_prompt(
+    session_id: str,
+    payload: AssistantPromptRequest,
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+) -> AssistantSpeechView:
+    """What Vesta says now in the earbuds (text, plus ElevenLabs audio when configured)."""
+
+    services = _services(request)
+    session = await services.sessions.authorize(session_id, _bearer(authorization))
+    line = payload.line
+    if session.state is SessionState.CANCELLED and line != "false_alarm":
+        raise ConflictError("SESSION_CANCELLED", "The session has ended")
+    if line == "checkin":
+        if session.current_attempt >= 2:
+            line = "reprompt"
+        elif session.last_confirmation_at is None:
+            line = "greeting"
+    if line == "nudge" and session.state not in {SessionState.ACTIVE, SessionState.ALERT}:
+        raise ConflictError("NOT_NOW", "Periodic questions run only in ACTIVE or ALERT")
+    if session_id in services.takeovers and line != "operator":
+        raise ConflictError("OPERATOR_CONNECTED", "The dispatcher took over the call")
+    spoken = await _assistant(services).say(
+        session_id,
+        line,
+        event_id=payload.event_id,
+        record=line != "false_alarm",
+        state=session.state.value,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return _speech_view(spoken)
+
+
+@router.post(
+    "/api/v1/sessions/{session_id}/assistant/reply",
+    response_model=AssistantReplyResponse,
+    tags=["assistant"],
+)
+async def assistant_reply(
+    session_id: str,
+    payload: AssistantReplyRequest,
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+) -> AssistantReplyResponse:
+    """One spoken phrase of the person: Gemini interprets it, the API applies the intent."""
+
+    services = _services(request)
+    token = _bearer(authorization)
+    session = await services.sessions.authorize(session_id, token)
+    if session.state is SessionState.CANCELLED:
+        raise ConflictError("SESSION_CANCELLED", "The session has ended")
+    if session_id in services.takeovers:
+        raise ConflictError("OPERATOR_CONNECTED", "The dispatcher took over the call")
+    try:
+        audio = base64.b64decode(payload.audio_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise AppError(code="INVALID_AUDIO", message="audio_base64 is not valid base64", status_code=422) from exc
+    alerting = session.state is SessionState.ALERT
+    context = (
+        f"Starea sesiunii: {session.state.value}. "
+        + (
+            "Dispeceratul și persoana de încredere au fost deja anunțați."
+            if alerting
+            else "Dispeceratul NU a fost anunțat încă; întrebarea este dacă a fost o greșeală."
+        )
+    )
+    try:
+        decision, spoken = await _assistant(services).understand(
+            session_id,
+            audio=audio,
+            mime_type=payload.mime_type,
+            context=context,
+            event_id=payload.event_id,
+        )
+    except AssistantUnavailable as exc:
+        raise ServiceUnavailableError("ASSISTANT_UNAVAILABLE", exc.message) from exc
+
+    action_event = f"{payload.event_id}-act"[:128]
+    applied = False
+    try:
+        if decision.action is AssistantAction.FALSE_ALARM and decision.transcript:
+            await services.sessions.cancel(
+                session_id,
+                token=token,
+                event_id=action_event,
+                reason=CancellationReason.FALSE_ALARM.value,
+            )
+            applied = True
+        elif decision.action is AssistantAction.ESCALATE and not alerting:
+            reason = f"Cerere vocală: {decision.transcript}" if decision.transcript else "Cerere vocală"
+            await services.sessions.request_sos(
+                session_id,
+                token=token,
+                event_id=action_event,
+                source="voice_agent",
+                reason=reason[:280],
+            )
+            applied = True
+        elif (
+            decision.action is AssistantAction.CONFIRM_SAFE
+            and session.state is SessionState.CHECK_IN
+            and session.current_checkin_id
+        ):
+            await services.sessions.confirm_safe(
+                session_id,
+                token=token,
+                event_id=action_event,
+                checkin_id=session.current_checkin_id,
+                source="voice_agent",
+            )
+            applied = True
+    except ConflictError:
+        applied = False  # the session moved on meanwhile (e.g. the check-in timed out)
+    current = await services.sessions.authorize(session_id, token)
+    response.headers["Cache-Control"] = "no-store"
+    return AssistantReplyResponse(
+        transcript=decision.transcript,
+        action=decision.action.value,
+        applied=applied,
+        reply=_speech_view(spoken),
+        session=_session_view(current, services),
+    )
+
+
+MAX_CHUNK_BYTES = 2 * 1024 * 1024
+
+
+@router.post(
+    "/api/v1/sessions/{session_id}/recording/chunks",
+    response_model=RecordingChunkResponse,
+    tags=["recording"],
+)
+async def upload_recording_chunk(
+    session_id: str,
+    request: Request,
+    seq: Annotated[int, Query(ge=0, le=1_000_000)],
+    authorization: Annotated[str | None, Header()] = None,
+    content_type: Annotated[str | None, Header()] = None,
+) -> RecordingChunkResponse:
+    """The phone records the whole conversation from the start and uploads it in chunks."""
+
+    services = _services(request)
+    session = await services.sessions.authorize(session_id, _bearer(authorization))
+    if session.cancellation_reason == CancellationReason.FALSE_ALARM.value:
+        raise ConflictError("SESSION_CANCELLED", "False alarm: nothing is recorded any more")
+    body = await request.body()
+    if not body:
+        raise AppError(code="EMPTY_CHUNK", message="The chunk is empty", status_code=422)
+    if len(body) > MAX_CHUNK_BYTES:
+        raise AppError(code="CHUNK_TOO_LARGE", message="A chunk may not exceed 2 MB", status_code=413)
+    mime = (content_type or "audio/webm").split(";")[0].strip() or "audio/webm"
+    if not mime.startswith("audio/"):
+        raise AppError(code="INVALID_AUDIO", message="Only audio chunks are accepted", status_code=415)
+    assert services.recordings is not None
+    info = await services.recordings.append(session_id, seq, body, mime_type=mime)
+    return RecordingChunkResponse(chunks=info.chunks, size_bytes=info.size_bytes)
+
+
+async def _shared_with_dispatcher(services: AppServices, session_id: str) -> None:
+    """Share live sessions and real alerts with the authenticated dispatcher, never false alarms."""
+
+    alert = services.alerts.get_for_session(session_id)
+    if alert is not None:
+        if alert.resolution_action == CancellationReason.FALSE_ALARM.value:
+            raise NotFoundError("Nothing shared for this session")
+        return
+    try:
+        session = await services.sessions.get(session_id)
+    except NotFoundError:
+        session = None
+    if session and session.state in {
+        SessionState.ACTIVE,
+        SessionState.CHECK_IN,
+        SessionState.UNCONFIRMED,
+        SessionState.ALERT,
+    }:
+        return
+    stored = services.recordings.record(session_id) if services.recordings else None
+    if stored is None or stored.alert_id is None or stored.resolution == CancellationReason.FALSE_ALARM.value:
+        raise NotFoundError("Nothing shared for this session")
+
+
+@router.get(
+    "/api/v1/sessions/{session_id}/conversation",
+    response_model=ConversationResponse,
+    tags=["recording"],
+)
+async def session_conversation(
+    session_id: str,
+    request: Request,
+    response: Response,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> ConversationResponse:
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    await _shared_with_dispatcher(services, session_id)
+    info = services.recordings.info(session_id) if services.recordings else None
+    turns = services.recordings.turns(session_id) if services.recordings else []
+    response.headers["Cache-Control"] = "no-store"
+    return ConversationResponse(
+        session_id=session_id,
+        turns=[
+            ConversationTurnView(id=t.id, role=t.role, text=t.text, at=t.at, action=t.action)
+            for t in turns
+        ],
+        recording=(
+            RecordingView(
+                mime_type=info.mime_type,
+                size_bytes=info.size_bytes,
+                chunks=info.chunks,
+                started_at=info.started_at,
+                updated_at=info.updated_at,
+                finalized=info.finalized,
+            )
+            if info
+            else None
+        ),
+    )
+
+
+@router.get("/api/v1/sessions/{session_id}/recording", tags=["recording"])
+async def session_recording(
+    session_id: str,
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> StreamingResponse:
+    """The recording from its first second, then live while the session runs."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    await _shared_with_dispatcher(services, session_id)
+    assert services.recordings is not None
+    info = services.recordings.info(session_id)
+    if info is None:
+        raise NotFoundError("No recording for this session yet")
+
+    async def relay():
+        async for chunk in services.recordings.follow(session_id):
+            if await request.is_disconnected():
+                break
+            yield chunk
+
+    return StreamingResponse(
+        relay(),
+        media_type=info.mime_type,
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+def _archived(info) -> ArchivedRecordingView:
+    return ArchivedRecordingView(
+        session_id=info.session_id,
+        device_id=info.device_id,
+        started_at=info.started_at,
+        updated_at=info.updated_at,
+        size_bytes=info.size_bytes,
+        chunks=info.chunks,
+        finalized=info.finalized,
+        alert_id=info.alert_id,
+        alert_reason=info.alert_reason,
+        alert_at=info.alert_at,
+        resolution=info.resolution,
+        resolved_at=info.resolved_at,
+        operator_at=info.operator_at,
+        turns=0,
+    )
+
+
+@router.get("/api/v1/recordings", response_model=list[ArchivedRecordingView], tags=["recording"])
+async def recordings_archive(
+    request: Request,
+    response: Response,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> list[ArchivedRecordingView]:
+    """Every alert's recording kept in the database, newest first (false alarms are deleted)."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    assert services.recordings is not None
+    response.headers["Cache-Control"] = "no-store"
+    items = []
+    for info in services.recordings.archive():
+        view = _archived(info)
+        view.turns = len(services.recordings.turns(info.session_id))
+        items.append(view)
+    return items
+
+
+@router.post(
+    "/api/v1/sessions/{session_id}/takeover", response_model=TakeoverResponse, tags=["recording"]
+)
+async def take_over_call(
+    session_id: str,
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+) -> TakeoverResponse:
+    """The dispatcher takes the call: the assistant in her earbuds stops and the dispatcher talks."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    session = await services.sessions.get(session_id)
+    if session.state not in {
+        SessionState.ACTIVE,
+        SessionState.CHECK_IN,
+        SessionState.UNCONFIRMED,
+        SessionState.ALERT,
+    }:
+        raise ConflictError("SESSION_NOT_ACTIVE", "Only an ongoing session can be taken over")
+    at = services.takeovers.get(session_id)
+    if at is None:
+        at = services.takeovers[session_id] = datetime.now(UTC)
+        assert services.recordings is not None
+        await services.recordings.annotate(session_id, operator_at=at)
+        await services.broker.publish(
+            "call.taken_over", session_id=session_id, data={"operator_connected_at": at.isoformat()}
+        )
+    return TakeoverResponse(session_id=session_id, operator_connected_at=at)
+
+
+@router.post(
+    "/api/v1/sessions/{session_id}/operator/messages",
+    response_model=OperatorMessageAck,
+    tags=["recording"],
+)
+async def send_operator_message(
+    session_id: str,
+    request: Request,
+    x_dashboard_key: Annotated[str | None, Header()] = None,
+    content_type: Annotated[str | None, Header()] = None,
+) -> OperatorMessageAck:
+    """A recorded phrase of the dispatcher (push to talk), played in her earbuds."""
+
+    services = _services(request)
+    _require_dashboard_key(services, x_dashboard_key)
+    if session_id not in services.takeovers:
+        raise ConflictError("NOT_TAKEN_OVER", "Take over the call before talking")
+    body = await request.body()
+    if not body:
+        raise AppError(code="EMPTY_AUDIO", message="The message is empty", status_code=422)
+    if len(body) > MAX_CHUNK_BYTES:
+        raise AppError(code="AUDIO_TOO_LARGE", message="A message may not exceed 2 MB", status_code=413)
+    mime = (content_type or "audio/webm").split(";")[0].strip() or "audio/webm"
+    if not mime.startswith("audio/"):
+        raise AppError(code="INVALID_AUDIO", message="Only audio is accepted", status_code=415)
+    assert services.recordings is not None
+    message = await services.recordings.add_operator_message(session_id, body, mime)
+    await services.broker.publish(
+        "operator.message", session_id=session_id, data={"message_id": message.id}
+    )
+    await services.broker.publish(
+        "conversation.updated", session_id=session_id, data={"turn_id": message.id, "role": "operator"}
+    )
+    return OperatorMessageAck(id=message.id, at=message.at)
+
+
+@router.get(
+    "/api/v1/sessions/{session_id}/operator/messages",
+    response_model=list[OperatorMessageView],
+    tags=["recording"],
+)
+async def receive_operator_messages(
+    session_id: str,
+    request: Request,
+    response: Response,
+    after: Annotated[str | None, Query(max_length=64)] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> list[OperatorMessageView]:
+    """The person's phone fetches the dispatcher's messages to play them in her earbuds."""
+
+    services = _services(request)
+    await services.sessions.authorize(session_id, _bearer(authorization))
+    assert services.recordings is not None
+    response.headers["Cache-Control"] = "no-store"
+    return [
+        OperatorMessageView(
+            id=item.id,
+            at=item.at,
+            mime_type=item.mime_type,
+            audio_base64=base64.b64encode(item.data).decode(),
+        )
+        for item in services.recordings.operator_messages(session_id, after=after)
+    ]
+
+
+async def purge_session_media(services: AppServices, session_id: str) -> None:
+    """False alarm: voice, transcript and positions of the session are deleted."""
+
+    if services.recordings is not None:
+        await services.recordings.delete(session_id)
+    if services.assistant is not None:
+        await services.assistant.forget(session_id)
+    forget = getattr(services.locations, "forget", None)
+    if forget is not None:
+        await forget(session_id)
+    if services.persistence is not None:
+        services.persistence.purge_session_media(session_id)
+    await services.broker.publish("session.data_deleted", session_id=session_id, data={})
 
 
 async def _authenticate_websocket(
