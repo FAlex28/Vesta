@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: vesta-backend
+Version: 0.1.0
+Summary: Deterministic safety backend and ElevenLabs voice gateway for Vesta
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1.0,>=0.120
+Requires-Dist: httpx<1.0,>=0.28
+Requires-Dist: uvicorn[standard]<1.0,>=0.38
+Requires-Dist: pg8000<2.0,>=1.31
+Requires-Dist: python-dotenv<2.0,>=1.0
+Requires-Dist: pywebpush<3.0,>=2.0
+Provides-Extra: dev
+Requires-Dist: pytest<10.0,>=9.0; extra == "dev"
+Requires-Dist: ruff<1.0,>=0.15; extra == "dev"
+Provides-Extra: raspberry
+Requires-Dist: gpiozero<3.0,>=2.0; extra == "raspberry"
