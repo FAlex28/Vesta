@@ -283,6 +283,19 @@ export type AssistantLine = "checkin" | "alert" | "false_alarm" | "confirm_safe"
 
 export type OperatorMessage = { id: string; at: string; mime_type: string; audio_base64: string };
 
+/** One position of the route (GET /sessions/{id}/locations, dispatcher, alerts only). */
+export type LocationPoint = {
+  latitude: number;
+  longitude: number;
+  captured_at: string;
+  accuracy_meters: number | null;
+  source: string;
+};
+export type LocationHistory = { session_id: string; points: LocationPoint[] };
+
+/** Live call (WebRTC): the server only passes the offer/answer between dashboard and phone. */
+export type CallView = { call_id: string | null; offer?: string | null; answer?: string | null };
+
 export type ArchivedRecording = {
   session_id: string;
   device_id: string | null;

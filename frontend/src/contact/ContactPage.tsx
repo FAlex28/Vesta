@@ -1,9 +1,9 @@
-import { Bell, BellOff, Navigation, Phone } from "lucide-react";
+import { Bell, BellOff, Navigation, Phone, ShieldCheck } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { AccessGrant } from "../api/accessStore";
 import { api, ApiError } from "../api/client";
 import { CONTACT_POLL_MS } from "../api/config";
-import type { ContactAlert, ContactStatusResponse } from "../api/contract";
+import { USER_RESOLUTION_ACTION, type ContactAlert, type ContactStatusResponse } from "../api/contract";
 import { useOpenGrant } from "../companion/useCompanionAccess";
 import { AlertList } from "../components/AlertList";
 import { BrandLockup } from "../components/BrandLockup";
@@ -38,6 +38,9 @@ const toRecord = (item: ContactAlert): AlertRecord => ({
   resolvedAt: item.alert.resolved_at,
   resolutionAction: item.alert.resolution_action,
 });
+
+/** How long "she is safe" stays at the top after she closed the alert. */
+const SAFE_NOTICE_MS = 6 * 60 * 60 * 1000;
 
 const pushCopy: Record<PushState, string> = {
   unsupported: "Browserul nu poate primi notificări. Ține pagina deschisă.",
@@ -102,6 +105,13 @@ export default function ContactPage() {
   const person = data?.person_name || "Persoana pe care o susții";
   const clock = new Date(now).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
   const location = current?.location ?? null;
+  // The latest alert was closed by her ("I'm safe"): say so plainly, for a few hours.
+  const latest = [...(data?.alerts ?? [])].sort((a, b) => Date.parse(b.alert.created_at) - Date.parse(a.alert.created_at))[0];
+  const safeAt =
+    !current && latest?.alert.status === "RESOLVED" && latest.alert.resolution_action === USER_RESOLUTION_ACTION && latest.alert.resolved_at
+      ? latest.alert.resolved_at
+      : null;
+  const showSafe = safeAt !== null && now - Date.parse(safeAt) < SAFE_NOTICE_MS;
   const tone = current ? "danger" : known ? "safe" : "neutral";
 
   return (
@@ -127,6 +137,16 @@ export default function ContactPage() {
         {known && link.state !== "CONNECTED" && (
           <p className="stale-banner" role="alert">
             <strong>Legătura cu serverul s-a întrerupt</strong> ({formatClock(data?.generated_at)}).
+          </p>
+        )}
+
+        {showSafe && (
+          <p className="notice safe-notice" role="status" data-testid="contact-safe-notice">
+            <ShieldCheck size={20} aria-hidden="true" />
+            <span>
+              <strong>{data?.person_name ? `${data.person_name} este în siguranță.` : "Este în siguranță."}</strong> A închis
+              singură alerta de pe telefon la <span className="num">{formatClock(safeAt)}</span>.
+            </span>
           </p>
         )}
 

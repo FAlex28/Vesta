@@ -90,6 +90,15 @@ class LocationsRepo:
             now = at or tx.one("SELECT now() AS n")["n"]
         return location_status(row, now, self._s)
 
+    def history(self, session_id, *, limit: int = 5000) -> list[dict]:
+        """Every stored position of the session, oldest first (the route)."""
+        with self._pool.autocommit() as tx:
+            return tx.all(
+                "SELECT occurred_at, lat, lon, accuracy_m, source FROM locations "
+                "WHERE session_id = %s AND NOT simulated ORDER BY occurred_at LIMIT %s",
+                (as_uuid(session_id), limit),
+            )
+
     def delete_for_session(self, session_id) -> int:
         """Alarmă falsă: pozițiile sesiunii se șterg, nu doar se ascund."""
         with self._pool.autocommit() as tx:

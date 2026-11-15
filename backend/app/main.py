@@ -109,6 +109,7 @@ async def _media_janitor(services: AppServices, stop_event: asyncio.Event) -> No
             if event.type not in {"session.cancelled", "safety.alert_resolved"}:
                 continue
             services.takeovers.pop(event.session_id, None)
+            services.calls.pop(event.session_id, None)
             try:
                 if event.data.get("reason") == "FALSE_ALARM":
                     await purge_session_media(services, event.session_id)

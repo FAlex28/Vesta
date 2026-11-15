@@ -1,6 +1,6 @@
 import { Crosshair } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { Circle, CircleMarker, MapContainer, TileLayer, ZoomControl, useMap } from "react-leaflet";
+import { Circle, CircleMarker, MapContainer, Polyline, TileLayer, ZoomControl, useMap } from "react-leaflet";
 import { latLng, type LatLngTuple } from "leaflet";
 import type { SessionState } from "../api/contract";
 
@@ -10,6 +10,8 @@ type CityMapProps = {
   /** "device": the person's live fix. "area": just the city, no marker. "simulated": a labelled test point. */
   kind: "simulated" | "device" | "area";
   accuracy?: number | null;
+  /** Where she has been (oldest first), drawn behind the current position. */
+  trail?: LatLngTuple[];
 };
 
 // Mirrors the status tokens in styles.css. Tiles are dark grey, so this point is the only colour.
@@ -87,7 +89,7 @@ function FollowPoint({ point, accuracy, live }: { point: LatLngTuple; accuracy?:
   );
 }
 
-export function CityMap({ point, state, kind, accuracy }: CityMapProps) {
+export function CityMap({ point, state, kind, accuracy, trail }: CityMapProps) {
   const live = kind === "device";
   return (
     <MapContainer
@@ -106,6 +108,22 @@ export function CityMap({ point, state, kind, accuracy }: CityMapProps) {
       />
       <ZoomControl position="bottomright" />
       <FollowPoint point={point} accuracy={accuracy} live={live} />
+      {live && trail && trail.length > 1 && (
+        <>
+          <Polyline
+            positions={[...trail, point]}
+            interactive={false}
+            pathOptions={{ color: markerColor(state), weight: 4, opacity: 0.6, lineCap: "round", lineJoin: "round" }}
+          />
+          {/* Where the route started. */}
+          <CircleMarker
+            center={trail[0]}
+            radius={5}
+            interactive={false}
+            pathOptions={{ color: markerColor(state), weight: 2, fillColor: "#0d1418", fillOpacity: 1 }}
+          />
+        </>
+      )}
       {kind === "area" ? null : kind === "simulated" ? (
         // Dashed ring: marks a reference point, not a tracked position.
         <CircleMarker

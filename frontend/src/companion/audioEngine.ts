@@ -15,6 +15,10 @@
 
 const TARGET_RATE = 16_000;
 const FRAME = 4096;
+/** Her own voice right after Vesta stops (room echo) is not an answer. */
+const ECHO_TAIL_MS = 450;
+/** Upper bound for the learned background noise, so a loud moment cannot make her inaudible. */
+const MAX_NOISE_FLOOR = 0.012;
 
 export type ListenOptions = {
   /** Give up when nobody starts speaking within this time. */
@@ -41,7 +45,27 @@ export class AudioEngine {
   private output: AudioNode | null = null;
   /** While Vesta speaks, the microphone is not interpreted (no answer to her own voice). */
   private speakingNow = false;
+  private quietSince = 0;
+  private lastFrameAt = 0;
+  private capturing = false;
+  /** One microphone only: a second start while the first is opening waits for it. */
+  private arming: Promise<void> | null = null;
   level = 0;
+
+  /** She is in the middle of a phrase: nobody should talk over her. */
+  get hearing(): boolean {
+    return this.capturing;
+  }
+
+  /** The microphone, also sent in the live call with the dispatcher. */
+  get micStream(): MediaStream | null {
+    return this.stream;
+  }
+
+  /** False when the microphone stopped delivering sound (suspended page, lost earbuds). */
+  get micAlive(): boolean {
+    return this.armed && Date.now() - this.lastFrameAt < 3000;
+  }
 
   get armed(): boolean {
     return this.ctx !== null && this.stream !== null;
@@ -61,12 +85,21 @@ export class AudioEngine {
     return this.ctx?.sampleRate ?? 48_000;
   }
 
-  /** Must run inside a user gesture. */
-  async arm({ loud = true }: { loud?: boolean } = {}): Promise<void> {
+  /** Must run inside a user gesture (or after the permission was given once). */
+  async arm(options: { loud?: boolean } = {}): Promise<void> {
     if (this.armed) {
       await this.ctx?.resume();
       return;
     }
+    // Two starts at once (page load + session start) used to open two microphones, and both
+    // fed the same phrase: every frame twice, a garbled phrase for the transcription.
+    this.arming ??= this.open(options).finally(() => {
+      this.arming = null;
+    });
+    return this.arming;
+  }
+
+  private async open({ loud = true }: { loud?: boolean }): Promise<void> {
     // loud: no voice processing, so Android does not switch to the quiet "call" audio mode.
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: loud
@@ -87,6 +120,8 @@ export class AudioEngine {
     processor.connect(mute);
     mute.connect(ctx.destination);
     processor.onaudioprocess = (event) => {
+      if (this.processor !== processor) return; // an old microphone never feeds the phrase
+      this.lastFrameAt = Date.now();
       const frame = event.inputBuffer.getChannelData(0);
       const rms = Math.sqrt(frame.reduce((sum, value) => sum + value * value, 0) / frame.length);
       this.level = rms;
@@ -121,6 +156,7 @@ export class AudioEngine {
     this.mix = mix;
     this.processor = processor;
     this.keepAlive = keepAlive;
+    this.lastFrameAt = Date.now();
     await this.holdWakeLock();
   }
 
@@ -134,6 +170,7 @@ export class AudioEngine {
   }
 
   async disarm(): Promise<void> {
+    await this.arming?.catch(() => undefined);
     this.stopRecording();
     this.frameListener = null;
     this.processor?.disconnect();
@@ -188,18 +225,55 @@ export class AudioEngine {
     if (!ctx) throw new Error("audio not armed");
     const bytes = Uint8Array.from(atob(audioBase64), (char) => char.charCodeAt(0));
     const buffer = await ctx.decodeAudioData(bytes.buffer);
+    await ctx.resume().catch(() => undefined);
     this.speakingNow = true;
     try {
       await new Promise<void>((resolve) => {
         const source = ctx.createBufferSource();
         source.buffer = buffer;
         source.connect(this.output ?? ctx.destination);
-        source.onended = () => resolve();
+        // A suspended page never fires "ended": the guard lets the conversation go on.
+        const guard = window.setTimeout(() => {
+          try {
+            source.stop();
+          } catch {
+            // never started
+          }
+          resolve();
+        }, buffer.duration * 1000 + 1500);
+        source.onended = () => {
+          window.clearTimeout(guard);
+          resolve();
+        };
         source.start();
       });
     } finally {
       this.speakingNow = false;
+      this.quietSince = Date.now();
     }
+  }
+
+  /** The dispatcher's voice in the live call: through the earbuds (louder) and into the recording. */
+  playRemote(stream: MediaStream): () => void {
+    // Chrome only delivers a remote stream to Web Audio while a media element holds it.
+    const holder = new Audio();
+    holder.srcObject = stream;
+    holder.muted = true;
+    const ctx = this.ctx;
+    let source: MediaStreamAudioSourceNode | null = null;
+    if (ctx && this.output) {
+      void ctx.resume().catch(() => undefined);
+      source = ctx.createMediaStreamSource(stream);
+      source.connect(this.output);
+    } else {
+      holder.muted = false; // no audio engine: play it directly
+    }
+    void holder.play().catch(() => undefined);
+    return () => {
+      source?.disconnect();
+      holder.pause();
+      holder.srcObject = null;
+    };
   }
 
   /** Browser voice (no ElevenLabs key). Heard, but not part of the recording. */
@@ -219,6 +293,7 @@ export class AudioEngine {
       const done = () => {
         window.clearTimeout(guard);
         this.speakingNow = false;
+        this.quietSince = Date.now();
         resolve();
       };
       const guard = window.setTimeout(done, Math.min(20_000, 1500 + text.length * 90));
@@ -246,17 +321,30 @@ export class AudioEngine {
       let speechFrames = 0;
       let silenceMs = 0;
       let elapsedMs = 0;
+      let done = false;
+      const startedAt = Date.now();
       const finish = (result: Phrase | null) => {
-        this.frameListener = null;
+        if (done) return;
+        done = true;
+        this.capturing = false;
+        window.clearInterval(watchdog);
+        if (this.frameListener === onFrame) this.frameListener = null;
         signal?.removeEventListener("abort", onAbort);
         resolve(result);
       };
       const onAbort = () => finish(null);
       signal?.addEventListener("abort", onAbort);
+      // Frames can stop (page suspended, microphone lost): the wall clock still ends the wait.
+      const watchdog = window.setInterval(() => {
+        if (Date.now() - this.lastFrameAt > 1500) void this.ctx?.resume().catch(() => undefined);
+        const waited = Date.now() - startedAt;
+        if (!speaking && !this.speakingNow && waited > startTimeoutMs + 3000) finish(null);
+        else if (waited > startTimeoutMs + maxMs + 20_000) finish(null);
+      }, 1000);
 
-      this.frameListener = (frame) => {
-        if (this.speakingNow) {
-          // Vesta's own voice: not an answer. Start over once she is quiet.
+      const onFrame = (frame: Float32Array) => {
+        if (this.speakingNow || Date.now() - this.quietSince < ECHO_TAIL_MS) {
+          // Vesta's own voice (and its echo): not an answer. Start over once she is quiet.
           if (!speaking) elapsedMs = 0;
           return;
         }
@@ -265,13 +353,14 @@ export class AudioEngine {
         const threshold = Math.max(0.012, this.noiseFloor * 3);
         const loud = rms > threshold;
         if (!speaking) {
-          // Slowly learn the background noise while nobody speaks.
-          this.noiseFloor = this.noiseFloor * 0.95 + rms * 0.05;
+          // Slowly learn the background noise, only from quiet frames and within a limit.
+          if (!loud) this.noiseFloor = Math.min(MAX_NOISE_FLOOR, this.noiseFloor * 0.95 + rms * 0.05);
           speechFrames = loud ? speechFrames + 1 : 0;
           if (previous) captured.splice(0, captured.length, previous);
           captured.push(frame);
           if (speechFrames >= 2) {
             speaking = true;
+            this.capturing = true;
             silenceMs = 0;
             elapsedMs = 0;
           } else if (elapsedMs > startTimeoutMs) {
@@ -287,6 +376,7 @@ export class AudioEngine {
           finish({ wavBase64: encodeWav(downsample(samples, rate, TARGET_RATE), TARGET_RATE), durationMs: (samples.length / rate) * 1000 });
         }
       };
+      this.frameListener = onFrame;
     });
   }
 }

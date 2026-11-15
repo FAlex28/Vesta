@@ -219,6 +219,9 @@ test.describe("dashboard", () => {
     session.alert = { ...session.alert, status: "RESOLVED", resolved_at: now, resolution_action: "USER_CONFIRMED_SAFE" };
     backend.publish("safety.alert_resolved", { from_state: "ALERT", state: "CANCELLED", alert_id: "alert-5" });
     await expect(page.getByTestId("dashboard-location-real")).toHaveCount(0);
+    // She closed it herself from her phone: the dispatcher reads it plainly.
+    await expect(page.getByTestId("safe-notice")).toContainText("Persoana este în siguranță");
+    await expect(page.getByTestId("safe-notice")).toContainText("A închis singură alerta de pe telefon");
   });
   test("dispatcher can take over a live session before an alert", async ({ page }) => {
     const backend = new MockBackend(page);
@@ -230,7 +233,7 @@ test.describe("dashboard", () => {
     await expect(page.getByTestId("live-call")).toContainText("Apel preluat");
     await expect(page.getByTestId("ptt-button")).toBeVisible();
     expect(backend.calls(/\/takeover$/)).toHaveLength(1);
-    backend.addTurn(SESSION_ID, "operator", "Mesaj vocal — transcriere indisponibilă.");
+    backend.addTurn(SESSION_ID, "operator", "Mesaj vocal al dispecerului.");
     await expect(page.getByTestId("call-transcript")).toContainText("Dispecer");
     await expect(page.getByTestId("call-transcript").locator("time")).toHaveCount(1);
   });
@@ -268,6 +271,46 @@ test.describe("dashboard", () => {
     await page.getByTestId("presentation-toggle").click();
     await expect(page.getByTestId("call-transcript")).toContainText("Ascunsă în modul prezentare");
     await expect(page.getByTestId("call-transcript")).not.toContainText("am nevoie de ajutor");
+  });
+
+  test("the route of an alert: on the map and as a list, hidden in presentation mode", async ({ page }) => {
+    const backend = new MockBackend(page);
+    const at = (secondsAgo: number) => new Date(Date.now() - secondsAgo * 1000).toISOString();
+    const now = at(0);
+    backend.sessions = [
+      makeSession({
+        state: "ALERT",
+        alert_reason: "SOS_EXPLICIT",
+        alert: { id: "alert-r", incident_type: "EXPLICIT_SOS", status: "ACTIVE", created_at: now, updated_at: now, notification_requested_at: now, resolved_at: null, resolution_action: null, version: 1 },
+      }),
+    ];
+    backend.locations.set(SESSION_ID, { latitude: 45.7542, longitude: 21.2268, captured_at: now, accuracy_meters: 6, source: "android" });
+    backend.routes.set(SESSION_ID, [
+      { latitude: 45.753, longitude: 21.225, captured_at: at(40), accuracy_meters: 8, source: "android" },
+      { latitude: 45.7536, longitude: 21.2259, captured_at: at(20), accuracy_meters: 7, source: "android" },
+      { latitude: 45.7542, longitude: 21.2268, captured_at: now, accuracy_meters: 6, source: "android" },
+    ]);
+    await backend.install();
+    await page.goto("/");
+    const history = page.getByTestId("location-history");
+    await expect(history).toBeVisible();
+    await expect(page.getByTestId("route-summary")).toContainText("3 poziții");
+    await expect(page.getByTestId("route-summary")).toContainText("parcurși");
+    await expect(page.getByTestId("location-trail").locator("li")).toHaveCount(3);
+    await expect(page.getByTestId("location-trail").locator("li").first()).toContainText("45.75420, 21.22680");
+    await expect(page.locator(".city-map path.leaflet-interactive, .city-map path")).not.toHaveCount(0);
+
+    await page.getByTestId("presentation-toggle").click();
+    await expect(page.getByTestId("location-trail")).not.toContainText("45.754");
+    await page.getByTestId("presentation-toggle").click();
+
+    // A false alarm keeps no route at all.
+    const session = backend.session()!;
+    session.state = "CANCELLED";
+    session.cancellation_reason = "FALSE_ALARM";
+    session.alert = { ...session.alert!, status: "RESOLVED", resolved_at: now, resolution_action: "FALSE_ALARM" };
+    backend.publish("safety.alert_resolved", { from_state: "ALERT", state: "CANCELLED", alert_id: "alert-r" });
+    await expect(history).toHaveCount(0);
   });
 
   test("a false alarm leaves no call, no transcript and no location", async ({ page }) => {
@@ -315,7 +358,7 @@ test.describe("dashboard", () => {
     backend.turns.set(SESSION_ID, [
       { id: "t1", role: "assistant", text: "Ești bine?", at: now, action: null },
       { id: "t2", role: "person", text: "Da.", at: now, action: null },
-      { id: "t3", role: "operator", text: "Mesaj vocal — transcriere indisponibilă.", at: now, action: null },
+      { id: "t3", role: "operator", text: "Mesaj vocal al dispecerului.", at: now, action: null },
     ]);
     await backend.install();
     await page.goto("/");

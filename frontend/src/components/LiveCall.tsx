@@ -1,14 +1,16 @@
-import { BellOff, BellRing, Headphones, Mic, PhoneCall, Radio, RotateCcw } from "lucide-react";
+import { BellOff, BellRing, Headphones, Mic, PhoneCall, PhoneOff, Radio, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import { apiBaseUrl } from "../api/config";
 import { isUnfinished, type ConversationResponse, type SessionView } from "../api/contract";
 import { formatClock } from "../state/presentation";
+import { useDispatcherCall, type DispatcherCallState } from "./useDispatcherCall";
 
 /*
  * The dispatcher's call panel. When a session becomes an alert the dashboard rings; the
  * dispatcher can listen (the recording from its first second, then live) and take the call:
- * the assistant in her earbuds goes quiet and the dispatcher talks to her (push to talk).
+ * the assistant in her earbuds goes quiet and the dispatcher talks with her live (WebRTC).
+ * Push to talk stays as the fallback when the live call cannot connect.
  */
 
 const MSE_TYPE = 'audio/webm; codecs="opus"';
@@ -132,6 +134,15 @@ function useLiveRecording(sessionId: string, dashboardKey: string | null, enable
   return { audioRef, status } as const;
 }
 
+const callCopy: Record<DispatcherCallState, string> = {
+  idle: "",
+  calling: "Se pornește microfonul…",
+  ringing: "Se sună telefonul…",
+  live: "Vorbești cu persoana",
+  ended: "Apel încheiat.",
+  failed: "",
+};
+
 const playerCopy: Record<PlayerStatus, string> = {
   idle: "Apasă „Ascultă”.",
   connecting: "Se conectează…",
@@ -220,6 +231,14 @@ export function LiveCall({
   const ringer = useRinger(activeAlert && !heard);
   const player = useLiveRecording(session.id, dashboardKey, heard, attempt);
   const talk = usePushToTalk(session.id, dashboardKey);
+  const call = useDispatcherCall(session.id, dashboardKey, active);
+  const inCall = call.state === "calling" || call.state === "ringing" || call.state === "live";
+
+  // During the live call her voice comes through the call; the recording stays muted (no echo).
+  useEffect(() => {
+    const audio = player.audioRef.current;
+    if (audio) audio.muted = call.state === "live";
+  }, [call.state, player.audioRef]);
 
   useEffect(() => {
     let stop = false;
@@ -252,9 +271,11 @@ export function LiveCall({
       setAttempt((value) => value + 1);
     } catch {
       setTakeError("Apelul nu a putut fi preluat. Încearcă din nou.");
-    } finally {
       setTaking(false);
+      return;
     }
+    setTaking(false);
+    await call.start();
   };
 
   const reason = activeAlert
@@ -288,6 +309,16 @@ export function LiveCall({
               <PhoneCall size={18} aria-hidden="true" /> {taking ? "Se preia…" : "Preia apelul"}
             </button>
           )}
+          {active && takenOver && inCall && (
+            <button type="button" className="btn btn--ghost" data-testid="hangup-call" onClick={() => void call.hangup()}>
+              <PhoneOff size={18} aria-hidden="true" /> Închide apelul
+            </button>
+          )}
+          {active && takenOver && !inCall && (
+            <button type="button" className="btn btn--danger" data-testid="redial-call" onClick={() => void call.start()}>
+              <PhoneCall size={18} aria-hidden="true" /> {call.state === "idle" ? "Sună persoana" : "Sună din nou"}
+            </button>
+          )}
           {activeAlert && !ringer.enabled && (
             <button type="button" className="chip-toggle" onClick={() => void ringer.enable()}>
               <BellOff size={15} aria-hidden="true" /> Activează sunetul
@@ -296,8 +327,15 @@ export function LiveCall({
         </div>
       </div>
       {takeError && <p className="notice notice--danger" role="alert">{takeError}</p>}
+      <audio ref={call.audioRef} autoPlay hidden data-testid="call-remote" />
+      {active && takenOver && call.state !== "idle" && (
+        <p className={`call-line call-line--${call.state}`} role="status" data-testid="call-state" data-state={call.state}>
+          {call.state === "live" && <span className="live-dot" aria-hidden="true" />}
+          {call.state === "failed" ? call.error : callCopy[call.state]}
+        </p>
+      )}
 
-      {active && takenOver && (
+      {active && takenOver && call.state !== "live" && (
         <div className="ptt" data-testid="ptt">
           <button
             type="button"
@@ -326,7 +364,7 @@ export function LiveCall({
             {talk.state === "sending" && "Se trimite…"}
             {talk.state === "sent" && "Mesajul a ajuns în căștile ei."}
             {talk.state === "error" && talk.error}
-            {talk.state === "idle" && "Asistentul tace. Ea îți răspunde, iar tu o auzi mai sus."}
+            {talk.state === "idle" && "Mesaj vocal: ea îl aude în căști, iar răspunsul ei îl auzi mai jos."}
           </p>
         </div>
       )}

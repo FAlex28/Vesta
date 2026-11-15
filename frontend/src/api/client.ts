@@ -22,6 +22,8 @@ import type {
   ConversationResponse,
   ArchivedRecording,
   OperatorMessage,
+  CallView,
+  LocationHistory,
 } from "./contract";
 
 /*
@@ -295,6 +297,27 @@ export const api = {
       `${sessionPath(sessionId, "operator/messages")}${after ? `?after=${encodeURIComponent(after)}` : ""}`,
       { token },
     ),
+
+  /** Dispatcher: the route of an alert (kept with the recording). */
+  locationHistory: (sessionId: string, dashboardKey?: string) =>
+    request<LocationHistory>(sessionPath(sessionId, "locations"), { dashboardKey }),
+
+  /** Dispatcher calls her (WebRTC offer). The assistant stops; her phone answers by itself. */
+  callOffer: (sessionId: string, sdp: string, dashboardKey?: string) =>
+    request<CallView>(sessionPath(sessionId, "call/offer"), { method: "POST", body: JSON.stringify({ sdp }), dashboardKey }),
+
+  /** Dispatcher waits for the phone's answer. */
+  callAnswerPoll: (sessionId: string, dashboardKey?: string) =>
+    request<CallView>(sessionPath(sessionId, "call/answer"), { dashboardKey }),
+
+  callHangup: (sessionId: string, dashboardKey?: string) =>
+    request<CallView>(sessionPath(sessionId, "call/hangup"), { method: "POST", dashboardKey }),
+
+  /** Her phone: is the dispatcher calling? */
+  callForPhone: (sessionId: string, token: string) => request<CallView>(sessionPath(sessionId, "call"), { token }),
+
+  callAnswer: (sessionId: string, token: string, callId: string, sdp: string) =>
+    post<CallView>(sessionPath(sessionId, "call/answer"), { call_id: callId, sdp }, token),
 
   /** Dispatcher: transcript and recording info, only once an alert exists. */
   conversation: (sessionId: string, dashboardKey?: string) =>

@@ -2,8 +2,9 @@ import { Pause, Play } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import { apiBaseUrl } from "../api/config";
-import type { ArchivedRecording, ConversationTurn } from "../api/contract";
+import type { ArchivedRecording, ConversationTurn, LocationPoint } from "../api/contract";
 import { alertReasonLabel, formatClock, resolutionLabel } from "../state/presentation";
+import { LocationTrail } from "./LocationHistory";
 import { SectionHead } from "./SectionHead";
 
 /* Every alert's recording, kept in the database: listen and read the transcript any time. */
@@ -25,6 +26,7 @@ function Row({ item, dashboardKey, presentation }: { item: ArchivedRecording; da
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [turns, setTurns] = useState<ConversationTurn[] | null>(null);
+  const [route, setRoute] = useState<LocationPoint[] | null>(null);
   const audio = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => () => {
@@ -69,6 +71,19 @@ function Row({ item, dashboardKey, presentation }: { item: ArchivedRecording; da
     }
   };
 
+  const showRoute = async () => {
+    if (route) {
+      setRoute(null);
+      return;
+    }
+    try {
+      const answer = await api.locationHistory(item.session_id, dashboardKey ?? undefined);
+      setRoute(answer.points);
+    } catch {
+      setRoute([]);
+    }
+  };
+
   const resolution = item.resolution ? resolutionLabel(item.resolution) : item.finalized ? "închisă" : "în desfășurare";
 
   return (
@@ -93,10 +108,19 @@ function Row({ item, dashboardKey, presentation }: { item: ArchivedRecording; da
               </button>
             </>
           )}
+          {" · "}
+          <button type="button" className="text-button" data-testid="rec-route" onClick={() => void showRoute()}>
+            {route ? "Ascunde traseul" : "Traseu"}
+          </button>
         </p>
         {loading && <p className="c-hint">Se încarcă…</p>}
         {failed && <p className="c-hint">Înregistrarea nu a putut fi încărcată.</p>}
         {url && <audio ref={audio} src={url} controls preload="auto" className="rec-audio" />}
+        {route && (
+          <div className="rec-route">
+            <LocationTrail points={route} presentation={presentation} />
+          </div>
+        )}
         {turns && (
           <div className="rec-transcript">
             {presentation ? (

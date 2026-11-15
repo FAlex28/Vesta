@@ -495,7 +495,7 @@ def test_dispatcher_takes_over_any_ongoing_session_and_talks_to_her(
         conversation = test_client.get(f"{url}/conversation", headers=DASH)
         assert conversation.status_code == 200
         assert conversation.json()["turns"][-1]["role"] == "operator"
-        assert conversation.json()["turns"][-1]["text"] == "Mesaj vocal — transcriere indisponibilă."
+        assert conversation.json()["turns"][-1]["text"] == "Mesaj vocal al dispecerului."
         assert test_client.get(f"{url}/operator/messages").status_code == 401
         assert test_client.post(f"{url}/operator/messages", content=b"x", headers={"Content-Type": "audio/webm"}).status_code == 401
 
@@ -536,5 +536,202 @@ def test_recordings_stay_in_the_database_after_a_restart(tmp_path: Path) -> None
         conversation = again.get(f"/api/v1/sessions/{session_id}/conversation", headers=DASH).json()
         assert "din greșeală" in conversation["turns"][0]["text"]
         assert conversation["turns"][1]["role"] == "operator"
-        assert conversation["turns"][1]["text"] == "Mesaj vocal — transcriere indisponibilă."
+        assert conversation["turns"][1]["text"] == "Mesaj vocal al dispecerului."
         assert again.get("/api/v1/recordings").status_code == 401
+
+
+class FakeTiger:
+    """Stands in for TigerPersistence: records the mirrored writes, serves archived rows."""
+
+    def __init__(self) -> None:
+        self.chunks: list[tuple[str, int, bytes]] = []
+        self.meta: dict[str, dict] = {}
+        self.turns: list[tuple[str, str, str]] = []
+        self.messages: list[str] = []
+        self.purged: list[str] = []
+        self.archived = {
+            "session_id": "7b8a2c1e-0000-4000-8000-000000000001",
+            "device_id": DEVICE,
+            "started_at": datetime(2026, 11, 14, 9, 0, tzinfo=UTC),
+            "updated_at": datetime(2026, 11, 14, 9, 1, tzinfo=UTC),
+            "size_bytes": 9,
+            "chunks": 1,
+            "finalized": True,
+            "alert_id": "old-alert",
+            "alert_reason": "MISSED_CHECK_INS",
+            "alert_at": datetime(2026, 11, 14, 9, 0, 30, tzinfo=UTC),
+            "resolution": "USER_CONFIRMED_SAFE",
+            "resolved_at": datetime(2026, 11, 14, 9, 1, tzinfo=UTC),
+            "operator_at": None,
+        }
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    # writes
+    def recording_chunk(self, session_id, seq, data, mime_type, at):
+        self.chunks.append((session_id, seq, data))
+
+    def recording_meta(self, session_id, fields):
+        self.meta.setdefault(session_id, {}).update(fields)
+
+    def recording_operator_message(self, session_id, message):
+        self.messages.append(session_id)
+
+    def record_conversation_turn(self, session_id, turn):
+        self.turns.append((session_id, turn.role, turn.text))
+
+    def record_location(self, **kwargs):
+        pass
+
+    def purge_session_media(self, session_id):
+        self.purged.append(session_id)
+
+    def record_companion_heartbeat(self, **kwargs):
+        pass
+
+    def record_alert_viewed(self, alert_id):
+        pass
+
+    # reads
+    async def recordings_archive(self):
+        return [self.archived]
+
+    async def recording_meta_read(self, session_id):
+        return self.archived if session_id == self.archived["session_id"] else None
+
+    async def recording_audio(self, session_id):
+        return b"webm-tiger" if session_id == self.archived["session_id"] else b""
+
+    async def conversation_turns(self, session_id):
+        return [{"turn_id": "11111111-1111-4111-8111-111111111111", "occurred_at": datetime(2026, 11, 14, 9, 0, 31, tzinfo=UTC),
+                 "role": "PERSON", "text": "Ajutor!", "action": "ESCALATE"}]  # fmt: skip
+
+
+class FakeTranscriber(FakeGemini):
+    async def transcribe(self, audio, mime_type):
+        return "Rămâi pe loc, vine ajutorul."
+
+
+def test_everything_is_mirrored_to_tiger_data_and_read_back(tmp_path: Path) -> None:
+    tiger = FakeTiger()
+    test_client, services = make_client(tmp_path, FakeTranscriber())
+    services.persistence = tiger
+    services.recordings.mirror = tiger
+    original = services.assistant._recorder
+
+    def keep(session_id, turn):
+        original(session_id, turn)
+        tiger.record_conversation_turn(session_id, turn)
+
+    services.assistant._recorder = keep
+    with test_client:
+        activation = activate(test_client)
+        session_id = activation["session"]["id"]
+        token = activation["control_token"]
+        test_client.post(
+            f"/api/v1/sessions/{session_id}/recording/chunks?seq=0",
+            headers={**auth(token), "Content-Type": "audio/webm"},
+            content=b"webm-head",
+        )
+        test_client.post(f"/api/v1/sessions/{session_id}/sos", headers=auth(token), json={"event_id": "s-t"})
+        assert test_client.post(f"/api/v1/sessions/{session_id}/takeover", headers=DASH).status_code == 200
+        sent = test_client.post(
+            f"/api/v1/sessions/{session_id}/operator/messages",
+            headers={**DASH, "Content-Type": "audio/webm"},
+            content=b"operator-voice",
+        )
+        assert sent.status_code == 200
+        wait_until(lambda: tiger.meta.get(session_id, {}).get("alert_id") is not None)
+
+        assert tiger.chunks == [(session_id, 0, b"webm-head")]
+        assert tiger.meta[session_id]["alert_reason"] == "SOS_EXPLICIT"
+        assert "operator_at" in tiger.meta[session_id]
+        assert tiger.messages == [session_id]
+        assert (session_id, "operator", "Rămâi pe loc, vine ajutorul.") in tiger.turns
+        local = test_client.get(f"/api/v1/sessions/{session_id}/conversation", headers=DASH).json()["turns"]
+        assert any(t["role"] == "operator" and t["text"] == "Rămâi pe loc, vine ajutorul." for t in local)
+
+        # An alert known only to Tiger Data (another machine, local copy gone) is still there.
+        archive = test_client.get("/api/v1/recordings", headers=DASH).json()
+        old = tiger.archived["session_id"]
+        assert old in [item["session_id"] for item in archive]
+        audio = test_client.get(f"/api/v1/sessions/{old}/recording", headers=DASH)
+        assert audio.status_code == 200 and audio.content == b"webm-tiger"
+        turns = test_client.get(f"/api/v1/sessions/{old}/conversation", headers=DASH).json()["turns"]
+        assert turns[0]["role"] == "person" and turns[0]["text"] == "Ajutor!"
+
+
+def test_whisper_silence_and_subtitle_hallucinations_are_dropped() -> None:
+    from app.assistant.service import _clean_transcript
+
+    assert _clean_transcript({"text": "Să vă mulțumim pentru vizionare!"}) == ""
+    assert _clean_transcript({"text": "x", "segments": [{"text": "x", "no_speech_prob": 0.9}]}) == ""
+    real = {"text": "Ajutor", "segments": [{"text": "Ajutor, sunt pe Alba Iulia.", "no_speech_prob": 0.02}]}
+    assert _clean_transcript(real) == "Ajutor, sunt pe Alba Iulia."
+
+
+
+def test_live_call_offer_answer_and_hangup(client: TestClient) -> None:
+    activation = activate(client)
+    session_id = activation["session"]["id"]
+    token = activation["control_token"]
+    url = f"/api/v1/sessions/{session_id}"
+    assert client.get(f"{url}/call", headers=auth(token)).json() == {"call_id": None, "offer": None, "answer": None}
+    offer = client.post(f"{url}/call/offer", headers=DASH, json={"sdp": "v=0 offer-sdp"})
+    assert offer.status_code == 200
+    call_id = offer.json()["call_id"]
+    # Calling her takes the call over: the assistant is quiet from now on.
+    assert client.get(url, headers=auth(token)).json()["operator_connected_at"] is not None
+    seen = client.get(f"{url}/call", headers=auth(token)).json()
+    assert seen == {"call_id": call_id, "offer": "v=0 offer-sdp", "answer": None}
+    assert client.get(f"{url}/call/answer", headers=DASH).json()["answer"] is None
+    assert client.post(f"{url}/call/answer", headers=auth(token), json={"call_id": "other", "sdp": "v=0 answer"}).status_code == 409
+    assert client.post(f"{url}/call/answer", headers=auth(token), json={"call_id": call_id, "sdp": "v=0 answer-sdp"}).status_code == 200
+    assert client.get(f"{url}/call/answer", headers=DASH).json()["answer"] == "v=0 answer-sdp"
+    assert client.get(f"{url}/call", headers=auth(token)).json()["offer"] is None  # already answered
+    assert client.get(f"{url}/call").status_code == 401
+    assert client.post(f"{url}/call/offer", json={"sdp": "v=0 offer-sdp"}).status_code == 401
+    client.post(f"{url}/call/hangup", headers=DASH)
+    assert client.get(f"{url}/call", headers=auth(token)).json()["call_id"] is None
+
+
+def test_location_history_is_kept_for_an_alert_and_never_for_a_false_alarm(client: TestClient) -> None:
+    activation = activate(client)
+    session_id = activation["session"]["id"]
+    token = activation["control_token"]
+    url = f"/api/v1/sessions/{session_id}"
+
+    def send(event_id: str, lat: float, lon: float, seconds_ago: int) -> None:
+        client.post(
+            f"{url}/location",
+            headers=auth(token),
+            json={
+                "event_id": event_id,
+                "latitude": lat,
+                "longitude": lon,
+                "accuracy_meters": 9,
+                "captured_at": (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat(),
+                "source": "android",
+            },
+        )
+
+    send("p1", 45.7530, 21.2250, 20)
+    # Before an alert the route is private, even for the dispatcher.
+    assert client.get(f"{url}/locations", headers=DASH).status_code == 404
+    client.post(f"{url}/sos", headers=auth(token), json={"event_id": "sos-h"})
+    send("p2", 45.7536, 21.2257, 10)
+    send("p3", 45.7541, 21.2263, 0)
+    assert client.get(f"{url}/locations").status_code == 401
+    history = client.get(f"{url}/locations", headers=DASH).json()
+    assert [p["latitude"] for p in history["points"]] == [45.7530, 45.7536, 45.7541]
+    assert history["points"][0]["accuracy_meters"] == 9 and history["points"][0]["source"] == "android"
+
+    # A false alarm deletes the route too.
+    client.post(f"{url}/cancel", headers=auth(token), json={"event_id": "fa-h", "reason": "FALSE_ALARM"})
+    services = client.app.state.services
+    wait_until(lambda: not services.recordings.locations(session_id))
+    assert client.get(f"{url}/locations", headers=DASH).status_code == 404

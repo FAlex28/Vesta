@@ -112,6 +112,10 @@ class Settings:
     open_access: bool = False
     # Voice assistant: Gemini understands the person (audio in, decision out), ElevenLabs speaks.
     gemini_api_key: str | None = field(default=None, repr=False)
+    # Groq (preferred when set): Whisper transcribes her phrase, an LLM decides.
+    groq_api_key: str | None = field(default=None, repr=False)
+    groq_stt_model: str = "whisper-large-v3"
+    groq_llm_model: str = "openai/gpt-oss-120b"
     gemini_model: str = "gemini-2.5-flash"
     elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
     elevenlabs_tts_model: str = "eleven_flash_v2_5"
@@ -261,6 +265,9 @@ class Settings:
             first_checkin_delay_seconds=first_checkin_delay,
             open_access=open_access,
             gemini_api_key=(os.getenv("GEMINI_API_KEY") or "").strip() or None,
+            groq_api_key=(os.getenv("GROQ_API_KEY") or "").strip() or None,
+            groq_stt_model=(os.getenv("GROQ_STT_MODEL") or "whisper-large-v3").strip(),
+            groq_llm_model=(os.getenv("GROQ_LLM_MODEL") or "openai/gpt-oss-120b").strip(),
             gemini_model=(os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip(),
             elevenlabs_voice_id=(os.getenv("ELEVENLABS_VOICE_ID") or "JBFqnCBsd6RMkjVDRZzb").strip(),
             elevenlabs_tts_model=(os.getenv("ELEVENLABS_TTS_MODEL") or "eleven_flash_v2_5").strip(),

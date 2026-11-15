@@ -18,6 +18,7 @@ from .service import (
     ConversationTurn,
     ElevenLabsSpeech,
     GeminiUnderstanding,
+    GroqUnderstanding,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "ConversationTurn",
     "ElevenLabsSpeech",
     "GeminiUnderstanding",
+    "GroqUnderstanding",
 ]

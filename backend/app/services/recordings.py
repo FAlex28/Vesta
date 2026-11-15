@@ -59,7 +59,21 @@ CREATE TABLE IF NOT EXISTS operator_messages (
     data       BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS operator_messages_session ON operator_messages (session_id, at);
+
+CREATE TABLE IF NOT EXISTS location_points (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    captured_at TEXT    NOT NULL,
+    latitude    REAL    NOT NULL,
+    longitude   REAL    NOT NULL,
+    accuracy    REAL,
+    source      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS location_points_session ON location_points (session_id, captured_at);
 """
+
+#: Positions kept per session (one every few seconds: hours of route).
+MAX_LOCATION_POINTS = 5000
 
 _ANNOTATIONS = {"device_id", "alert_id", "alert_reason", "alert_at", "resolution", "resolved_at", "operator_at"}
 
@@ -99,6 +113,15 @@ class StoredTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class LocationPoint:
+    latitude: float
+    longitude: float
+    captured_at: datetime
+    accuracy_meters: float | None
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
 class OperatorMessage:
     id: str
     at: datetime
@@ -130,6 +153,8 @@ class RecordingStore:
         self._lock = asyncio.Lock()
         self._conditions: dict[str, asyncio.Condition] = {}
         self._deleted: set[str] = set()
+        # Tiger Data (TigerPersistence) when configured: every write is mirrored there.
+        self.mirror = None
 
     def close(self) -> None:
         self._db.close()
@@ -198,6 +223,8 @@ class RecordingStore:
             )
             self._db.commit()
             info = _info(self._row(session_id))
+        if self.mirror is not None:
+            self.mirror.recording_chunk(session_id, sequence, data, info.mime_type, now or datetime.now(UTC))
         await self._notify(session_id)
         return info
 
@@ -205,6 +232,8 @@ class RecordingStore:
         async with self._lock:
             self._db.execute("UPDATE recordings SET finalized = 1 WHERE session_id = ?", (session_id,))
             self._db.commit()
+        if self.mirror is not None and session_id not in self._deleted:
+            self.mirror.recording_meta(session_id, {"finalized": True})
         await self._notify(session_id)
 
     async def annotate(self, session_id: str, **fields: object) -> None:
@@ -227,6 +256,10 @@ class RecordingStore:
                 (*values.values(), session_id),
             )
             self._db.commit()
+        if self.mirror is not None:
+            self.mirror.recording_meta(
+                session_id, {k: v for k, v in fields.items() if k in _ANNOTATIONS and v is not None}
+            )
 
     async def delete(self, session_id: str) -> bool:
         """False alarm: audio, transcript and the dispatcher's messages are gone for good."""
@@ -234,7 +267,7 @@ class RecordingStore:
         async with self._lock:
             self._deleted.add(session_id)
             existed = self._row(session_id) is not None
-            for table in ("recording_chunks", "recordings", "transcript", "operator_messages"):
+            for table in ("recording_chunks", "recordings", "transcript", "operator_messages", "location_points"):
                 self._db.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))  # noqa: S608
             self._db.commit()
         await self._notify(session_id)
@@ -313,6 +346,43 @@ class RecordingStore:
         rows = self._db.execute("SELECT * FROM transcript WHERE session_id = ? ORDER BY at", (session_id,)).fetchall()
         return [StoredTurn(row["turn_id"], row["role"], row["text"], _dt(row["at"]), row["action"]) for row in rows]
 
+    # ------------------------------------------------------------------ location history
+
+    def add_location(
+        self,
+        session_id: str,
+        *,
+        latitude: float,
+        longitude: float,
+        captured_at: datetime,
+        accuracy_meters: float | None,
+        source: str,
+    ) -> None:
+        """Every accepted position, so the route stays available after the alert."""
+
+        if session_id in self._deleted:
+            return
+        count = self._db.execute(
+            "SELECT COUNT(*) AS n FROM location_points WHERE session_id = ?", (session_id,)
+        ).fetchone()["n"]
+        if count >= MAX_LOCATION_POINTS:
+            return
+        self._db.execute(
+            "INSERT INTO location_points (session_id, captured_at, latitude, longitude, accuracy, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, _iso(captured_at), latitude, longitude, accuracy_meters, source),
+        )
+        self._db.commit()
+
+    def locations(self, session_id: str) -> list[LocationPoint]:
+        rows = self._db.execute(
+            "SELECT * FROM location_points WHERE session_id = ? ORDER BY captured_at, id", (session_id,)
+        ).fetchall()
+        return [
+            LocationPoint(row["latitude"], row["longitude"], _dt(row["captured_at"]), row["accuracy"], row["source"])
+            for row in rows
+        ]
+
     # ------------------------------------------------------------------ dispatcher's voice
 
     async def add_operator_message(self, session_id: str, data: bytes, mime_type: str) -> OperatorMessage:
@@ -327,10 +397,18 @@ class RecordingStore:
             self._db.execute(
                 "INSERT OR IGNORE INTO transcript (turn_id, session_id, at, role, text, action) "
                 "VALUES (?, ?, ?, ?, ?, NULL)",
-                (message.id, session_id, _iso(message.at), "operator", "Mesaj vocal — transcriere indisponibilă."),
+                (message.id, session_id, _iso(message.at), "operator", "Mesaj vocal al dispecerului."),
             )
             self._db.commit()
+        if self.mirror is not None:
+            self.mirror.recording_operator_message(session_id, message)
         return message
+
+    def set_turn_text(self, turn_id: str, text: str) -> None:
+        """The dispatcher's phrase, once transcribed."""
+
+        self._db.execute("UPDATE transcript SET text = ? WHERE turn_id = ?", (text[:1000], turn_id))
+        self._db.commit()
 
     def operator_messages(self, session_id: str, *, after: str | None = None) -> list[OperatorMessage]:
         since = ""

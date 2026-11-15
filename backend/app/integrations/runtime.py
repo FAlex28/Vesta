@@ -163,8 +163,37 @@ class TigerPersistence:
         def purge() -> None:
             self.db.locations.delete_for_session(session_id)
             self.db.conversations.delete_for_session(session_id)
+            self.db.recordings.delete_session(session_id)
 
         self._background(purge)
+
+    # -- recordings mirrored to Tiger Data (the local copy only serves live playback) -----
+
+    def recording_meta(self, session_id: str, fields: dict) -> None:
+        self._background(self.db.recordings.upsert_meta, session_id, dict(fields))
+
+    def recording_chunk(self, session_id: str, seq: int, data: bytes, mime_type: str, at) -> None:
+        self._background(self.db.recordings.add_chunk, session_id, seq, data, mime_type=mime_type, updated_at=at)
+
+    def recording_operator_message(self, session_id: str, message) -> None:
+        self._background(
+            self.db.recordings.add_operator_message, message.id, session_id, message.at, message.mime_type, message.data
+        )
+
+    async def recordings_archive(self) -> list[dict]:
+        return await asyncio.to_thread(self.db.recordings.archive)
+
+    async def recording_meta_read(self, session_id: str) -> dict | None:
+        return await asyncio.to_thread(self.db.recordings.meta, session_id)
+
+    async def recording_audio(self, session_id: str) -> bytes:
+        return await asyncio.to_thread(self.db.recordings.audio, session_id)
+
+    async def location_history(self, session_id: str) -> list[dict]:
+        return await asyncio.to_thread(self.db.locations.history, session_id)
+
+    async def conversation_turns(self, session_id: str) -> list[dict]:
+        return await asyncio.to_thread(self.db.conversations.for_session, session_id)
 
     def record_power(self, status: PowerStatus) -> None:
         self._background(
